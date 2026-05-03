@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
 
@@ -21,6 +21,57 @@ type ImageLightboxProps = {
   onIndexChange: (index: number) => void;
 };
 
+type ImageTransform = {
+  scale: number;
+  x: number;
+  y: number;
+};
+
+type TouchGesture =
+  | {
+      type: "swipe";
+      startX: number;
+      startY: number;
+    }
+  | {
+      type: "pan";
+      startX: number;
+      startY: number;
+      startTransform: ImageTransform;
+    }
+  | {
+      type: "pinch";
+      startDistance: number;
+      startTransform: ImageTransform;
+    };
+
+const minScale = 1;
+const maxScale = 4;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getTouchDistance(touches: TouchList) {
+  const first = touches[0];
+  const second = touches[1];
+  return Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+}
+
+function normalizeTransform(transform: ImageTransform) {
+  if (transform.scale <= minScale) {
+    return { scale: minScale, x: 0, y: 0 };
+  }
+
+  const maxX = window.innerWidth * (transform.scale - 1) * 0.5;
+  const maxY = window.innerHeight * (transform.scale - 1) * 0.5;
+  return {
+    scale: transform.scale,
+    x: clamp(transform.x, -maxX, maxX),
+    y: clamp(transform.y, -maxY, maxY),
+  };
+}
+
 export function ImageLightbox({
   images,
   currentIndex,
@@ -28,10 +79,17 @@ export function ImageLightbox({
   onOpenChange,
   onIndexChange,
 }: ImageLightboxProps) {
-  const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
+  const gestureRef = useRef<TouchGesture | null>(null);
+  const lastTapRef = useRef(0);
+  const [transform, setTransform] = useState<ImageTransform>({ scale: 1, x: 0, y: 0 });
   const current = images[currentIndex];
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < images.length - 1;
+
+  const resetTransform = useCallback(() => {
+    setTransform({ scale: 1, x: 0, y: 0 });
+    gestureRef.current = null;
+  }, []);
 
   const goPrev = useCallback(() => {
     if (hasPrev) onIndexChange(currentIndex - 1);
@@ -40,6 +98,10 @@ export function ImageLightbox({
   const goNext = useCallback(() => {
     if (hasNext) onIndexChange(currentIndex + 1);
   }, [hasNext, currentIndex, onIndexChange]);
+
+  useEffect(() => {
+    resetTransform();
+  }, [current?.id, open, resetTransform]);
 
   useEffect(() => {
     if (!open) return;
@@ -58,20 +120,6 @@ export function ImageLightbox({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [open, goPrev, goNext]);
 
-  useEffect(() => {
-    if (!open) return;
-
-    const viewport = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
-    const previousViewport = viewport?.content;
-    viewport?.setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes");
-
-    return () => {
-      if (viewport && previousViewport) {
-        viewport.setAttribute("content", previousViewport);
-      }
-    };
-  }, [open]);
-
   const handleDownload = useCallback(() => {
     if (!current) return;
     const link = document.createElement("a");
@@ -80,32 +128,103 @@ export function ImageLightbox({
     link.click();
   }, [current]);
 
-  const handleTouchStart = useCallback((event: React.TouchEvent<HTMLDivElement>) => {
-    if (event.touches.length !== 1) {
-      swipeStartRef.current = null;
-      return;
-    }
-    const touch = event.touches[0];
-    swipeStartRef.current = { x: touch.clientX, y: touch.clientY };
+  const toggleZoom = useCallback(() => {
+    setTransform((currentTransform) =>
+      currentTransform.scale > minScale ? { scale: 1, x: 0, y: 0 } : { scale: 2.5, x: 0, y: 0 },
+    );
   }, []);
 
+  const handleTouchStart = useCallback(
+    (event: React.TouchEvent<HTMLDivElement>) => {
+      if (event.touches.length === 2) {
+        event.preventDefault();
+        gestureRef.current = {
+          type: "pinch",
+          startDistance: getTouchDistance(event.touches),
+          startTransform: transform,
+        };
+        return;
+      }
+
+      if (event.touches.length !== 1) {
+        gestureRef.current = null;
+        return;
+      }
+
+      const touch = event.touches[0];
+      gestureRef.current =
+        transform.scale > minScale
+          ? {
+              type: "pan",
+              startX: touch.clientX,
+              startY: touch.clientY,
+              startTransform: transform,
+            }
+          : {
+              type: "swipe",
+              startX: touch.clientX,
+              startY: touch.clientY,
+            };
+    },
+    [transform],
+  );
+
   const handleTouchMove = useCallback((event: React.TouchEvent<HTMLDivElement>) => {
+    const gesture = gestureRef.current;
+    if (!gesture) return;
+
+    if (gesture.type === "pinch" && event.touches.length === 2) {
+      event.preventDefault();
+      const nextScale = clamp(
+        (getTouchDistance(event.touches) / gesture.startDistance) * gesture.startTransform.scale,
+        minScale,
+        maxScale,
+      );
+      setTransform(normalizeTransform({ ...gesture.startTransform, scale: nextScale }));
+      return;
+    }
+
+    if (gesture.type === "pan" && event.touches.length === 1) {
+      event.preventDefault();
+      const touch = event.touches[0];
+      setTransform(
+        normalizeTransform({
+          scale: gesture.startTransform.scale,
+          x: gesture.startTransform.x + touch.clientX - gesture.startX,
+          y: gesture.startTransform.y + touch.clientY - gesture.startY,
+        }),
+      );
+      return;
+    }
+
     if (event.touches.length !== 1) {
-      swipeStartRef.current = null;
+      gestureRef.current = null;
     }
   }, []);
 
   const handleTouchEnd = useCallback(
     (event: React.TouchEvent<HTMLDivElement>) => {
-      const start = swipeStartRef.current;
-      swipeStartRef.current = null;
-      if (!start || event.changedTouches.length !== 1) {
+      const gesture = gestureRef.current;
+      gestureRef.current = null;
+      if (!gesture) return;
+
+      if (gesture.type !== "swipe" || event.changedTouches.length !== 1) {
         return;
       }
 
       const touch = event.changedTouches[0];
-      const deltaX = touch.clientX - start.x;
-      const deltaY = touch.clientY - start.y;
+      const deltaX = touch.clientX - gesture.startX;
+      const deltaY = touch.clientY - gesture.startY;
+      const now = Date.now();
+
+      if (Math.abs(deltaX) < 10 && Math.abs(deltaY) < 10 && now - lastTapRef.current < 280) {
+        event.preventDefault();
+        lastTapRef.current = 0;
+        toggleZoom();
+        return;
+      }
+      lastTapRef.current = now;
+
       if (Math.abs(deltaX) < 48 || Math.abs(deltaX) < Math.abs(deltaY) * 1.4) {
         return;
       }
@@ -116,7 +235,7 @@ export function ImageLightbox({
         goNext();
       }
     },
-    [goPrev, goNext],
+    [goPrev, goNext, toggleZoom],
   );
 
   if (!current) return null;
@@ -133,8 +252,7 @@ export function ImageLightbox({
             图片预览
           </DialogPrimitive.Title>
 
-          {/* toolbar */}
-          <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
+          <div className="absolute top-[calc(env(safe-area-inset-top)+1rem)] right-4 z-10 flex items-center gap-2">
             {current.sizeLabel || current.dimensions ? (
               <span className="rounded-full bg-black/50 px-3 py-1.5 text-xs font-medium text-white/90">
                 {[current.sizeLabel, current.dimensions].filter(Boolean).join(" · ")}
@@ -159,8 +277,7 @@ export function ImageLightbox({
             </DialogPrimitive.Close>
           </div>
 
-          {/* prev */}
-          {hasPrev && (
+          {hasPrev && transform.scale <= minScale && (
             <button
               type="button"
               onClick={goPrev}
@@ -171,9 +288,8 @@ export function ImageLightbox({
             </button>
           )}
 
-          {/* image */}
           <div
-            className="flex max-h-[90vh] max-w-[90vw] items-center justify-center"
+            className="flex h-full w-full touch-none items-center justify-center overflow-hidden"
             onClick={() => onOpenChange(false)}
             onTouchStart={handleTouchStart}
             onTouchMove={handleTouchMove}
@@ -182,14 +298,23 @@ export function ImageLightbox({
             <img
               src={current.src}
               alt=""
-              className="max-h-[90vh] max-w-[90vw] rounded-lg object-contain"
+              className={cn(
+                "max-h-[90vh] max-w-[90vw] rounded-lg object-contain transition-transform duration-100",
+                transform.scale > minScale ? "cursor-grab active:cursor-grabbing" : "cursor-zoom-in",
+              )}
+              style={{
+                transform: `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`,
+              }}
               onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                toggleZoom();
+              }}
               draggable={false}
             />
           </div>
 
-          {/* next */}
-          {hasNext && (
+          {hasNext && transform.scale <= minScale && (
             <button
               type="button"
               onClick={goNext}
