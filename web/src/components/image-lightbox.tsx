@@ -58,6 +58,20 @@ export function ImageLightbox({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [open, goPrev, goNext]);
 
+  useEffect(() => {
+    if (!open) return;
+
+    const viewport = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
+    const previousViewport = viewport?.content;
+    viewport?.setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes");
+
+    return () => {
+      if (viewport && previousViewport) {
+        viewport.setAttribute("content", previousViewport);
+      }
+    };
+  }, [open]);
+
   const handleDownload = useCallback(() => {
     if (!current) return;
     const link = document.createElement("a");

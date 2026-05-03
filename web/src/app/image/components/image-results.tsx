@@ -193,12 +193,12 @@ export function ImageResults({
                         return (
                           <div
                             key={image.id}
-                            className="break-inside-avoid overflow-hidden rounded-xl sm:rounded-none"
+                            className="break-inside-avoid"
                           >
                             <button
                               type="button"
                               onClick={() => onOpenLightbox(successfulTurnImages, currentIndex)}
-                              className="group block aspect-square w-full cursor-zoom-in overflow-hidden sm:aspect-auto"
+                              className="group block aspect-square w-full cursor-zoom-in overflow-hidden rounded-xl sm:aspect-auto"
                             >
                               <img
                                 src={imageSrc}
