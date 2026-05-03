@@ -222,7 +222,9 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
     new Set(
       items.flatMap((conversation) =>
         conversation.turns.flatMap((turn) =>
-          turn.images.flatMap((image) => (image.status === "loading" && image.taskId ? [image.taskId] : [])),
+          turn.resultsDeleted
+            ? []
+            : turn.images.flatMap((image) => (image.status === "loading" && image.taskId ? [image.taskId] : [])),
         ),
       ),
     ),
@@ -355,7 +357,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [deleteConfirm, setDeleteConfirm] = useState<
-    { type: "one"; id: string } | { type: "turn"; conversationId: string; turnId: string } | { type: "all" } | null
+    | { type: "one"; id: string }
+    | { type: "prompt"; conversationId: string; turnId: string }
+    | { type: "results"; conversationId: string; turnId: string }
+    | { type: "all" }
+    | null
   >(null);
 
   const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
@@ -372,15 +378,25 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     [conversations],
   );
   const deleteConfirmTitle =
-    deleteConfirm?.type === "all" ? "清空历史记录" : deleteConfirm?.type === "turn" ? "删除本轮记录" : deleteConfirm?.type === "one" ? "删除对话" : "";
+    deleteConfirm?.type === "all"
+      ? "清空历史记录"
+      : deleteConfirm?.type === "prompt"
+        ? "删除提示词记录"
+        : deleteConfirm?.type === "results"
+          ? "删除生成结果"
+          : deleteConfirm?.type === "one"
+            ? "删除对话"
+            : "";
   const deleteConfirmDescription =
     deleteConfirm?.type === "all"
       ? "确认删除全部图片历史记录吗？删除后无法恢复。"
-      : deleteConfirm?.type === "turn"
-        ? "确认删除这轮提示词和生成记录吗？删除后无法恢复。"
-        : deleteConfirm?.type === "one"
-          ? "确认删除这条图片对话吗？删除后无法恢复。"
-          : "";
+      : deleteConfirm?.type === "prompt"
+        ? "确认删除这条提示词记录吗？对应生成结果会保留。"
+        : deleteConfirm?.type === "results"
+          ? "确认删除这条生成结果吗？对应提示词记录会保留。"
+          : deleteConfirm?.type === "one"
+            ? "确认删除这条图片对话吗？删除后无法恢复。"
+            : "";
 
   useEffect(() => {
     conversationsRef.current = conversations;
@@ -574,13 +590,35 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
   };
 
-  const handleDeleteTurn = async (conversationId: string, turnId: string) => {
+  const handleDeleteTurnPart = async (conversationId: string, turnId: string, part: "prompt" | "results") => {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) {
       return;
     }
 
-    const turns = conversation.turns.filter((turn) => turn.id !== turnId);
+    const turns = conversation.turns
+      .map((turn) => {
+        if (turn.id !== turnId) {
+          return turn;
+        }
+        const nextTurn = {
+          ...turn,
+          promptDeleted: part === "prompt" ? true : turn.promptDeleted,
+          resultsDeleted: part === "results" ? true : turn.resultsDeleted,
+          status: part === "results" && turn.status === "generating" ? "error" as const : turn.status,
+          images:
+            part === "results"
+              ? turn.images.map((image) =>
+                  image.status === "loading"
+                    ? { ...image, status: "error" as const, error: "生成结果已删除" }
+                    : image,
+                )
+              : turn.images,
+        };
+        return nextTurn.promptDeleted && nextTurn.resultsDeleted ? null : nextTurn;
+      })
+      .filter((turn): turn is ImageTurn => Boolean(turn));
+
     if (turns.length === 0) {
       await handleDeleteConversation(conversationId);
       return;
@@ -613,8 +651,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setDeleteConfirm({ type: "one", id });
   };
 
-  const openDeleteTurnConfirm = (conversationId: string, turnId: string) => {
-    setDeleteConfirm({ type: "turn", conversationId, turnId });
+  const openDeletePromptConfirm = (conversationId: string, turnId: string) => {
+    setDeleteConfirm({ type: "prompt", conversationId, turnId });
+  };
+
+  const openDeleteResultsConfirm = (conversationId: string, turnId: string) => {
+    setDeleteConfirm({ type: "results", conversationId, turnId });
   };
 
   const openClearHistoryConfirm = () => {
@@ -632,8 +674,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       await handleClearHistory();
       return;
     }
-    if (target.type === "turn") {
-      await handleDeleteTurn(target.conversationId, target.turnId);
+    if (target.type === "prompt" || target.type === "results") {
+      await handleDeleteTurnPart(target.conversationId, target.turnId, target.type);
       return;
     }
     await handleDeleteConversation(target.id);
@@ -714,6 +756,28 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     },
     [],
   );
+
+  const handleReuseTurnConfig = useCallback(async (conversationId: string, turnId: string) => {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    const turn = conversation?.turns.find((item) => item.id === turnId);
+    if (!conversation || !turn) {
+      return;
+    }
+
+    setSelectedConversationId(conversationId);
+    setImagePrompt(turn.prompt);
+    setImageCount(String(Math.max(1, turn.count || turn.images.length || 1)));
+    setImageSize(turn.size);
+    setReferenceImages(turn.referenceImages);
+    setReferenceImageFiles(
+      turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
+    );
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    textareaRef.current?.focus();
+    toast.success("已复用这条提示词配置");
+  }, []);
 
   const openLightbox = useCallback((images: ImageLightboxItem[], index: number) => {
     if (images.length === 0) {
@@ -981,6 +1045,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         !activeConversationQueueIds.has(conversation.id) &&
         conversation.turns.some(
           (turn) =>
+            !turn.resultsDeleted &&
             (turn.status === "queued" || turn.status === "generating") &&
             turn.images.some((image) => image.status === "loading"),
         )
@@ -1129,7 +1194,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               selectedConversation={selectedConversation}
               onOpenLightbox={openLightbox}
               onContinueEdit={handleContinueEdit}
-              onDeleteTurn={openDeleteTurnConfirm}
+              onDeletePrompt={openDeletePromptConfirm}
+              onDeleteResults={openDeleteResultsConfirm}
+              onReuseTurnConfig={handleReuseTurnConfig}
               onRegenerateTurn={handleRegenerateTurn}
               onRetryImage={handleRetryImage}
               formatConversationTime={formatConversationTime}
