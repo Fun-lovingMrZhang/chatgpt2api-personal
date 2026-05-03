@@ -65,8 +65,8 @@ export function TopNav() {
   const displayName = session.name.trim() || roleLabel;
 
   return (
-    <header className="sticky top-2 z-40 rounded-3xl border border-white/70 bg-white/80 shadow-[0_16px_50px_-36px_rgba(15,23,42,0.45)] backdrop-blur sm:static sm:rounded-none sm:border-x-0 sm:border-t-0 sm:border-b-stone-100/50 sm:bg-transparent sm:shadow-none sm:backdrop-blur-none">
-      <div className="flex min-h-12 flex-col gap-2 px-3 py-2.5 sm:h-12 sm:flex-row sm:items-center sm:justify-between sm:gap-3 sm:px-6 sm:py-0">
+    <header className="border-b border-stone-100/50">
+      <div className="flex min-h-12 flex-col gap-1 px-3 py-2 sm:h-12 sm:flex-row sm:items-center sm:justify-between sm:gap-3 sm:px-6 sm:py-0">
         <div className="flex items-center justify-between gap-2 sm:justify-start sm:gap-3">
           <Link
             href="/image"
@@ -92,7 +92,7 @@ export function TopNav() {
             退出
           </button>
         </div>
-        <nav className="hide-scrollbar -mx-1 flex min-w-0 flex-1 gap-1 overflow-x-auto px-1 pb-0.5 sm:mx-0 sm:justify-center sm:gap-8 sm:overflow-visible sm:px-0 sm:pb-0">
+        <nav className="hide-scrollbar -mx-1 flex min-w-0 flex-1 gap-1 overflow-x-auto px-1 sm:mx-0 sm:justify-center sm:gap-8 sm:overflow-visible sm:px-0">
           {navItems.map((item) => {
             const active = pathname === item.href;
             return (
@@ -100,10 +100,10 @@ export function TopNav() {
                 key={item.href}
                 href={item.href}
                 className={cn(
-                  "relative shrink-0 whitespace-nowrap rounded-full px-3 py-1.5 text-[13px] font-medium transition sm:rounded-none sm:px-0 sm:py-1 sm:text-[15px]",
+                  "relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium transition sm:rounded-none sm:px-0 sm:text-[15px]",
                   active
-                    ? "bg-stone-950 text-white shadow-sm sm:bg-transparent sm:font-semibold sm:text-stone-950 sm:shadow-none"
-                    : "bg-stone-100/70 text-stone-600 hover:bg-stone-200/80 hover:text-stone-900 sm:bg-transparent sm:text-stone-500 sm:hover:bg-transparent",
+                    ? "bg-stone-950 text-white sm:bg-transparent sm:font-semibold sm:text-stone-950"
+                    : "text-stone-500 hover:text-stone-900",
                 )}
               >
                 {item.label}
