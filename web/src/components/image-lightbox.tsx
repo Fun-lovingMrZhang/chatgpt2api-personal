@@ -75,6 +75,12 @@ export function ImageLightbox({
     swipeStartRef.current = { x: touch.clientX, y: touch.clientY };
   }, []);
 
+  const handleTouchMove = useCallback((event: React.TouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) {
+      swipeStartRef.current = null;
+    }
+  }, []);
+
   const handleTouchEnd = useCallback(
     (event: React.TouchEvent<HTMLDivElement>) => {
       const start = swipeStartRef.current;
@@ -156,6 +162,7 @@ export function ImageLightbox({
             className="flex max-h-[90vh] max-w-[90vw] items-center justify-center"
             onClick={() => onOpenChange(false)}
             onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
             onTouchEnd={handleTouchEnd}
           >
             <img

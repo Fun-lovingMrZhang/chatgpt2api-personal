@@ -213,18 +213,18 @@ export function ImageResults({
                                 }}
                               />
                             </button>
-                            <div className="hidden items-center justify-between gap-2 px-3 py-3 sm:flex">
-                              <div className="min-w-0 text-xs text-stone-500">
+                            <div className="flex flex-col gap-1 px-0.5 py-1 text-[10px] sm:flex-row sm:items-center sm:justify-between sm:gap-2 sm:px-3 sm:py-3 sm:text-xs">
+                              <div className="min-w-0 text-stone-500">
                                 <span>结果 {index + 1}</span>
-                                {imageMeta ? <span className="ml-2 text-stone-400">{imageMeta}</span> : null}
+                                {imageMeta ? <span className="block text-stone-400 sm:ml-2 sm:inline">{imageMeta}</span> : null}
                               </div>
                               <Button
                                 variant="outline"
                                 size="sm"
-                                className="rounded-full border-stone-200 bg-white text-stone-700 hover:bg-stone-50"
+                                className="h-7 w-fit rounded-full border-stone-200 bg-white px-2 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:px-3 sm:text-xs"
                                 onClick={() => onContinueEdit(selectedConversation.id, image)}
                               >
-                                <Sparkles className="size-4" />
+                                <Sparkles className="size-3 sm:size-4" />
                                 加入编辑
                               </Button>
                             </div>
