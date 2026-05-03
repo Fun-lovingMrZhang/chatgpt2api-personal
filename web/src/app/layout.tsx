@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Toaster } from "sonner";
 import "./globals.css";
 import { TopNav } from "@/components/top-nav";
@@ -6,6 +6,13 @@ import { TopNav } from "@/components/top-nav";
 export const metadata: Metadata = {
   title: "ChatGPT 号池管理",
   description: "ChatGPT account pool management dashboard",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
 };
 
 export default function RootLayout({

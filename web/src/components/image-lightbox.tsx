@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
 
@@ -28,6 +28,7 @@ export function ImageLightbox({
   onOpenChange,
   onIndexChange,
 }: ImageLightboxProps) {
+  const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
   const current = images[currentIndex];
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < images.length - 1;
@@ -64,6 +65,39 @@ export function ImageLightbox({
     link.download = `image-${current.id}.png`;
     link.click();
   }, [current]);
+
+  const handleTouchStart = useCallback((event: React.TouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) {
+      swipeStartRef.current = null;
+      return;
+    }
+    const touch = event.touches[0];
+    swipeStartRef.current = { x: touch.clientX, y: touch.clientY };
+  }, []);
+
+  const handleTouchEnd = useCallback(
+    (event: React.TouchEvent<HTMLDivElement>) => {
+      const start = swipeStartRef.current;
+      swipeStartRef.current = null;
+      if (!start || event.changedTouches.length !== 1) {
+        return;
+      }
+
+      const touch = event.changedTouches[0];
+      const deltaX = touch.clientX - start.x;
+      const deltaY = touch.clientY - start.y;
+      if (Math.abs(deltaX) < 48 || Math.abs(deltaX) < Math.abs(deltaY) * 1.4) {
+        return;
+      }
+
+      if (deltaX > 0) {
+        goPrev();
+      } else {
+        goNext();
+      }
+    },
+    [goPrev, goNext],
+  );
 
   if (!current) return null;
 
@@ -121,6 +155,8 @@ export function ImageLightbox({
           <div
             className="flex max-h-[90vh] max-w-[90vw] items-center justify-center"
             onClick={() => onOpenChange(false)}
+            onTouchStart={handleTouchStart}
+            onTouchEnd={handleTouchEnd}
           >
             <img
               src={current.src}

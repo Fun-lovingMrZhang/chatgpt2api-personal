@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Clock3, LoaderCircle, Sparkles } from "lucide-react";
+import { Clock3, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -18,6 +18,9 @@ type ImageResultsProps = {
   selectedConversation: ImageConversation | null;
   onOpenLightbox: (images: ImageLightboxItem[], index: number) => void;
   onContinueEdit: (conversationId: string, image: StoredImage | StoredReferenceImage) => void;
+  onDeleteTurn: (conversationId: string, turnId: string) => void;
+  onRegenerateTurn: (conversationId: string, turnId: string) => void | Promise<void>;
+  onRetryImage: (conversationId: string, turnId: string, imageId: string) => void | Promise<void>;
   formatConversationTime: (value: string) => string;
 };
 
@@ -32,6 +35,9 @@ export function ImageResults({
   selectedConversation,
   onOpenLightbox,
   onContinueEdit,
+  onDeleteTurn,
+  onRegenerateTurn,
+  onRetryImage,
   formatConversationTime,
 }: ImageResultsProps) {
   const [imageDimensions, setImageDimensions] = useState<Record<string, string>>({});
@@ -105,6 +111,24 @@ export function ImageResults({
                   <span>{formatConversationTime(turn.createdAt)}</span>
                 </div>
                 <div className="text-right">{turn.prompt}</div>
+                <div className="mt-2 flex flex-wrap justify-end gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => void onRegenerateTurn(selectedConversation.id, turn.id)}
+                    className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-1 text-[11px] font-medium text-stone-600 transition hover:bg-stone-200 hover:text-stone-900"
+                  >
+                    <RotateCcw className="size-3" />
+                    全部重新生成
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onDeleteTurn(selectedConversation.id, turn.id)}
+                    className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-medium text-rose-600 transition hover:bg-rose-100"
+                  >
+                    <Trash2 className="size-3" />
+                    删除本轮
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -151,7 +175,7 @@ export function ImageResults({
                   ) : null}
                 </div>
 
-                <div className="columns-1 gap-3 space-y-3 sm:columns-2 sm:gap-4 sm:space-y-4 xl:columns-3">
+                <div className="grid grid-cols-3 gap-2 sm:columns-2 sm:block sm:gap-4 sm:space-y-4 xl:columns-3">
                   {turn.images.map((image, index) => {
                     const imageSrc = image.status === "success" ? getStoredImageSrc(image) : "";
                     if (image.status === "success" && imageSrc) {
@@ -163,17 +187,17 @@ export function ImageResults({
                       return (
                         <div
                           key={image.id}
-                          className="break-inside-avoid overflow-hidden"
+                          className="break-inside-avoid overflow-hidden rounded-xl bg-white sm:rounded-none"
                         >
                           <button
                             type="button"
                             onClick={() => onOpenLightbox(successfulTurnImages, currentIndex)}
-                            className="group block w-full cursor-zoom-in"
+                            className="group block aspect-square w-full cursor-zoom-in overflow-hidden sm:aspect-auto"
                           >
                             <img
                               src={imageSrc}
                               alt={`Generated result ${index + 1}`}
-                              className="block h-auto w-full transition duration-200 group-hover:brightness-90"
+                              className="block h-full w-full object-cover transition duration-200 group-hover:brightness-90 sm:h-auto sm:object-contain"
                               onLoad={(event) => {
                                 updateImageDimensions(
                                   image.id,
@@ -183,7 +207,7 @@ export function ImageResults({
                               }}
                             />
                           </button>
-                          <div className="flex items-center justify-between gap-2 px-3 py-3">
+                          <div className="hidden items-center justify-between gap-2 px-3 py-3 sm:flex">
                             <div className="min-w-0 text-xs text-stone-500">
                               <span>结果 {index + 1}</span>
                               {imageMeta ? <span className="ml-2 text-stone-400">{imageMeta}</span> : null}
@@ -207,7 +231,8 @@ export function ImageResults({
                         <div
                           key={image.id}
                           className={cn(
-                            "break-inside-avoid overflow-hidden rounded-2xl border border-rose-200 bg-rose-50 sm:rounded-none",
+                            "break-inside-avoid overflow-hidden rounded-xl border border-rose-200 bg-rose-50 sm:rounded-none",
+                            "aspect-square",
                             turn.size === "1:1" && "sm:aspect-square",
                             turn.size === "16:9" && "sm:aspect-video",
                             turn.size === "9:16" && "sm:aspect-[9/16]",
@@ -216,8 +241,15 @@ export function ImageResults({
                             !["1:1", "16:9", "9:16", "4:3", "3:4"].includes(turn.size) && "sm:aspect-square",
                           )}
                         >
-                          <div className="flex h-full min-h-16 items-center justify-center px-4 py-4 text-center text-sm leading-6 text-rose-600 sm:px-6 sm:py-8">
-                            {image.error || "生成失败"}
+                          <div className="flex h-full min-h-16 flex-col items-center justify-center gap-1.5 px-2 py-2 text-center text-[11px] leading-4 text-rose-600 sm:gap-3 sm:px-6 sm:py-8 sm:text-sm sm:leading-6">
+                            <span className="line-clamp-2 sm:line-clamp-none">{image.error || "生成失败"}</span>
+                            <button
+                              type="button"
+                              onClick={() => void onRetryImage(selectedConversation.id, turn.id, image.id)}
+                              className="rounded-full bg-white px-2 py-1 text-[10px] font-medium text-rose-600 shadow-sm transition hover:bg-rose-100 sm:px-3 sm:text-xs"
+                            >
+                              重新生成这一张
+                            </button>
                           </div>
                         </div>
                       );
@@ -227,7 +259,7 @@ export function ImageResults({
                       <div
                         key={image.id}
                         className={cn(
-                          "break-inside-avoid overflow-hidden border border-stone-200/80 bg-stone-100/80",
+                          "break-inside-avoid overflow-hidden rounded-xl border border-stone-200/80 bg-stone-100/80 sm:rounded-none",
                           turn.size === "1:1" && "aspect-square",
                           turn.size === "16:9" && "aspect-video",
                           turn.size === "9:16" && "aspect-[9/16]",
@@ -236,15 +268,15 @@ export function ImageResults({
                           !["1:1", "16:9", "9:16", "4:3", "3:4"].includes(turn.size) && "aspect-square",
                         )}
                       >
-                        <div className="flex h-full flex-col items-center justify-center gap-3 px-6 py-8 text-center text-stone-500">
-                          <div className="rounded-full bg-white p-3 shadow-sm">
+                        <div className="flex h-full flex-col items-center justify-center gap-1.5 px-2 py-3 text-center text-stone-500 sm:gap-3 sm:px-6 sm:py-8">
+                          <div className="rounded-full bg-white p-2 shadow-sm sm:p-3">
                             {turn.status === "queued" ? (
-                              <Clock3 className="size-5" />
+                              <Clock3 className="size-4 sm:size-5" />
                             ) : (
-                              <LoaderCircle className="size-5 animate-spin" />
+                              <LoaderCircle className="size-4 animate-spin sm:size-5" />
                             )}
                           </div>
-                          <p className="text-sm">{turn.status === "queued" ? "已加入当前对话队列..." : "正在处理图片..."}</p>
+                          <p className="text-[10px] leading-4 sm:text-sm">{turn.status === "queued" ? "排队中" : "处理中"}</p>
                         </div>
                       </div>
                     );
