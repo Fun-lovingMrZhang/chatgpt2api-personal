@@ -31,6 +31,7 @@ export function ConfigCard() {
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
+  const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
 
   const handleTestProxy = async () => {
@@ -211,6 +212,36 @@ export function ConfigCard() {
               className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
             />
             <p className="text-xs text-stone-500">只要用户请求包含任意敏感词，就直接返回拒绝。</p>
+          </div>
+          <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
+            <label className="flex items-center gap-3 text-sm text-stone-700">
+              <Checkbox
+                checked={Boolean(config?.ai_review?.enabled)}
+                onCheckedChange={(checked) => setAIReviewField("enabled", Boolean(checked))}
+              />
+              启用 AI 审核
+            </label>
+            <p className="text-xs leading-6 text-stone-500">
+              开启后会在请求进入生图账号前先调用审核模型，审核不通过会直接拒绝，减少违规提示词触达账号造成风控或封号的风险。
+            </p>
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">Base URL</label>
+                <Input value={String(config?.ai_review?.base_url || "")} onChange={(event) => setAIReviewField("base_url", event.target.value)} placeholder="https://api.openai.com" className="h-10 rounded-xl border-stone-200 bg-white" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">API Key</label>
+                <Input value={String(config?.ai_review?.api_key || "")} onChange={(event) => setAIReviewField("api_key", event.target.value)} placeholder="sk-..." className="h-10 rounded-xl border-stone-200 bg-white" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">Model</label>
+                <Input value={String(config?.ai_review?.model || "")} onChange={(event) => setAIReviewField("model", event.target.value)} placeholder="gpt-5.4-mini" className="h-10 rounded-xl border-stone-200 bg-white" />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">审核提示词</label>
+              <Textarea value={String(config?.ai_review?.prompt || "")} onChange={(event) => setAIReviewField("prompt", event.target.value)} placeholder="判断用户请求是否允许。只回答 ALLOW 或 REJECT。" className="min-h-24 rounded-xl border-stone-200 bg-white text-xs shadow-none" />
+            </div>
           </div>
         </div>
 

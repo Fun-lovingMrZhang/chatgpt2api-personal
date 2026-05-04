@@ -54,6 +54,13 @@ export type SettingsConfig = {
   base_url?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
+  ai_review?: {
+    enabled?: boolean;
+    base_url?: string;
+    api_key?: string;
+    model?: string;
+    prompt?: string;
+  };
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;

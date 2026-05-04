@@ -74,6 +74,13 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
+    ai_review: {
+      enabled: Boolean(config.ai_review?.enabled),
+      base_url: String(config.ai_review?.base_url || ""),
+      api_key: String(config.ai_review?.api_key || ""),
+      model: String(config.ai_review?.model || ""),
+      prompt: String(config.ai_review?.prompt || ""),
+    },
     backup: {
       ...backup,
       enabled: Boolean(backup.enabled),
@@ -173,6 +180,7 @@ type SettingsStore = {
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
+  setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
@@ -302,6 +310,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
+        ai_review: {
+          enabled: Boolean(config.ai_review?.enabled),
+          base_url: String(config.ai_review?.base_url || "").trim(),
+          api_key: String(config.ai_review?.api_key || "").trim(),
+          model: String(config.ai_review?.model || "").trim(),
+          prompt: String(config.ai_review?.prompt || "").trim(),
+        },
         backup: {
           ...(config.backup as BackupSettings),
           account_id: String(config.backup?.account_id || "").trim(),
@@ -407,6 +422,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.config ? { config: { ...state.config, sensitive_words: value.split("\n") } } : {});
   },
 
+  setAIReviewField: (key, value) => {
+    set((state) => state.config ? { config: { ...state.config, ai_review: { ...(state.config.ai_review || {}), [key]: value } } } : {});
+  },
 
   setBackupField: (key, value) => {
     set((state) => {

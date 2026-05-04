@@ -15,6 +15,13 @@
   "base_url": "",
   "sensitive_words": [],
   "global_system_prompt": "",
+  "ai_review": {
+    "enabled": false,
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "prompt": ""
+  },
   "backup": {
     "enabled": false,
     "provider": "cloudflare_r2",
@@ -38,5 +45,6 @@
       "auth_keys_snapshot": true,
       "images": false
     }
-  }
+  },
+  "image_account_concurrency": 3
 }
