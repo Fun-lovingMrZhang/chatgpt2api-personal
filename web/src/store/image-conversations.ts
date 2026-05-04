@@ -36,6 +36,8 @@ export type ImageTurn = {
   createdAt: string;
   status: ImageTurnStatus;
   error?: string;
+  promptDeleted?: boolean;
+  resultsDeleted?: boolean;
 };
 
 export type ImageConversation = {
@@ -144,6 +146,8 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
         ? turn.status
         : derivedStatus,
     error: typeof turn.error === "string" ? turn.error : undefined,
+    promptDeleted: turn.promptDeleted === true,
+    resultsDeleted: turn.resultsDeleted === true,
   };
 }
 
@@ -265,6 +269,9 @@ export function getImageConversationStats(conversation: ImageConversation | null
 
   return conversation.turns.reduce(
     (acc, turn) => {
+      if (turn.resultsDeleted) {
+        return acc;
+      }
       if (turn.status === "queued") {
         acc.queued += 1;
       } else if (turn.status === "generating") {
