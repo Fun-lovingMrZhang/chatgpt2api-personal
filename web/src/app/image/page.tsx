@@ -603,16 +603,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         }
         const nextTurn = {
           ...turn,
+          prompt: part === "prompt" ? "" : turn.prompt,
           promptDeleted: part === "prompt" ? true : turn.promptDeleted,
           resultsDeleted: part === "results" ? true : turn.resultsDeleted,
           status: part === "results" && turn.status === "generating" ? "error" as const : turn.status,
           images:
             part === "results"
-              ? turn.images.map((image) =>
-                  image.status === "loading"
-                    ? { ...image, status: "error" as const, error: "生成结果已删除" }
-                    : image,
-                )
+              ? turn.images.map((image) => ({ id: image.id, status: "error" as const, error: "生成结果已删除" }))
               : turn.images,
         };
         return nextTurn.promptDeleted && nextTurn.resultsDeleted ? null : nextTurn;
@@ -760,7 +757,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const handleReuseTurnConfig = useCallback(async (conversationId: string, turnId: string) => {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     const turn = conversation?.turns.find((item) => item.id === turnId);
-    if (!conversation || !turn) {
+    if (!conversation || !turn || !turn.prompt.trim()) {
       return;
     }
 
@@ -964,7 +961,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     async (conversationId: string, turnId: string) => {
       const conversation = conversationsRef.current.find((item) => item.id === conversationId);
       const sourceTurn = conversation?.turns.find((turn) => turn.id === turnId);
-      if (!conversation || !sourceTurn) {
+      if (!conversation || !sourceTurn || !sourceTurn.prompt.trim()) {
         return;
       }
 
@@ -1011,6 +1008,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         updatedAt: now,
         turns: conversation.turns.map((turn) => {
           if (turn.id !== turnId) {
+            return turn;
+          }
+          if (!turn.prompt.trim()) {
             return turn;
           }
 
@@ -1115,7 +1115,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   return (
     <>
-      <section className="mx-auto grid min-h-0 flex-1 w-full max-w-[1380px] grid-cols-1 gap-2 px-0 pb-[calc(env(safe-area-inset-bottom)+0.5rem)] sm:gap-3 sm:px-3 sm:pb-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+      <section className="mx-auto grid h-[calc(100dvh-6.5rem)] min-h-0 w-full max-w-[1380px] grid-cols-1 gap-2 overflow-hidden px-0 pb-[calc(env(safe-area-inset-bottom)+0.5rem)] sm:h-[calc(100dvh-5.25rem)] sm:gap-3 sm:px-3 sm:pb-6 lg:grid-cols-[240px_minmax(0,1fr)]">
         <div className="hidden h-full min-h-0 border-r border-stone-200/70 pr-3 lg:block">
           <ImageSidebar
             conversations={conversations}
