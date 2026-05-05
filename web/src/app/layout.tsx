@@ -6,6 +6,11 @@ import { TopNav } from "@/components/top-nav";
 export const metadata: Metadata = {
   title: "ChatGPT 号池管理",
   description: "ChatGPT account pool management dashboard",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "chatgpt2api",
+  },
 };
 
 export const viewport: Viewport = {
@@ -13,6 +18,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
+  viewportFit: "cover",
   themeColor: "#f0ebe3",
 };
 
