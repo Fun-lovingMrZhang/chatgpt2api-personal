@@ -178,9 +178,10 @@ export function ImageComposer({
                     variant="outline"
                     className="h-9 shrink-0 rounded-full border-stone-200 bg-white px-3 text-xs font-medium text-stone-700 shadow-none sm:h-10 sm:px-4 sm:text-sm"
                     onClick={onPickReferenceImage}
+                    aria-label={referenceImages.length > 0 ? "添加参考图" : "上传"}
                   >
                     <ImagePlus className="size-3.5 sm:size-4" />
-                    <span>{referenceImages.length > 0 ? "添加参考图" : "上传"}</span>
+                    <span className="hidden sm:inline">{referenceImages.length > 0 ? "添加参考图" : "上传"}</span>
                   </Button>
                   <div className="shrink-0 rounded-full bg-stone-100 px-2 py-1 text-[10px] font-medium text-stone-600 sm:px-3 sm:py-2 sm:text-xs">
                     <span className="hidden sm:inline">剩余额度 </span>{availableQuota}
@@ -192,7 +193,7 @@ export function ImageComposer({
                     </div>
                   )}
                   <div className="flex h-9 shrink-0 items-center gap-1.5 rounded-full border border-stone-200 bg-white px-2 py-0.5 sm:h-auto sm:gap-2 sm:px-3 sm:py-1">
-                    <span className="text-[11px] font-medium text-stone-700 sm:text-sm">张数</span>
+                    <span className="hidden text-[11px] font-medium text-stone-700 sm:inline sm:text-sm">张数</span>
                     <Input
                       type="number"
                       inputMode="numeric"
@@ -207,7 +208,7 @@ export function ImageComposer({
                   <div
                     className="relative flex h-9 shrink-0 items-center gap-1.5 rounded-full border border-stone-200 bg-white px-2 py-0.5 text-[11px] sm:h-auto sm:gap-2 sm:px-3 sm:py-1 sm:text-[13px]"
                   >
-                    <span className="font-medium text-stone-700 sm:text-sm">比例</span>
+                    <span className="hidden font-medium text-stone-700 sm:inline sm:text-sm">比例</span>
                     <button
                       ref={sizeMenuBtnRef}
                       type="button"
@@ -215,7 +216,8 @@ export function ImageComposer({
                       onClick={() => {
                         if (!isSizeMenuOpen && sizeMenuBtnRef.current) {
                           const rect = sizeMenuBtnRef.current.getBoundingClientRect();
-                          setSizeMenuPos({ top: rect.top - 8, left: rect.left });
+                          const menuWidth = Math.min(186, window.innerWidth - 32);
+                          setSizeMenuPos({ top: rect.top - 8, left: Math.max(16, Math.min(rect.left, window.innerWidth - menuWidth - 16)) });
                         }
                         setIsSizeMenuOpen((open) => !open);
                       }}
