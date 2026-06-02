@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
+import json
+import secrets
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock
+from threading import Condition, Lock, Thread
 from typing import Any
+from urllib.parse import urlencode
 
 from services.config import config
 from services.log_service import (
@@ -443,9 +448,510 @@ class AccountService:
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
-                self._record_token_refresh_error(active_token, event, str(exc))
+                error_str = str(exc or "")
+                self._record_token_refresh_error(active_token, event, error_str)
+                # 如果是 app_session_terminated 错误，尝试密码重新登录
+                if "app_session_terminated" in error_str.lower():
+                    # 获取账号信息（email, password）
+                    email = str(account.get("email") or "").strip()
+                    password = str(account.get("password") or "").strip()
+                    if email and password:
+                        # 创建新线程执行密码重新登录
+                        t = Thread(
+                            target=self._password_re_login_thread,
+                            args=(active_token, email, password, event),
+                            daemon=True,
+                        )
+                        t.start()
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str) -> None:
+        """密码重新登录线程入口"""
+        try:
+            result = self._login_with_password(email, password)
+            if result.get("ok"):
+                # 登录成功，更新账号
+                new_access_token = result.get("access_token", "")
+                new_refresh_token = result.get("refresh_token", "")
+                new_id_token = result.get("id_token", "")
+                new_expires_at = result.get("expires_at")
+                
+                # 构建 token_data 供 _apply_refreshed_tokens 使用
+                token_data = {
+                    "access_token": new_access_token,
+                    "refresh_token": new_refresh_token,
+                    "id_token": new_id_token,
+                }
+                
+                # 使用 _apply_refreshed_tokens 更新账号（处理 token 别名）
+                new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:password_relogin")
+                
+                # 额外更新 source_type 和 status
+                self.update_account(new_token, {
+                    "source_type": result.get("source_type", "password"),
+                    "status": "正常",
+                })
+                
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "重新登录",
+                    {
+                        "source": event,
+                        "old_token": anonymize_token(access_token),
+                        "new_token": anonymize_token(new_access_token),
+                        "email": email,
+                        "status": "成功",
+                    },
+                )
+            else:
+                # 登录失败
+                error_type = result.get("error", "")
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "重新登录",
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "email": email,
+                        "status": "失败",
+                        "error": error_type,
+                        "detail": result.get("detail", {}),
+                    },
+                )
+                # 临时故障（验证码超时、邮箱API异常等）不删除账号，只记录日志
+                temporary_errors = {
+                    "otp_code_timeout",        # 等待验证码超时
+                    "wait_code_exception",     # 临时邮箱API请求异常
+                    "otp_resend_exception",    # 验证码重发异常
+                    "otp_resend_failed",       # 验证码重发失败
+                    "create_mailbox_failed",   # 创建邮箱会话失败
+                    "no_mail_config",          # 未配置邮箱提供商
+                }
+                is_temporary = any(error_type.startswith(e) for e in temporary_errors)
+                if is_temporary:
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "临时故障-跳过删除",
+                        {
+                            "source": event,
+                            "token": anonymize_token(access_token),
+                            "email": email,
+                            "error": error_type,
+                            "detail": result.get("detail", {}),
+                        },
+                    )
+                else:
+                    # 永久故障：将账号标记为异常（或自动移除）
+                    self.remove_invalid_token(access_token, f"{event}:password_relogin_failed")
+        except Exception as exc:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "重新登录",
+                {
+                    "source": event,
+                    "token": anonymize_token(access_token),
+                    "email": email,
+                    "status": "异常",
+                    "error": str(exc),
+                },
+            )
+            # 将账号标记为异常（或自动移除）
+            self.remove_invalid_token(access_token, f"{event}:password_relogin_exception")
+
+    def _login_with_password(self, email: str, password: str) -> dict:
+        """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
+        from curl_cffi import requests
+        
+        # 常量
+        auth_base = "https://auth.openai.com"
+        platform_oauth_audience = "https://api.openai.com/v1"
+        platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+        platform_oauth_client_id = self._OAUTH_CLIENT_ID
+        platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
+        user_agent = self._OAUTH_USER_AGENT
+        
+        # 创建 session
+        session_kwargs = {"impersonate": "chrome110", "verify": False}
+        proxy = config.get_proxy_settings()
+        if proxy:
+            session_kwargs["proxy"] = proxy
+        session = requests.Session(**session_kwargs)
+        
+        try:
+            device_id = str(uuid.uuid4())
+            
+            # ─── 方式2: OAuth authorize 流程 ──────────────────────────
+            # 使用 Platform Client + PKCE（与注册流程相同）
+            
+            from utils.pkce import generate_pkce
+            code_verifier, code_challenge = generate_pkce()
+            
+            # ② 发起 OAuth authorize 请求 (使用 Platform Client + PKCE)
+            session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+            session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+            params = {
+                "issuer": auth_base,
+                "client_id": platform_oauth_client_id,
+                "audience": platform_oauth_audience,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "device_id": device_id,
+                "screen_hint": "login_or_signup",
+                "max_age": "0",
+                "login_hint": email,
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": secrets.token_urlsafe(32),
+                "nonce": secrets.token_urlsafe(32),
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "auth0Client": platform_auth0_client,
+            }
+            authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+            resp = session.get(
+                authorize_url,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "user-agent": user_agent,
+                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "cross-site",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                    "referer": "https://platform.openai.com/",
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+            
+            if resp.status_code not in (200, 302):
+                return {"ok": False, "error": f"authorize_failed_{resp.status_code}", "detail": {"url": resp.url, "text": resp.text[:500]}}
+            
+            # 检测最终 URL 是否指向错误页面
+            final_url = str(resp.url)
+            if "/error" in final_url and "payload=" in final_url:
+                from urllib.parse import parse_qs, urlparse
+                try:
+                    parsed_query = parse_qs(urlparse(final_url).query)
+                    error_payload_b64 = parsed_query.get("payload", [""])[0]
+                    error_payload_b64 += "=" * ((4 - len(error_payload_b64) % 4) % 4)
+                    error_payload = json.loads(base64.b64decode(error_payload_b64))
+                    error_code = error_payload.get("errorCode", "")
+                    if error_code == "rate_limit_exceeded":
+                        return {"ok": False, "error": "rate_limit_exceeded", "detail": error_payload}
+                    else:
+                        return {"ok": False, "error": f"authorize_error_{error_code}", "detail": error_payload}
+                except Exception as e:
+                    return {"ok": False, "error": "authorize_redirect_error", "detail": {"url": final_url, "parse_error": str(e)}}
+            
+            # ③ 提交密码验证
+            login_headers = {
+                "accept": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "content-type": "application/json",
+                "origin": auth_base,
+                "priority": "u=1, i",
+                "user-agent": user_agent,
+                "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "referer": f"{auth_base}/email-verification",
+                "oai-device-id": device_id,
+            }
+            
+            # 添加 sentinel token
+            try:
+                from utils.sentinel import build_sentinel_token
+                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "password_verify")
+                login_headers["openai-sentinel-token"] = sentinel_val
+                if oai_sc_val:
+                    session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
+            except Exception:
+                pass
+            
+            login_resp = session.post(
+                f"{auth_base}/api/accounts/password/verify",
+                headers=login_headers,
+                json={"password": password},
+                timeout=30,
+            )
+            
+            login_data = {}
+            try:
+                login_data = login_resp.json() if login_resp.text else {}
+            except Exception:
+                pass
+            
+            if login_resp.status_code != 200:
+                error_code = login_data.get("error", {}).get("code", "")
+                error_msg = login_data.get("error", {}).get("message", "")
+                if error_code == "unsupported_country_region_territory":
+                    return {"ok": False, "error": "unsupported_country_region_territory", "detail": login_data}
+                elif error_code == "invalid_state":
+                    return {"ok": False, "error": "invalid_state", "detail": login_data}
+                elif "Invalid credentials" in error_msg or "wrong password" in error_msg.lower():
+                    return {"ok": False, "error": "invalid_password", "detail": login_data}
+                return {"ok": False, "error": f"password_verify_failed_{login_resp.status_code}", "detail": login_data}
+            
+            # 获取 authorization code
+            continue_url = str(login_data.get("continue_url") or "").strip()
+            auth_code = ""
+            if continue_url:
+                from urllib.parse import parse_qs, urlparse
+                parsed_params = parse_qs(urlparse(continue_url).query)
+                auth_code = str((parsed_params.get("code") or [""])[0]).strip()
+            
+            # ─── 处理邮箱 OTP 验证 ──────────────────────────
+            if not auth_code:
+                page_type = ""
+                page_info = login_data.get("page")
+                if isinstance(page_info, dict):
+                    page_type = str(page_info.get("type") or "")
+                
+                if page_type == "email_otp_verification":
+                    otp_result = self._handle_email_otp_verification(
+                        session, auth_base, device_id, email, user_agent, login_data,
+                    )
+                    if otp_result.get("auth_code"):
+                        auth_code = otp_result["auth_code"]
+                    else:
+                        return {"ok": False, "error": otp_result.get("error", "email_otp_failed"), "detail": login_data}
+                else:
+                    return {"ok": False, "error": "no_auth_code", "detail": login_data}
+            
+            # ④ 用 code 换 token (使用 Platform Client + code_verifier，与注册流程相同)
+            platform_base = "https://platform.openai.com"
+            token_resp = session.post(
+                f"{auth_base}/api/accounts/oauth/token",
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "auth0-client": platform_auth0_client,
+                    "cache-control": "no-cache",
+                    "content-type": "application/json",
+                    "origin": platform_base,
+                    "pragma": "no-cache",
+                    "priority": "u=1, i",
+                    "referer": f"{platform_base}/",
+                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-site",
+                    "user-agent": user_agent,
+                },
+                json={
+                    "client_id": platform_oauth_client_id,
+                    "code_verifier": code_verifier,
+                    "grant_type": "authorization_code",
+                    "code": auth_code,
+                    "redirect_uri": platform_oauth_redirect_uri,
+                },
+                verify=False,
+                timeout=60,
+            )
+            
+            token_data = {}
+            try:
+                token_data = token_resp.json() if token_resp.text else {}
+            except Exception:
+                pass
+            
+            if token_resp.status_code != 200 or not token_data.get("access_token"):
+                return {"ok": False, "error": "token_exchange_failed", "detail": token_data}
+            
+            access_token = str(token_data.get("access_token") or "").strip()
+            refresh_token = str(token_data.get("refresh_token") or "").strip()
+            id_token = str(token_data.get("id_token") or "").strip()
+            
+            # ⑤ 用 access_token 获取用户信息
+            user_info = {}
+            try:
+                me_resp = session.get(
+                    "https://chatgpt.com/backend-api/me",
+                    headers={
+                        "accept": "application/json",
+                        "authorization": f"Bearer {access_token}",
+                        "user-agent": user_agent,
+                    },
+                    timeout=30,
+                )
+                if me_resp.status_code == 200:
+                    user_info = me_resp.json() if me_resp.text else {}
+            except Exception:
+                pass
+            
+            # 解析 JWT payload
+            jwt_payload = self._decode_jwt_payload(access_token)
+            
+            email_from_jwt = str(jwt_payload.get("https://api.openai.com/profile", {}).get("email") or "").strip()
+            account_id_from_jwt = str(
+                jwt_payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id") or ""
+            ).strip()
+            
+            account_info = user_info.get("account") if isinstance(user_info.get("account"), dict) else {}
+            result = {
+                "ok": True,
+                "email": email_from_jwt or email,
+                "account_id": account_id_from_jwt or account_info.get("account_id", ""),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "expires_at": jwt_payload.get("exp"),
+                "source_type": "password",
+            }
+            
+            return result
+        
+        finally:
+            session.close()
+
+    def _handle_email_otp_verification(
+        self, session, auth_base: str, device_id: str, email: str,
+        user_agent: str, login_data: dict,
+    ) -> dict:
+        """处理邮箱 OTP 验证流程：发送验证码 → 等待验证码 → 提交验证 → 获取 auth_code。
+
+        返回 {"auth_code": "..."} 或 {"error": "..."}。
+        """
+        from services.register import mail_provider as _mail_provider
+
+        otp_headers = {
+            "accept": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "content-type": "application/json",
+            "origin": auth_base,
+            "priority": "u=1, i",
+            "user-agent": user_agent,
+            "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "referer": f"{auth_base}/email-verification",
+            "oai-device-id": device_id,
+        }
+
+        # ─── 步骤 1: 发送验证码 ──────────────────────────
+        try:
+            resend_resp = session.post(
+                f"{auth_base}/api/accounts/email-otp/resend",
+                headers={**otp_headers, "content-length": "0"},
+                timeout=30,
+            )
+            resend_data = {}
+            try:
+                resend_data = resend_resp.json() if resend_resp.text else {}
+            except Exception:
+                pass
+            if resend_resp.status_code != 200 or not resend_data.get("success"):
+                return {"error": f"otp_resend_failed_{resend_resp.status_code}", "detail": resend_data}
+        except Exception as exc:
+            return {"error": f"otp_resend_exception", "detail": str(exc)}
+
+        # ─── 步骤 2: 等待验证码 ──────────────────────────
+        mail_config = self._get_mail_config()
+        if not mail_config:
+            return {"error": "no_mail_config", "detail": "未配置邮箱提供商，无法自动获取验证码"}
+
+        mailbox = self._create_mailbox_for_email(mail_config, email)
+        if not mailbox:
+            return {"error": "create_mailbox_failed", "detail": f"无法为 {email} 创建邮箱会话"}
+
+        try:
+            code = _mail_provider.wait_for_code(mail_config, mailbox)
+        except Exception as exc:
+            return {"error": "wait_code_exception", "detail": str(exc)}
+
+        if not code:
+            return {"error": "otp_code_timeout", "detail": "等待验证码超时"}
+
+        # ─── 步骤 3: 提交验证码 ──────────────────────────
+        try:
+            validate_resp = session.post(
+                f"{auth_base}/api/accounts/email-otp/validate",
+                headers=otp_headers,
+                json={"code": code},
+                timeout=30,
+            )
+            validate_data = {}
+            try:
+                validate_data = validate_resp.json() if validate_resp.text else {}
+            except Exception:
+                pass
+
+            # 检查错误（如 account_deactivated）
+            error_obj = validate_data.get("error")
+            if isinstance(error_obj, dict) and error_obj.get("code"):
+                return {"error": f"otp_validate_error_{error_obj['code']}", "detail": validate_data}
+
+            # 从 continue_url 提取 auth_code
+            continue_url = str(validate_data.get("continue_url") or "").strip()
+            if continue_url:
+                from urllib.parse import parse_qs as _pq, urlparse as _up
+                parsed = _pq(_up(continue_url).query)
+                auth_code = str((parsed.get("code") or [""])[0]).strip()
+                if auth_code:
+                    return {"auth_code": auth_code}
+
+            # 如果 validate 返回的是 email_otp_verification，可能需要再调用 authorize/continue
+            page_info = validate_data.get("page")
+            if isinstance(page_info, dict) and str(page_info.get("type") or "") == "email_otp_verification":
+                # 调用 authorize/continue 获取 auth_code
+                continue_resp = session.post(
+                    f"{auth_base}/api/accounts/authorize/continue",
+                    headers={**otp_headers, "content-length": "0"},
+                    timeout=30,
+                )
+                continue_data = {}
+                try:
+                    continue_data = continue_resp.json() if continue_resp.text else {}
+                except Exception:
+                    pass
+                continue_url2 = str(continue_data.get("continue_url") or "").strip()
+                if continue_url2:
+                    from urllib.parse import parse_qs as _pq2, urlparse as _up2
+                    parsed2 = _pq2(_up2(continue_url2).query)
+                    auth_code2 = str((parsed2.get("code") or [""])[0]).strip()
+                    if auth_code2:
+                        return {"auth_code": auth_code2}
+
+            return {"error": "otp_validate_no_code", "detail": validate_data}
+
+        except Exception as exc:
+            return {"error": "otp_validate_exception", "detail": str(exc)}
+
+    def _get_mail_config(self) -> dict | None:
+        """读取 register.json 中的 mail 配置"""
+        try:
+            register_config_file = Path(__file__).resolve().parent.parent / "data" / "register.json"
+            saved = json.loads(register_config_file.read_text(encoding="utf-8"))
+            mail_conf = saved.get("mail")
+            if isinstance(mail_conf, dict) and mail_conf.get("providers"):
+                return mail_conf
+        except Exception:
+            pass
+        return None
+
+    def _create_mailbox_for_email(self, mail_config: dict, email: str) -> dict | None:
+        """为指定邮箱地址查询已有 mailbox（用于等待 OTP 验证码）。"""
+        from services.register import mail_provider as _mail_provider
+
+        try:
+            mailbox = _mail_provider.get_existing_mailbox(mail_config, email)
+            return mailbox
+        except Exception:
+            return None
 
     def list_expiring_access_tokens(self) -> list[str]:
         with self._lock:
@@ -572,8 +1078,14 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        """从候选池中获取一个可用的图片生图 token。
+
+        基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
+        限制最大尝试次数防止 token rotation 导致无限循环。
+        """
+        max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
-        while True:
+        for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
                 plan_type=plan_type,
@@ -586,6 +1098,11 @@ class AccountService:
             except Exception:
                 self.release_image_slot(access_token)
                 continue
+            # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
+            # 把新 token 也加入排除列表，防止重复尝试
+            resolved = str((account or {}).get("access_token") or "")
+            if resolved and resolved != access_token:
+                attempted_tokens.add(resolved)
             if (
                     self._is_image_account_available(account or {})
                     and self._account_matches_plan_type(account or {}, plan_type)
@@ -594,6 +1111,10 @@ class AccountService:
             ):
                 return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
+        raise RuntimeError(
+            f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
+            if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
+        )
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         excluded = set(excluded_tokens or set())
@@ -919,7 +1440,8 @@ class AccountService:
         errors = []
         max_workers = min(10, len(access_tokens))
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {
                 executor.submit(self.fetch_remote_info, token, "refresh_accounts"): token
                 for token in access_tokens
@@ -927,11 +1449,19 @@ class AccountService:
             for future in as_completed(futures):
                 try:
                     account = future.result()
+                except (KeyboardInterrupt, SystemExit):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
                 except Exception as exc:
                     errors.append({"token": anonymize_token(futures[future]), "error": str(exc)})
                     continue
                 if account is not None:
                     refreshed += 1
+        except (KeyboardInterrupt, SystemExit):
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
 
         return {
             "refreshed": refreshed,
