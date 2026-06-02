@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -90,12 +91,26 @@ def is_tls_connection_error(message: str) -> bool:
     )
 
 
+def is_connection_timeout_error(message: str) -> bool:
+    """检测连接超时错误（如 curl 28），这类错误可通过同账号短等待重试解决。"""
+    text = str(message or "").lower()
+    return (
+        "curl: (28)" in text
+        or "operation timed out" in text
+        or "connection timed out" in text
+        or "read timed out" in text
+        or "connect timeout" in text
+    )
+
+
 def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     if is_token_invalid_error(text):
         return "image generation failed"
     if is_tls_connection_error(text):
         return "upstream image connection failed, please retry later"
+    if is_connection_timeout_error(text):
+        return "upstream connection timed out, please retry later"
     return text or "image generation failed"
 
 
@@ -289,6 +304,7 @@ class ConversationRequest:
     response_format: str = "b64_json"
     base_url: str | None = None
     message_as_error: bool = False
+    progress_callback: Any = None  # Callable[[str], None] | None
 
 
 @dataclass
@@ -795,6 +811,8 @@ def stream_image_outputs(
         "tool_invoked": last.get("tool_invoked"),
         "turn_use_case": last.get("turn_use_case"),
     })
+    if request.progress_callback:
+        request.progress_callback("image_stream_resolve_start")
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -906,6 +924,8 @@ def stream_image_outputs(
             raise
 
     if image_urls:
+        if request.progress_callback:
+            request.progress_callback("receiving_image")
         image_items = [
             {"b64_json": base64.b64encode(image_data).decode("ascii")}
             for image_data in backend.download_image_bytes(image_urls)
@@ -1001,6 +1021,8 @@ def stream_image_outputs(
                     conversation_id, file_ids, sediment_ids, poll=False,
                 )
                 if image_urls:
+                    if request.progress_callback:
+                        request.progress_callback("receiving_image")
                     image_items = [
                         {"b64_json": base64.b64encode(image_data).decode("ascii")}
                         for image_data in backend.download_image_bytes(image_urls)
@@ -1111,6 +1133,8 @@ def stream_image_outputs(
                 conversation_id, file_ids, sediment_ids, poll=False,
             )
             if image_urls:
+                if request.progress_callback:
+                    request.progress_callback("receiving_image")
                 image_items = [
                     {"b64_json": base64.b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
@@ -1188,173 +1212,311 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
-def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    if not is_supported_image_model(request.model):
-        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+def _generate_single_image(
+        request: ConversationRequest,
+        index: int,
+        total: int,
+) -> list[ImageOutput]:
+    """为单张图片执行生成逻辑（含重试），返回结果列表。
 
-    emitted = False
-    last_error = ""
+    该函数在独立线程中运行，每个线程使用不同的账号，
+    实现并行生图，避免串行超时阻塞。
+    """
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
     # TLS 连接错误最大重试次数
     MAX_TLS_RETRIES = 3
-    for index in range(1, request.n + 1):
-        text_reply_retry_count = 0
-        tls_retry_count = 0
-        while True:
-            try:
-                plan_type, _ = split_image_model(request.model)
-                codex_model = is_codex_image_model(request.model)
-                token = account_service.get_available_access_token(
-                    plan_type=plan_type,
-                    source_type="codex" if codex_model else None,
-                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                )
-            except RuntimeError as exc:
-                if emitted:
-                    return
-                raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+    # 连接超时错误最大重试次数（同账号短等待重试）
+    MAX_CONN_TIMEOUT_RETRIES = 3
+    # 轮询超时错误最大重试次数（换账号重试）
+    MAX_POLL_TIMEOUT_RETRIES = 4
 
-            emitted_for_token = False
-            returned_message = False
-            returned_result = False
-            account = account_service.get_account(token) or {}
-            account_email = str(account.get("email") or "").strip()
-            logger.debug({
-                "event": "image_account_lookup",
-                "token_prefix": token[:12] + "..." if len(token) > 12 else token,
-                "account_email": account_email,
-                "account_found": bool(account),
-                "account_keys": list(account.keys())[:10] if account else [],
-            })
-            try:
-                backend = OpenAIBackendAPI(access_token=token)
-                stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
-                for output in stream_fn(backend, request, index, request.n):
-                    if account_email and not output.account_email:
-                        output.account_email = account_email
-                    if output.kind == "message" and request.message_as_error:
-                        raise ImageGenerationError(
-                            output.text or "Image generation was rejected by upstream policy.",
-                            status_code=400,
-                            error_type="invalid_request_error",
-                            code="content_policy_violation",
-                            account_email=account_email,
-                            conversation_id=output.conversation_id,
-                        )
-                    emitted = True
-                    emitted_for_token = True
-                    returned_message = output.kind == "message"
-                    returned_result = returned_result or output.kind == "result"
-                    yield output
-                if returned_message:
-                    account_service.mark_image_result(token, False)
-                    return
-                if not returned_result:
-                    account_service.mark_image_result(token, False)
-                    if emitted_for_token:
-                        raise ImageGenerationError(
-                            "upstream completed without generating images",
-                            status_code=400,
-                            error_type="invalid_request_error",
-                            code="no_image_generated",
-                            account_email=account_email,
-                            conversation_id=output.conversation_id,
-                        )
-                    return
-                account_service.mark_image_result(token, True)
-                break
-            except ImagePollTimeoutError as exc:
+    text_reply_retry_count = 0
+    tls_retry_count = 0
+    conn_timeout_retry_count = 0
+    poll_timeout_retry_count = 0
+    account_email = ""
+
+    while True:
+        try:
+            if request.progress_callback:
+                request.progress_callback("getting_account")
+            plan_type, _ = split_image_model(request.model)
+            codex_model = is_codex_image_model(request.model)
+            token = account_service.get_available_access_token(
+                plan_type=plan_type,
+                source_type="codex" if codex_model else None,
+                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+            )
+        except RuntimeError as exc:
+            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+
+        emitted_for_token = False
+        returned_message = False
+        returned_result = False
+        account = account_service.get_account(token) or {}
+        account_email = str(account.get("email") or "").strip()
+        logger.debug({
+            "event": "image_account_lookup",
+            "token_prefix": token[:12] + "..." if len(token) > 12 else token,
+            "account_email": account_email,
+            "account_found": bool(account),
+            "index": index,
+        })
+        try:
+            backend = OpenAIBackendAPI(access_token=token)
+            if request.progress_callback:
+                backend.progress_callback = request.progress_callback
+            stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
+            outputs: list[ImageOutput] = []
+            for output in stream_fn(backend, request, index, total):
+                if account_email and not output.account_email:
+                    output.account_email = account_email
+                if output.kind == "message" and request.message_as_error:
+                    raise ImageGenerationError(
+                        output.text or "Image generation was rejected by upstream policy.",
+                        status_code=400,
+                        error_type="invalid_request_error",
+                        code="content_policy_violation",
+                        account_email=account_email,
+                        conversation_id=output.conversation_id,
+                    )
+                emitted_for_token = True
+                returned_message = output.kind == "message"
+                returned_result = returned_result or output.kind == "result"
+                outputs.append(output)
+            if returned_message:
                 account_service.mark_image_result(token, False)
-                if account_email and not getattr(exc, "account_email", ""):
-                    exc.account_email = account_email
-                raise
-            except ImageContentPolicyError as exc:
+                return outputs
+            if not returned_result:
                 account_service.mark_image_result(token, False)
+                if emitted_for_token:
+                    conv_id = outputs[-1].conversation_id if outputs else ""
+                    raise ImageGenerationError(
+                        "upstream completed without generating images",
+                        status_code=400,
+                        error_type="invalid_request_error",
+                        code="no_image_generated",
+                        account_email=account_email,
+                        conversation_id=conv_id,
+                    )
+                return outputs
+            account_service.mark_image_result(token, True)
+            return outputs
+        except ImagePollTimeoutError as exc:
+            account_service.mark_image_result(token, False)
+            if account_email:
+                setattr(exc, "account_email", account_email)
+            # 轮询超时：换账号重试
+            if not emitted_for_token:
+                poll_timeout_retry_count += 1
+                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                    logger.warning({
+                        "event": "image_poll_timeout_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": poll_timeout_retry_count,
+                        "index": index,
+                        "error": str(exc)[:200],
+                    })
+                    continue
                 logger.warning({
-                    "event": "image_stream_content_policy_error",
+                    "event": "image_poll_timeout_exhausted_retries",
                     "request_token": token,
                     "account_email": account_email,
-                    "error": str(exc),
+                    "retry_count": poll_timeout_retry_count,
+                    "index": index,
                 })
-                raise ImageGenerationError(
-                    str(exc) or "Image generation was rejected by upstream policy.",
-                    status_code=400,
-                    error_type="invalid_request_error",
-                    code="content_policy_violation",
-                    account_email=account_email,
-                    conversation_id=getattr(exc, "conversation_id", ""),
-                ) from exc
-            except ImageGenerationError as exc:
-                account_service.mark_image_result(token, False)
-                if account_email and not getattr(exc, "account_email", ""):
-                    exc.account_email = account_email
-                error_text = str(exc)
-                # 如果是模型返回文本而非图片（含 referenced_image_ids），尝试换账号重试
-                if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
-                    text_reply_retry_count += 1
-                    if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
-                        logger.warning({
-                            "event": "image_model_text_reply_retry",
-                            "request_token": token,
-                            "account_email": account_email,
-                            "retry_count": text_reply_retry_count,
-                            "error": error_text[:200],
-                        })
-                        continue
-                    # 超过重试次数，返回清晰的错误信息
+                raise
+            raise
+        except ImageContentPolicyError as exc:
+            account_service.mark_image_result(token, False)
+            logger.warning({
+                "event": "image_stream_content_policy_error",
+                "request_token": token,
+                "account_email": account_email,
+                "error": str(exc),
+                "index": index,
+            })
+            raise ImageGenerationError(
+                str(exc) or "Image generation was rejected by upstream policy.",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="content_policy_violation",
+                account_email=account_email,
+                conversation_id=getattr(exc, "conversation_id", ""),
+            ) from exc
+        except ImageGenerationError as exc:
+            account_service.mark_image_result(token, False)
+            if account_email and not getattr(exc, "account_email", ""):
+                exc.account_email = account_email
+            error_text = str(exc)
+            # 如果是模型返回文本而非图片，尝试换账号重试
+            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+                text_reply_retry_count += 1
+                if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
-                        "event": "image_model_text_reply_exhausted_retries",
+                        "event": "image_model_text_reply_retry",
                         "request_token": token,
                         "account_email": account_email,
                         "retry_count": text_reply_retry_count,
+                        "index": index,
+                        "error": error_text[:200],
                     })
-                    raise ImageGenerationError(
-                        "Image generation failed: the upstream model returned a text description "
-                        "instead of generating an image. Please try again later.",
-                        status_code=502,
-                        error_type="server_error",
-                        code="upstream_text_reply",
-                        account_email=account_email,
-                        conversation_id=getattr(exc, "conversation_id", ""),
-                    ) from exc
-                logger.warning({
-                    "event": "image_stream_generation_error",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "error": error_text,
-                })
-                raise
-            except Exception as exc:
-                account_service.mark_image_result(token, False)
-                last_error = str(exc)
-                logger.warning({
-                    "event": "image_stream_fail",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "error": last_error,
-                })
-                if not emitted_for_token and is_token_invalid_error(last_error):
-                    refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                    if refreshed_token and refreshed_token != token:
-                        token = refreshed_token
-                        continue
-                    account_service.remove_invalid_token(token, "image_stream")
                     continue
-                # TLS/SSL 连接错误：自动重试（通常是临时性网络问题）
-                if not emitted_for_token and is_tls_connection_error(last_error):
-                    tls_retry_count += 1
-                    if tls_retry_count <= MAX_TLS_RETRIES:
-                        logger.warning({
-                            "event": "image_stream_tls_retry",
-                            "request_token": token,
-                            "account_email": account_email,
-                            "retry_count": tls_retry_count,
-                            "error": last_error[:200],
-                        })
-                        time.sleep(min(2.0 * tls_retry_count, 10.0))  # 递增退避
-                        continue
-                raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+                logger.warning({
+                    "event": "image_model_text_reply_exhausted_retries",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "retry_count": text_reply_retry_count,
+                    "index": index,
+                })
+                raise ImageGenerationError(
+                    "Image generation failed: the upstream model returned a text description "
+                    "instead of generating an image. Please try again later.",
+                    status_code=502,
+                    error_type="server_error",
+                    code="upstream_text_reply",
+                    account_email=account_email,
+                    conversation_id=getattr(exc, "conversation_id", ""),
+                ) from exc
+            logger.warning({
+                "event": "image_stream_generation_error",
+                "request_token": token,
+                "account_email": account_email,
+                "error": error_text,
+                "index": index,
+            })
+            raise
+        except Exception as exc:
+            account_service.mark_image_result(token, False)
+            last_error = str(exc)
+            logger.warning({
+                "event": "image_stream_fail",
+                "request_token": token,
+                "account_email": account_email,
+                "error": last_error,
+                "index": index,
+            })
+            if not emitted_for_token and is_token_invalid_error(last_error):
+                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                if refreshed_token and refreshed_token != token:
+                    token = refreshed_token
+                    continue
+                account_service.remove_invalid_token(token, "image_stream")
+                continue
+            # TLS/SSL 连接错误：自动重试
+            if not emitted_for_token and is_tls_connection_error(last_error):
+                tls_retry_count += 1
+                if tls_retry_count <= MAX_TLS_RETRIES:
+                    logger.warning({
+                        "event": "image_stream_tls_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": tls_retry_count,
+                        "index": index,
+                        "error": last_error[:200],
+                    })
+                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    continue
+            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
+            if not emitted_for_token and is_connection_timeout_error(last_error):
+                conn_timeout_retry_count += 1
+                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                    wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
+                    logger.warning({
+                        "event": "image_stream_conn_timeout_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": conn_timeout_retry_count,
+                        "index": index,
+                        "wait_secs": wait_secs,
+                        "error": last_error[:200],
+                    })
+                    time.sleep(wait_secs)
+                    continue
+            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+
+
+def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
+    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    if not is_supported_image_model(request.model):
+        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+
+    if request.n <= 1:
+        # 单张图片，直接执行（无需线程池开销）
+        outputs = _generate_single_image(request, 1, 1)
+        for output in outputs:
+            yield output
+        return
+
+    # 多张图片：根据配置选择并行或串行执行
+    if not config.image_parallel_generation:
+        logger.info({
+            "event": "image_serial_generation_start",
+            "n": request.n,
+            "model": request.model,
+        })
+        for index in range(1, request.n + 1):
+            outputs = _generate_single_image(request, index, request.n)
+            for output in outputs:
+                yield output
+        return
+
+    logger.info({
+        "event": "image_parallel_generation_start",
+        "n": request.n,
+        "model": request.model,
+    })
+    # 每张图片一个线程，同时启动
+    futures = {}
+    results: dict[int, list[ImageOutput]] = {}
+    errors: dict[int, Exception] = {}
+    with ThreadPoolExecutor(max_workers=request.n) as executor:
+        for index in range(1, request.n + 1):
+            future = executor.submit(_generate_single_image, request, index, request.n)
+            futures[future] = index
+
+        # 按完成顺序收集结果
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:
+                errors[index] = exc
+                logger.warning({
+                    "event": "image_parallel_generation_error",
+                    "index": index,
+                    "error": str(exc)[:300],
+                })
+
+    # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
+    emitted = False
+    last_error = ""
+    # 先 yield 所有成功的结果
+    for index in range(1, request.n + 1):
+        if index in results:
+            for output in results[index]:
+                emitted = True
+                yield output
+        elif index in errors:
+            last_error = str(errors[index])
+            if not emitted:
+                logger.warning({
+                    "event": "image_parallel_failure_before_success",
+                    "failed_index": index,
+                    "error": last_error[:200],
+                })
+
+    # 如果有失败但也有成功，记录警告
+    if emitted:
+        for index in range(1, request.n + 1):
+            if index in errors:
+                logger.warning({
+                    "event": "image_parallel_partial_failure",
+                    "failed_index": index,
+                    "error": str(errors[index])[:200],
+                })
 
     if not emitted:
         if not last_error:
