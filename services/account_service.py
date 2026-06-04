@@ -1229,14 +1229,20 @@ class AccountService:
             return True
         return False
 
-    def _record_invalid_token_seen(self, access_token: str, event: str, error: str) -> bool:
+    def _record_invalid_token_seen(
+        self,
+        access_token: str,
+        event: str,
+        error: str,
+        defer_invalid_removal: bool = True,
+    ) -> bool:
         now = datetime.now(timezone.utc)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return True
-            should_defer = self._should_defer_invalid_token(current, now)
+            should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
             next_item["last_invalid_at"] = now.isoformat()
@@ -1291,7 +1297,12 @@ class AccountService:
             return dict(account)
         return None
 
-    def fetch_remote_info(self, access_token: str, event: str = "fetch_remote_info") -> dict[str, Any] | None:
+    def fetch_remote_info(
+        self,
+        access_token: str,
+        event: str = "fetch_remote_info",
+        defer_invalid_removal: bool = True,
+    ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
@@ -1305,12 +1316,22 @@ class AccountService:
                 try:
                     result = OpenAIBackendAPI(refreshed_token).get_user_info()
                 except InvalidAccessTokenError as retry_exc:
-                    if self._record_invalid_token_seen(refreshed_token, event, str(retry_exc)):
+                    if self._record_invalid_token_seen(
+                        refreshed_token,
+                        event,
+                        str(retry_exc),
+                        defer_invalid_removal=defer_invalid_removal,
+                    ):
                         self.remove_invalid_token(refreshed_token, event)
                     raise
                 active_token = refreshed_token
             else:
-                if self._record_invalid_token_seen(active_token, event, str(exc)):
+                if self._record_invalid_token_seen(
+                    active_token,
+                    event,
+                    str(exc),
+                    defer_invalid_removal=defer_invalid_removal,
+                ):
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
@@ -1416,7 +1437,12 @@ class AccountService:
         with self._relogin_progress_lock:
             self._relogin_progress.pop(progress_id, None)
 
-    def refresh_accounts(self, access_tokens: list[str], progress_id: str | None = None) -> dict[str, Any]:
+    def refresh_accounts(
+        self,
+        access_tokens: list[str],
+        progress_id: str | None = None,
+        defer_invalid_removal: bool = True,
+    ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             items = self.list_accounts()
@@ -1435,7 +1461,7 @@ class AccountService:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts"): token
+                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
                 for token in access_tokens
             }
             for future in as_completed(futures):

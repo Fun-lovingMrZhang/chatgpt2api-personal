@@ -259,7 +259,7 @@ def create_router() -> APIRouter:
 
         async def _do_refresh():
             try:
-                await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id)
+                await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id, False)
             except Exception as e:
                 account_service.finish_refresh_progress(progress_id, error=str(e))
 
