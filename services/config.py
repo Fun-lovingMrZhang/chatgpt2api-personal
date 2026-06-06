@@ -306,6 +306,16 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def image_redundancy_multiplier(self) -> float:
+        """生图冗余倍率：请求 N 张时实际生成 N * multiplier 张，只返回 N 张。
+        通过多账号并发提高出图成功率（某个任务失败时可用其他结果替补）。
+        默认 1.0 表示不开启。"""
+        try:
+            return max(1.0, float(self.data.get("image_redundancy_multiplier", 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
     def image_settle_enabled(self) -> bool:
         """图片二次确认机制：找到 file_ids 后等待一段时间再次确认。"""
         value = self.data.get("image_settle_enabled", True)
@@ -423,6 +433,7 @@ class ConfigStore:
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
+        data["image_redundancy_multiplier"] = self.image_redundancy_multiplier
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh

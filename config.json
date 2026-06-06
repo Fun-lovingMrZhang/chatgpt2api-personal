@@ -1,9 +1,9 @@
 {
   "auth-key": "chatgpt2api",
   "refresh_account_interval_minute": 60,
-  "image_retention_days": 15,
+  "image_retention_days": 1000,
   "image_poll_timeout_secs": 120,
-  "auto_remove_rate_limited_accounts": false,
+  "auto_remove_rate_limited_accounts": true,
   "auto_remove_invalid_accounts": true,
   "log_levels": [
     "debug",
@@ -48,6 +48,7 @@
   },
   "image_account_concurrency": 3,
   "image_parallel_generation": true,
+  "image_redundancy_multiplier": 1,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,
   "image_storage": {
@@ -70,9 +71,9 @@
     "drop_adjacent_duplicates": true,
     "drop_assistant_history": false
   },
-  "image_settle_enabled": false,
-  "image_check_before_hit_enabled": false,
+  "image_settle_enabled": true,
+  "image_check_before_hit_enabled": true,
   "image_settle_secs": 2,
-  "auto_relogin_after_refresh": false,
+  "auto_relogin_after_refresh": true,
   "image_timeout_retry_secs": 30
 }
