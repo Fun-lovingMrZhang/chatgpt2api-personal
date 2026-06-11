@@ -33,6 +33,27 @@ docker compose up -d
 - API 地址：`http://localhost:3000/v1`
 - 数据目录：`./data`
 
+### WARP / FlareSolverr 稳定代理部署
+
+如果注册或图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.warp.yml up -d --build
+```
+
+该 compose 会启动：
+
+- `warp-proxy`：提供 WARP SOCKS5 出口。
+- `privoxy`：把 WARP SOCKS5 转成 HTTP 代理。
+- `flaresolverr`：刷新 Cloudflare clearance。
+- `init-config`：幂等写入 `proxy_runtime` 默认配置。
+- `app`：启动 ChatGPT2API 主服务。
+
+默认只让上游 OpenAI / ChatGPT 请求走稳定代理，账号邮箱、CPA 等辅助链路不会被强制接管。账号自身配置的代理优先级最高，其次是稳定代理运行时，再其次是显式代理和旧版全局代理。
+
+可在 `.env` 中调整端口和代理运行时参数，也可在后台设置页的「稳定代理运行时」面板手动保存、测试代理和测试 clearance。
+
 ### 本地开发
 
 启动后端：
@@ -113,6 +134,7 @@ environment:
 - 定时检查限流账号并自动刷新
 - 支持密码重新登录恢复异常账号，刷新后可自动重登
 - 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
+- 支持 WARP / FlareSolverr 稳定代理运行时
 - 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
 - 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
