@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import os
@@ -90,6 +91,26 @@ class InitProxyConfigTests(unittest.TestCase):
             self.assertFalse(runtime["enabled"])
             self.assertFalse(runtime["clearance"]["enabled"])
             self.assertEqual(runtime["clearance"]["mode"], "none")
+
+    def test_bind_mounted_config_file_falls_back_when_atomic_replace_is_busy(self) -> None:
+        module = load_script_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"auth-key": "secret", "proxy": ""}), encoding="utf-8")
+            original_replace = Path.replace
+
+            def replace_with_ebusy(self: Path, target: Path) -> Path:
+                if self.name == "config.json.tmp":
+                    raise OSError(errno.EBUSY, "Device or resource busy")
+                return original_replace(self, target)
+
+            with patch.dict(os.environ, {"CHATGPT2API_CONFIG_FILE": str(path)}, clear=False):
+                with patch.object(Path, "replace", replace_with_ebusy):
+                    self.assertEqual(module.main(), 0)
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(data["proxy_runtime"]["enabled"])
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
 if __name__ == "__main__":

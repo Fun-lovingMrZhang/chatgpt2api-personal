@@ -155,9 +155,19 @@ def main() -> int:
 
     if changed:
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
         tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(config_path)
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            tmp_path.replace(config_path)
+        except OSError as exc:
+            # Docker bind-mounted single files can reject atomic rename with EBUSY.
+            # Fall back to in-place write so the init job works with both file and
+            # directory mounts.
+            if getattr(exc, "errno", None) != 16:
+                raise
+            config_path.write_text(payload, encoding="utf-8")
+            tmp_path.unlink(missing_ok=True)
 
     runtime = data.get("proxy_runtime") if isinstance(data.get("proxy_runtime"), dict) else {}
     clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
