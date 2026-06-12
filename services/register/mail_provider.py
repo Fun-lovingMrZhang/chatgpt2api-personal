@@ -26,6 +26,7 @@ OUTLOOK_TOKEN_USED_FILE = DATA_DIR / "outlook_token_used.json"
 _outlook_token_state_lock = Lock()
 # in_use 超过该秒数视为陈旧（注册进程崩溃残留），可被重新领用
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
+OUTLOOK_RECORDED_STATES = {"used", "in_use", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 
 
@@ -163,6 +164,23 @@ def reset_outlook_token_pool_state(scope: str = "all") -> int:
         count = len(store)
         _save_outlook_token_state({})
         return count
+
+
+def prune_outlook_unused_credentials(credentials: list[dict[str, str]]) -> tuple[list[dict[str, str]], int]:
+    """Return credentials with recorded state, plus the number pruned as unused."""
+    with _outlook_token_state_lock:
+        store = _load_outlook_token_state()
+    kept: list[dict[str, str]] = []
+    removed = 0
+    for credential in credentials:
+        key = str(credential.get("email") or "").strip().lower()
+        entry = store.get(key) if key else None
+        state = str(entry.get("state") or "") if isinstance(entry, dict) else ""
+        if state in OUTLOOK_RECORDED_STATES:
+            kept.append(credential)
+        else:
+            removed += 1
+    return kept, removed
 
 
 def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None) -> dict[str, int]:

@@ -705,7 +705,7 @@ export async function resetRegister() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
 }
 
-export async function resetOutlookPool(scope: "all" | "failed" = "all") {
+export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all") {
   return httpRequest<{ register: RegisterConfig }>("/api/register/outlook-pool/reset", {
     method: "POST",
     body: { scope },

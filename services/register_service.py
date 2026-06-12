@@ -138,6 +138,26 @@ class RegisterService:
             for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
                 provider.pop(key, None)
 
+    def _prune_unused_outlook_pools(self) -> int:
+        mail = self._config.get("mail")
+        if not isinstance(mail, dict):
+            return 0
+        providers = mail.get("providers")
+        if not isinstance(providers, list):
+            return 0
+        total_removed = 0
+        for provider in providers:
+            if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
+                continue
+            credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+            kept, removed = mail_provider.prune_outlook_unused_credentials(credentials)
+            if removed:
+                provider["mailboxes"] = _serialize_outlook_pool(kept)
+                total_removed += removed
+            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
+                provider.pop(key, None)
+        return total_removed
+
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._merge_outlook_pools(updates)
@@ -185,6 +205,14 @@ class RegisterService:
             return self.get()
 
     def reset_outlook_pool(self, scope: str = "all") -> dict:
+        scope = str(scope or "all").strip().lower()
+        if scope == "unused":
+            with self._lock:
+                removed = self._prune_unused_outlook_pools()
+                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                self._save()
+                self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
+            return self.get()
         scope = "failed" if str(scope) == "failed" else "all"
         cleared = mail_provider.reset_outlook_token_pool_state(scope)
         with self._lock:

@@ -245,7 +245,7 @@ type SettingsStore = {
   saveRegister: () => Promise<void>;
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
-  resetOutlookPool: (scope: "all" | "failed") => Promise<void>;
+  resetOutlookPool: (scope: "all" | "failed" | "unused") => Promise<void>;
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -830,7 +830,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       const data = await resetOutlookPoolApi(scope);
       set({ registerConfig: data.register });
-      toast.success(scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
+      toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
     } finally {
