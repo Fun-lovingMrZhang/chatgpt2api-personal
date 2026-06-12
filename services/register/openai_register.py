@@ -203,6 +203,27 @@ def _is_cloudflare_challenge(resp) -> bool:
     )
 
 
+def _authorize_landed_page(resp) -> str:
+    """诊断用：粗判 authorize 之后落在哪个页面。返回 signup / login / "" 仅供日志。
+
+    注意：email-verification / email_otp_verification 在注册和登录流程里都会出现，
+    无法据此可靠区分，所以这里只用于打日志，绝不据此中断注册流程。
+    """
+    if resp is None:
+        return ""
+    final_url = str(getattr(resp, "url", "") or "").lower()
+    data = _response_json(resp)
+    page_type = ""
+    page = data.get("page") if isinstance(data, dict) else None
+    if isinstance(page, dict):
+        page_type = str(page.get("type") or "").lower()
+    if "create-account" in final_url or "signup" in final_url or "create_account" in page_type:
+        return "signup"
+    if "/log-in" in final_url or "/login" in final_url or page_type in {"login", "password_verification"}:
+        return "login"
+    return ""
+
+
 def create_mailbox(username: str | None = None) -> dict:
     return mail_provider.create_mailbox(config["mail"], username)
 
@@ -336,7 +357,10 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            "screen_hint": "login_or_signup",
+            # 注册流程显式声明 signup：throwaway 域名 OpenAI 会自动当新账号走注册，
+            # 但 @outlook.com/@hotmail.com 这类真实消费邮箱会被 login_or_signup 路由到登录分支，
+            # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
+            "screen_hint": "signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -357,7 +381,10 @@ class PlatformRegistrar:
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
-        step(index, "platform authorize 完成")
+        landed = _authorize_landed_page(resp)
+        # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
+        # 真正的判定交给 user/register（失败会 dump 完整响应）。
+        step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
