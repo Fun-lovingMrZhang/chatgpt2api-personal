@@ -420,22 +420,28 @@ class PlatformRegistrar:
         mailbox = create_mailbox()
         email = str(mailbox.get("address") or "").strip()
         if not email:
+            mail_provider.release_mailbox(mailbox)
             raise RuntimeError("邮箱服务未返回 address")
         label = str(mailbox.get("label") or "")
         step(index, f"邮箱创建完成[{label}]: {email}")
-        password = _random_password()
-        first_name, last_name = _random_name()
-        self._platform_authorize(email, index)
-        self._register_user(email, password, index)
-        self._send_otp(index)
-        step(index, "开始等待注册验证码")
-        code = wait_for_code(mailbox)
-        if not code:
-            raise RuntimeError("等待注册验证码超时")
-        step(index, f"收到注册验证码: {code}")
-        self._validate_otp(code, index)
-        self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-        tokens = self._exchange_registered_tokens(index)
+        try:
+            password = _random_password()
+            first_name, last_name = _random_name()
+            self._platform_authorize(email, index)
+            self._register_user(email, password, index)
+            self._send_otp(index)
+            step(index, "开始等待注册验证码")
+            code = wait_for_code(mailbox)
+            if not code:
+                raise RuntimeError("等待注册验证码超时")
+            step(index, f"收到注册验证码: {code}")
+            self._validate_otp(code, index)
+            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            tokens = self._exchange_registered_tokens(index)
+        except Exception as error:
+            mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
+            raise
+        mail_provider.mark_mailbox_result(mailbox, success=True)
         return {
             "email": email,
             "password": password,
