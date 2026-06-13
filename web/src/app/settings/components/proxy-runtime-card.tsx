@@ -1,6 +1,6 @@
 "use client";
 
-import { Cookie, LoaderCircle, PlugZap, ShieldCheck } from "lucide-react";
+import { AlertTriangle, Cookie, LoaderCircle, PlugZap, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -61,12 +61,12 @@ export function ProxyRuntimeCard() {
       const data = await testProxy();
       setProxyResult(data.result);
       if (data.result.ok) {
-        toast.success(`稳定代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        toast.success(`清障代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
       } else {
-        toast.error(`稳定代理不可用：${data.result.error ?? "未知错误"}`);
+        toast.error(`清障代理不可用：${data.result.error ?? "未知错误"}`);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试稳定代理失败");
+      toast.error(error instanceof Error ? error.message : "测试清障代理失败");
     } finally {
       setIsTestingProxy(false);
     }
@@ -101,10 +101,10 @@ export function ProxyRuntimeCard() {
           <div>
             <div className="flex items-center gap-2 text-base font-semibold text-stone-900">
               <PlugZap className="size-5 text-stone-500" />
-              稳定代理运行时
+              FlareSolverr 清障
             </div>
             <p className="mt-1 text-xs leading-6 text-stone-500">
-              默认关闭。启用后仅接管上游 OpenAI/ChatGPT 请求，可配合 WARP / Privoxy / FlareSolverr 提升注册和生图链路稳定性。
+              默认关闭。用于注册遇到 Cloudflare 拦截后获取 clearance，可配合 WARP / Privoxy 代理链路重试。
             </p>
           </div>
           <span className={`rounded-full px-3 py-1 text-xs ${runtimeEnabled ? "bg-emerald-50 text-emerald-700" : "bg-stone-100 text-stone-500"}`}>
@@ -113,7 +113,12 @@ export function ProxyRuntimeCard() {
         </div>
 
         <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-xs leading-6 text-stone-600">
-          代理优先级：账号代理 &gt; 稳定代理运行时 &gt; 显式代理 &gt; 全局代理。Cookie / cf_clearance 不会在接口响应中明文返回。
+          代理优先级：账号代理 &gt; FlareSolverr 代理链路 &gt; 显式代理 &gt; 全局代理。Cookie / cf_clearance 不会在接口响应中明文返回。
+        </div>
+
+        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-6 text-amber-800">
+          <AlertTriangle className="mt-1 size-4 shrink-0" />
+          <span>使用 FlareSolverr 模式前，请先通过 Docker 启动 flaresolverr、privoxy、warp-proxy 等相关容器；容器内 URL 通常填写 http://flaresolverr:8191。</span>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
@@ -122,7 +127,7 @@ export function ProxyRuntimeCard() {
               checked={runtimeEnabled}
               onCheckedChange={(checked) => setProxyRuntimeField("enabled", Boolean(checked))}
             />
-            启用稳定代理运行时
+            启用 FlareSolverr 清障
           </label>
 
           <div className="space-y-2">
@@ -144,7 +149,7 @@ export function ProxyRuntimeCard() {
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">运行时代理 URL</label>
+            <label className="text-sm text-stone-700">清障代理 URL</label>
             <Input
               value={runtime.proxy_url}
               onChange={(event) => setProxyRuntimeField("proxy_url", event.target.value)}
@@ -162,7 +167,7 @@ export function ProxyRuntimeCard() {
             <Input
               value={runtime.resource_proxy_url}
               onChange={(event) => setProxyRuntimeField("resource_proxy_url", event.target.value)}
-              placeholder="留空则复用运行时代理"
+              placeholder="留空则复用清障代理"
               className="h-10 rounded-xl border-stone-200 bg-white"
               disabled={!runtimeEnabled || runtime.egress_mode !== "single_proxy"}
             />
@@ -198,7 +203,7 @@ export function ProxyRuntimeCard() {
               disabled={isTestingProxy || !runtimeEnabled}
             >
               {isTestingProxy ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
-              测试当前运行时代理
+              测试当前清障代理
             </Button>
           </div>
 

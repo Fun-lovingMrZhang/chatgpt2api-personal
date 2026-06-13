@@ -2,13 +2,13 @@
 
 ## Unreleased
 
-## 1.4.2 - 2026-06-11
+## 1.5.0 - 2026-06-13
 
-+ [新增] 稳定代理运行时。
-+ [新增] FlareSolverr 清障。
-+ [新增] WARP Compose 部署。
-+ [新增] 设置页代理面板。
-+ [优化] 注册拦截后重试。
++ [新增] 新增 WARP / Privoxy / FlareSolverr 清障方案，注册遇到 Cloudflare 拦截后可刷新 clearance 并重试。
++ [新增] 新增 `outlook_token` 邮箱池，支持 Outlook/Hotmail 注册验证码读取。
++ [新增] 新增网页搜索兼容接口、图片编辑 mask 和图片任务相关能力。
++ [优化] 更新 sentinel/PoW 获取方式，提高上游请求兼容性。
++ [优化] 调整代理优先级和注册请求重试逻辑。
 
 ## 1.4.1 - 2026-06-03
 

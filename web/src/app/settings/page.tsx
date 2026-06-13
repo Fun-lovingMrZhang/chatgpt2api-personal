@@ -7,6 +7,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 import { BackupSettingsCard } from "./components/backup-settings-card";
+import { ApiDocsCard } from "./components/api-docs-card";
 import { ConfigCard } from "./components/config-card";
 import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
@@ -20,10 +21,11 @@ import { useSettingsStore } from "./store";
 
 const settingsTabs = [
   { value: "basic", title: "基础配置" },
-  { value: "proxy", title: "代理运行时" },
   { value: "backup", title: "备份" },
   { value: "keys", title: "用户密钥" },
-  { value: "third-party", title: "三方应用" },
+  { value: "api-docs", title: "接口接入" },
+  { value: "canvas", title: "画布入口" },
+  { value: "proxy", title: "FlareSolverr" },
   { value: "cpa", title: "CPA" },
   { value: "sub2api", title: "Sub2API" },
 ];
@@ -99,8 +101,11 @@ function SettingsPageContent() {
         <TabsContent value="keys">
           <UserKeysCard />
         </TabsContent>
-        <TabsContent value="third-party">
+        <TabsContent value="canvas">
           <ThirdPartyAppsCard />
+        </TabsContent>
+        <TabsContent value="api-docs">
+          <ApiDocsCard />
         </TabsContent>
         <TabsContent value="cpa">
           <CPAPoolsCard />
