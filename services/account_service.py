@@ -1076,6 +1076,15 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
+    def list_normal_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("status") == "正常"
+                   and (token := item.get("access_token") or "")
+            ]
+
     @staticmethod
     def _account_payload_token(item: dict) -> str:
         return str(item.get("access_token") or item.get("accessToken") or "").strip()

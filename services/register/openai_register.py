@@ -194,25 +194,20 @@ def _response_debug_detail(resp, limit: int = 800) -> str:
 def _is_cloudflare_challenge(resp) -> bool:
     if resp is None:
         return False
-    text = str(getattr(resp, "text", "") or "").lower()
-    headers = getattr(resp, "headers", {}) or {}
-    server = str(headers.get("server") or "").lower()
     try:
         status_code = int(getattr(resp, "status_code", 0) or 0)
     except (TypeError, ValueError):
         status_code = 0
-
-    explicit_challenge_markers = (
-        "challenges.cloudflare.com" in text
-        or "<title>just a moment" in text
-        or "/cdn-cgi/challenge-platform/" in text
+    if status_code not in (403, 503):
+        return False
+    text = str(getattr(resp, "text", "") or "").lower()
+    return (
+        "<title>just a moment" in text
+        or "<title>attention required! | cloudflare" in text
         or "cf-chl-" in text
         or "__cf_chl_" in text
+        or "cf-browser-verification" in text
     )
-    if explicit_challenge_markers:
-        return True
-
-    return "cloudflare" in server and status_code in (403, 503)
 
 
 def _mail_config() -> dict:
@@ -300,10 +295,11 @@ def _headers_with_clearance(
     return normalized
 
 
-def _cloudflare_block_message(resp, prefix: str = "被 Cloudflare 拦截") -> str:
+def _cloudflare_block_message(resp, prefix: str = "被 Cloudflare 拦截", reason: str = "") -> str:
     status = getattr(resp, "status_code", "unknown")
     debug = _response_debug_detail(resp)
-    return f"{prefix}，clearance 刷新失败或重试后仍失败，请更换 IP/代理重试: status={status}, {debug}"
+    reason = reason or "clearance 刷新失败或重试后仍失败，请更换 IP/代理重试"
+    return f"{prefix}，{reason}: status={status}, {debug}"
 
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
@@ -386,6 +382,7 @@ class PlatformRegistrar:
         self.proxy = str(proxy or "").strip()
         self.session = create_session(self.proxy)
         self.clearance_user_agent = ""
+        self.clearance_failure_reason = ""
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
@@ -407,6 +404,14 @@ class PlatformRegistrar:
         return headers
 
     def _refresh_cloudflare_clearance(self, target_url: str, index: int) -> ClearanceBundle | None:
+        self.clearance_failure_reason = ""
+        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
+        if not profile.clearance_enabled:
+            self.clearance_failure_reason = (
+                "可尝试使用 FlareSolverr 清障方式，注意需要 Docker 部署 flaresolverr、privoxy、warp-proxy 等相关容器"
+            )
+            step(index, f"检测到 Cloudflare 拦截，{self.clearance_failure_reason}", "yellow")
+            return None
         step(index, "检测到 Cloudflare 拦截，尝试刷新 clearance", "yellow")
         bundle = proxy_settings.refresh_clearance(
             target_url=target_url,
@@ -418,6 +423,9 @@ class PlatformRegistrar:
             _apply_clearance_to_session(self.session, bundle)
             self.clearance_user_agent = bundle.user_agent or self.clearance_user_agent
             step(index, "Cloudflare clearance 刷新完成，重试当前请求", "yellow")
+        else:
+            self.clearance_failure_reason = "clearance 刷新未返回可用 Cookie，请检查 FlareSolverr URL、代理和出口 IP"
+            step(index, f"Cloudflare clearance 刷新失败：{self.clearance_failure_reason}", "yellow")
         return bundle
 
     def _platform_authorize(self, email: str, index: int) -> None:
@@ -453,7 +461,7 @@ class PlatformRegistrar:
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp))
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             retry_headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "get", target_url, headers=retry_headers, allow_redirects=True, verify=False)
             if _is_cloudflare_challenge(resp):
@@ -479,7 +487,7 @@ class PlatformRegistrar:
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp))
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/create-account/password")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
@@ -502,7 +510,7 @@ class PlatformRegistrar:
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp))
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
             if _is_cloudflare_challenge(resp):
@@ -533,7 +541,7 @@ class PlatformRegistrar:
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp))
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/about-you")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)

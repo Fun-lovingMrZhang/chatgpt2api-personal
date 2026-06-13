@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, Cookie, LoaderCircle, PlugZap, ShieldCheck } from "lucide-react";
+import { AlertTriangle, Cookie, LoaderCircle, PlugZap, Save, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -29,6 +29,7 @@ export function ProxyRuntimeCard() {
   const [targetUrl, setTargetUrl] = useState("https://chatgpt.com");
   const config = useSettingsStore((state) => state.config);
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
+  const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
   const setProxyRuntimeField = useSettingsStore((state) => state.setProxyRuntimeField);
   const setProxyRuntimeClearanceField = useSettingsStore((state) => state.setProxyRuntimeClearanceField);
@@ -359,6 +360,18 @@ export function ProxyRuntimeCard() {
               </div>
             ) : null}
           </div>
+        </div>
+
+        <div className="flex justify-end">
+          <Button
+            type="button"
+            className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+            onClick={() => void saveConfig()}
+            disabled={isSavingConfig}
+          >
+            {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+            保存配置
+          </Button>
         </div>
       </CardContent>
     </Card>
