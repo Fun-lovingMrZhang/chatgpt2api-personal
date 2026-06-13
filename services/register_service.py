@@ -68,8 +68,11 @@ class RegisterService:
 
     def _inject_proxy_to_mail(self) -> None:
         proxy = str(self._config.get("proxy") or "").strip()
-        if proxy and isinstance(self._config.get("mail"), dict):
-            self._config["mail"]["proxy"] = proxy
+        if isinstance(self._config.get("mail"), dict):
+            if proxy:
+                self._config["mail"]["proxy"] = proxy
+            else:
+                self._config["mail"].pop("proxy", None)
 
     def update(self, updates: dict) -> dict:
         with self._lock:
