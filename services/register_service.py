@@ -34,6 +34,8 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    if isinstance(cfg.get("mail"), dict):
+        cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -66,18 +68,14 @@ class RegisterService:
         with self._lock:
             return json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
 
-    def _inject_proxy_to_mail(self) -> None:
-        proxy = str(self._config.get("proxy") or "").strip()
+    def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):
-            if proxy:
-                self._config["mail"]["proxy"] = proxy
-            else:
-                self._config["mail"].pop("proxy", None)
+            self._config["mail"].pop("proxy", None)
 
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._config = _normalize({**self._config, **updates})
-            self._inject_proxy_to_mail()
+            self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             self._save()
             return self.get()
@@ -89,7 +87,7 @@ class RegisterService:
                 self._save()
                 return self.get()
             self._config["enabled"] = True
-            self._inject_proxy_to_mail()
+            self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}

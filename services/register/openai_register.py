@@ -203,12 +203,16 @@ def _is_cloudflare_challenge(resp) -> bool:
     )
 
 
+def _mail_config() -> dict:
+    return {**config["mail"], "proxy": config["proxy"]}
+
+
 def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(config["mail"], username)
+    return mail_provider.create_mailbox(_mail_config(), username)
 
 
 def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(config["mail"], mailbox)
+    return mail_provider.wait_for_code(_mail_config(), mailbox)
 
 
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
