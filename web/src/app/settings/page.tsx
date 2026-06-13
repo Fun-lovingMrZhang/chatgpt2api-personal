@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { LoaderCircle } from "lucide-react";
 
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 import { BackupSettingsCard } from "./components/backup-settings-card";
@@ -13,8 +14,19 @@ import { ImportBrowserDialog } from "./components/import-browser-dialog";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
 import { Sub2APIConnections } from "./components/sub2api-connections";
+import { ThirdPartyAppsCard } from "./components/third-party-apps-card";
 import { UserKeysCard } from "./components/user-keys-card";
 import { useSettingsStore } from "./store";
+
+const settingsTabs = [
+  { value: "basic", title: "基础配置" },
+  { value: "proxy", title: "代理运行时" },
+  { value: "backup", title: "备份" },
+  { value: "keys", title: "用户密钥" },
+  { value: "third-party", title: "三方应用" },
+  { value: "cpa", title: "CPA" },
+  { value: "sub2api", title: "Sub2API" },
+];
 
 function SettingsDataController() {
   const didLoadRef = useRef(false);
@@ -65,14 +77,38 @@ function SettingsPageContent() {
     <>
       <SettingsDataController />
       <SettingsHeader />
-      <section className="space-y-6">
-        <ConfigCard />
-        <ProxyRuntimeCard />
-        <BackupSettingsCard />
-        <UserKeysCard />
-        <CPAPoolsCard />
-        <Sub2APIConnections />
-      </section>
+      <Tabs defaultValue="basic" className="space-y-4">
+        <div className="sticky top-3 z-20 overflow-x-auto rounded-xl border border-white/80 bg-white/90 px-3 py-2 shadow-sm backdrop-blur">
+          <TabsList variant="line" className="min-w-max justify-start">
+            {settingsTabs.map((tab) => (
+              <TabsTrigger key={tab.value} value={tab.value} className="px-4">
+                {tab.title}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </div>
+        <TabsContent value="basic">
+          <ConfigCard />
+        </TabsContent>
+        <TabsContent value="proxy">
+          <ProxyRuntimeCard />
+        </TabsContent>
+        <TabsContent value="backup">
+          <BackupSettingsCard />
+        </TabsContent>
+        <TabsContent value="keys">
+          <UserKeysCard />
+        </TabsContent>
+        <TabsContent value="third-party">
+          <ThirdPartyAppsCard />
+        </TabsContent>
+        <TabsContent value="cpa">
+          <CPAPoolsCard />
+        </TabsContent>
+        <TabsContent value="sub2api">
+          <Sub2APIConnections />
+        </TabsContent>
+      </Tabs>
       <CPAPoolDialog />
       <ImportBrowserDialog />
     </>

@@ -152,7 +152,9 @@ export function ProxyRuntimeCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
               disabled={!runtimeEnabled || runtime.egress_mode !== "single_proxy"}
             />
-            <p className="text-xs text-stone-500">支持 http/https/socks，socks5 会转为 socks5h。</p>
+            <p className="text-xs leading-5 text-stone-500">
+              支持 http/https/socks5/socks5h，socks5 会转为 socks5h。带认证格式：协议://账号:密码@主机:端口，也可直接粘贴 主机:端口:账号:密码。
+            </p>
           </div>
 
           <div className="space-y-2">

@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Callable, Mapping
 from urllib import request as urllib_request
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from curl_cffi.requests import Session
 
@@ -27,6 +27,8 @@ def normalize_proxy_url(url: str) -> str:
     HTTP/HTTPS/socks5h inputs are otherwise left untouched except trimming.
     """
     candidate = str(url or "").strip()
+    if candidate and "://" not in candidate:
+        candidate = _colon_proxy_to_url(candidate)
     lowered = candidate.lower()
     if lowered.startswith("socks://"):
         return "socks5h://" + candidate[len("socks://") :]
@@ -422,6 +424,16 @@ def _clean(value: object) -> str:
     return str(value or "").strip()
 
 
+def _colon_proxy_to_url(url: str) -> str:
+    parts = url.split(":", 3)
+    if len(parts) == 4 and parts[1].isdigit():
+        host, port, username, password = parts
+        return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+    if len(parts) == 2 and parts[1].isdigit():
+        return f"http://{url}"
+    return url
+
+
 def _normalize_host(host: str) -> str:
     return str(host or "").strip().strip(".").lower()
 
@@ -522,7 +534,7 @@ def _find_header_key(headers: Mapping[str, object], name: str) -> str | None:
 
 def _redact_url_credentials(text: str) -> str:
     return re.sub(
-        r"(https?://)([^\s/@:]+):([^\s/@]+)@",
+        r"((?:https?|socks5h?|socks)://)([^\s/@:]+):([^\s/@]+)@",
         r"\1[REDACTED]@",
         str(text or ""),
         flags=re.IGNORECASE,
