@@ -264,6 +264,14 @@ export type UserKey = {
   last_used_at: string | null;
 };
 
+export type OutlookPoolStats = {
+  unused: number;
+  in_use: number;
+  used: number;
+  token_invalid: number;
+  failed: number;
+};
+
 export type RegisterConfig = {
   enabled: boolean;
   mail: {
@@ -697,6 +705,13 @@ export async function stopRegister() {
 
 export async function resetRegister() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
+}
+
+export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all") {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/outlook-pool/reset", {
+    method: "POST",
+    body: { scope },
+  });
 }
 
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────
