@@ -117,7 +117,7 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
-  const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
+  const canvas: Partial<ThirdPartyAppsSettings["infinite_canvas"]> = typeof source.infinite_canvas === "object" && source.infinite_canvas
     ? source.infinite_canvas
     : {};
   return {
@@ -334,6 +334,7 @@ type SettingsStore = {
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
+  setRegisterMailApiUseRegisterProxy: (value: boolean) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
   deleteRegisterProvider: (index: number) => void;
@@ -927,6 +928,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       registerConfig: {
         ...state.registerConfig,
         mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
+      },
+    } : {});
+  },
+
+  setRegisterMailApiUseRegisterProxy: (value) => {
+    set((state) => state.registerConfig ? {
+      registerConfig: {
+        ...state.registerConfig,
+        mail: { ...state.registerConfig.mail, api_use_register_proxy: value },
       },
     } : {});
   },
