@@ -2,6 +2,10 @@
 
 ## Unreleased
 
++ [修复] 修复sub2api导入问题。
++ [修复] 修复前端404、405问题。
++ [新增] 新增出图后删除对话记录功能。
+
 ## 1.5.0 - 2026-06-13
 
 + [新增] 新增 WARP / Privoxy / FlareSolverr 清障方案，注册遇到 Cloudflare 拦截后可刷新 clearance 并重试。
