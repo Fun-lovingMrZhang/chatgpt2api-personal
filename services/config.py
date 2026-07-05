@@ -18,7 +18,6 @@ BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
-    "register": True,
     "cpa": True,
     "sub2api": True,
     "logs": True,

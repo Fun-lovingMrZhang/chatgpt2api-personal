@@ -10,19 +10,13 @@ import {
   fetchCPAPoolFiles,
   fetchCPAPools,
   fetchBackups,
-  fetchRegisterConfig,
-  resetRegister as resetRegisterApi,
-  resetOutlookPool as resetOutlookPoolApi,
   fetchSettingsConfig,
   runBackupNow,
   syncImageStorage,
-  startRegister,
   startCPAImport,
-  stopRegister,
   testBackupConnection,
   testImageStorageConnection,
   updateCPAPool,
-  updateRegisterConfig,
   updateSettingsConfig,
   type BackupItem,
   type BackupSettings,
@@ -34,7 +28,6 @@ import {
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
-  type RegisterConfig,
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
@@ -161,7 +154,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       passphrase: "",
       include: {
         config: true,
-        register: true,
         cpa: true,
         sub2api: true,
         logs: true,
@@ -222,7 +214,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       passphrase: String(backup.passphrase || ""),
       include: {
         config: Boolean(backup.include?.config ?? true),
-        register: Boolean(backup.include?.register ?? true),
         cpa: Boolean(backup.include?.cpa ?? true),
         sub2api: Boolean(backup.include?.sub2api ?? true),
         logs: Boolean(backup.include?.logs ?? true),
@@ -264,10 +255,6 @@ type SettingsStore = {
   isTestingBackup: boolean;
   isTestingImageStorage: boolean;
   isSyncingImageStorage: boolean;
-
-  registerConfig: RegisterConfig | null;
-  isLoadingRegister: boolean;
-  isSavingRegister: boolean;
 
   pools: CPAPool[];
   isLoadingPools: boolean;
@@ -326,25 +313,6 @@ type SettingsStore = {
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
-  loadRegister: (silent?: boolean) => Promise<void>;
-  setRegisterConfig: (config: RegisterConfig) => void;
-  setRegisterProxy: (value: string) => void;
-  setRegisterTotal: (value: string) => void;
-  setRegisterThreads: (value: string) => void;
-  setRegisterMode: (value: "total" | "quota" | "available") => void;
-  setRegisterTargetQuota: (value: string) => void;
-  setRegisterTargetAvailable: (value: string) => void;
-  setRegisterCheckInterval: (value: string) => void;
-  setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
-  setRegisterMailApiUseRegisterProxy: (value: boolean) => void;
-  addRegisterProvider: () => void;
-  updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
-  deleteRegisterProvider: (index: number) => void;
-  saveRegister: () => Promise<void>;
-  toggleRegister: () => Promise<void>;
-  resetRegister: () => Promise<void>;
-  resetOutlookPool: (scope: "all" | "failed" | "unused") => Promise<void>;
-
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
   openEditDialog: (pool: CPAPool) => void;
@@ -378,10 +346,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isTestingBackup: false,
   isTestingImageStorage: false,
   isSyncingImageStorage: false,
-
-  registerConfig: null,
-  isLoadingRegister: true,
-  isSavingRegister: false,
 
   pools: [],
   isLoadingPools: true,
@@ -883,181 +847,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.error(error instanceof Error ? error.message : "测试备份连接失败");
     } finally {
       set({ isTestingBackup: false });
-    }
-  },
-
-  loadRegister: async (silent = false) => {
-    if (!silent) set({ isLoadingRegister: true });
-    try {
-      const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
-    } catch (error) {
-      if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
-    } finally {
-      if (!silent) set({ isLoadingRegister: false });
-    }
-  },
-
-  setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
-  },
-
-  setRegisterProxy: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
-  },
-
-  setRegisterTotal: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, total: Number(value) || 0 } } : {});
-  },
-
-  setRegisterThreads: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } } : {});
-  },
-
-  setRegisterMode: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, mode: value } } : {});
-  },
-
-  setRegisterTargetQuota: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, target_quota: Number(value) || 0 } } : {});
-  },
-
-  setRegisterTargetAvailable: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, target_available: Number(value) || 0 } } : {});
-  },
-
-  setRegisterCheckInterval: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, check_interval: Number(value) || 0 } } : {});
-  },
-
-  setRegisterMailField: (key, value) => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
-      },
-    } : {});
-  },
-
-  setRegisterMailApiUseRegisterProxy: (value) => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: { ...state.registerConfig.mail, api_use_register_proxy: value },
-      },
-    } : {});
-  },
-
-  addRegisterProvider: () => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: {
-          ...state.registerConfig.mail,
-          providers: [
-            ...(state.registerConfig.mail.providers || []),
-            { enable: true, type: "cloudmail_gen", api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" },
-          ],
-        },
-      },
-    } : {});
-  },
-
-  updateRegisterProvider: (index, updates) => {
-    set((state) => {
-      if (!state.registerConfig) return {};
-      const providers = [...(state.registerConfig.mail.providers || [])];
-      providers[index] = { ...(providers[index] || {}), ...updates };
-      return { registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
-    });
-  },
-
-  deleteRegisterProvider: (index) => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: {
-          ...state.registerConfig.mail,
-          providers: (state.registerConfig.mail.providers || []).filter((_, itemIndex) => itemIndex !== index),
-        },
-      },
-    } : {});
-  },
-
-  saveRegister: async () => {
-    const { registerConfig } = get();
-    if (!registerConfig) return;
-    try {
-      set({ isSavingRegister: true });
-      const data = await updateRegisterConfig({
-        mail: registerConfig.mail,
-        proxy: registerConfig.proxy.trim(),
-        total: Math.max(1, Number(registerConfig.total) || 1),
-        threads: Math.max(1, Number(registerConfig.threads) || 1),
-        mode: registerConfig.mode,
-        target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-        target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-        check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-      });
-      set({ registerConfig: data.register });
-      toast.success("注册配置已保存");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存注册配置失败");
-    } finally {
-      set({ isSavingRegister: false });
-    }
-  },
-
-  toggleRegister: async () => {
-    const { registerConfig } = get();
-    if (!registerConfig) return;
-    set({ isSavingRegister: true });
-    try {
-      if (!registerConfig.enabled) {
-        await updateRegisterConfig({
-          mail: registerConfig.mail,
-          proxy: registerConfig.proxy.trim(),
-          total: Math.max(1, Number(registerConfig.total) || 1),
-          threads: Math.max(1, Number(registerConfig.threads) || 1),
-          mode: registerConfig.mode,
-          target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-          target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-          check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-        });
-      }
-      const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: data.register });
-      toast.success(registerConfig.enabled ? "注册任务已停止" : "注册任务已启动");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "切换注册状态失败");
-    } finally {
-      set({ isSavingRegister: false });
-    }
-  },
-
-  resetRegister: async () => {
-    set({ isSavingRegister: true });
-    try {
-      const data = await resetRegisterApi();
-      set({ registerConfig: data.register });
-      toast.success("注册统计已重置");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "重置注册统计失败");
-    } finally {
-      set({ isSavingRegister: false });
-    }
-  },
-
-  resetOutlookPool: async (scope) => {
-    set({ isSavingRegister: true });
-    try {
-      const data = await resetOutlookPoolApi(scope);
-      set({ registerConfig: data.register });
-      toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
-    } finally {
-      set({ isSavingRegister: false });
     }
   },
 

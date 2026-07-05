@@ -605,7 +605,7 @@ class AccountService:
             device_id = str(uuid.uuid4())
             
             # ─── 方式2: OAuth authorize 流程 ──────────────────────────
-            # 使用 Platform Client + PKCE（与注册流程相同）
+            # 使用 Platform Client + PKCE
             
             from utils.pkce import generate_pkce
             code_verifier, code_challenge = generate_pkce()
@@ -745,7 +745,7 @@ class AccountService:
                 else:
                     return {"ok": False, "error": "no_auth_code", "detail": login_data}
             
-            # ④ 用 code 换 token (使用 Platform Client + code_verifier，与注册流程相同)
+            # ④ 用 code 换 token (使用 Platform Client + code_verifier)
             platform_base = "https://platform.openai.com"
             token_resp = session.post(
                 f"{auth_base}/api/accounts/oauth/token",
