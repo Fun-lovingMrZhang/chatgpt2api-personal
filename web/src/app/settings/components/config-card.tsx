@@ -38,6 +38,7 @@ export function ConfigCard() {
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
+  const setDefaultUpstreamModelName = useSettingsStore((state) => state.setDefaultUpstreamModelName);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
   const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
   const setImageStorageField = useSettingsStore((state) => state.setImageStorageField);
@@ -146,6 +147,16 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">用于生成图片结果的访问前缀地址。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">默认请求上游模型名称</label>
+            <Input
+              value={String(config?.default_upstream_model_name || "")}
+              onChange={(event) => setDefaultUpstreamModelName(event.target.value)}
+              placeholder="gpt-5-5"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">gpt-image-2 发起图片请求时使用的上游模型名称，默认 gpt-5-5。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片自动清理</label>

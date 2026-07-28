@@ -510,6 +510,10 @@ class ConfigStore:
         return str(self.data.get("global_system_prompt") or "").strip()
 
     @property
+    def default_upstream_model_name(self) -> str:
+        return str(self.data.get("default_upstream_model_name") or "gpt-5-5").strip()
+
+    @property
     def images_dir(self) -> Path:
         path = DATA_DIR / "images"
         path.mkdir(parents=True, exist_ok=True)
@@ -569,6 +573,7 @@ class ConfigStore:
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
+        data["default_upstream_model_name"] = self.default_upstream_model_name
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
