@@ -6,8 +6,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from services.image_task_service import ImageTaskService
+from services.image_task_service import ImageTaskService, _collect_image_urls
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -137,6 +138,96 @@ class ImageTaskServiceTests(unittest.TestCase):
             reloaded_task = reloaded.list_tasks(OWNER, ["memory-only-result"])["items"][0]
             self.assertEqual(reloaded_task["status"], "success")
             self.assertNotIn("data", reloaded_task)
+
+    def test_legacy_task_data_survives_metadata_save(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            legacy_data = [{"url": "http://local.test/images/legacy.png"}]
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "legacy-task",
+                                "owner_id": OWNER["id"],
+                                "status": "success",
+                                "mode": "generate",
+                                "model": "gpt-image-2",
+                                "created_at": now,
+                                "updated_at": now,
+                                "data": legacy_data,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            service = self.make_service(path)
+            service._update_task("owner-1:legacy-task", progress="metadata-only-update")
+            service._update_task(
+                "owner-1:legacy-task",
+                data=[{"url": "data:image/png;base64,new-result"}],
+            )
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["tasks"][0]["data"], legacy_data)
+
+    def test_collect_image_urls_skips_inline_data_urls(self):
+        self.assertEqual(
+            _collect_image_urls(
+                [
+                    {"url": "data:image/png;base64,c2VjcmV0"},
+                    {"url": "https://files.example.test/image.png"},
+                ]
+            ),
+            ["https://files.example.test/image.png"],
+        )
+
+    def test_resume_poll_passes_created_as_named_formatter_argument(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path)
+            key = "owner-1:resume-task"
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            service._tasks[key] = {
+                "id": "resume-task",
+                "owner_id": OWNER["id"],
+                "status": "running",
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "quality": "auto",
+                "size": "",
+                "created_at": now,
+                "updated_at": now,
+            }
+            backend = mock.Mock()
+            backend._poll_image_results.return_value = (["file-1"], [])
+            backend.resolve_conversation_image_urls.return_value = ["https://files.example.test/image.png"]
+            backend.download_image_bytes.return_value = [b"image-bytes"]
+
+            with (
+                mock.patch("services.image_task_service.config.proxy_url", "", create=True),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
+                mock.patch(
+                    "services.protocol.conversation.format_image_result",
+                    return_value={"data": [{"b64_json": "aW1hZ2UtYnl0ZXM="}]},
+                ) as format_result,
+            ):
+                service._run_resume_poll(
+                    key,
+                    "conversation-1",
+                    1.0,
+                    OWNER,
+                    "generate",
+                    "gpt-image-2",
+                )
+
+            self.assertEqual(service._tasks[key].get("status"), "success", service._tasks[key])
+            self.assertIn("created", format_result.call_args.kwargs)
+            self.assertIsInstance(format_result.call_args.kwargs["created"], int)
+            self.assertNotIn("message", format_result.call_args.kwargs)
 
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

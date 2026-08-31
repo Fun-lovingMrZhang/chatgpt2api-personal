@@ -113,14 +113,19 @@ class LogService:
 log_service = LogService(DATA_DIR / "logs.jsonl")
 
 
+def is_safe_to_log_url(url: str) -> bool:
+    normalized = url.strip().lower()
+    return bool(normalized) and not normalized.startswith("data:")
+
+
 def _collect_urls(value: object) -> list[str]:
     urls: list[str] = []
     if isinstance(value, dict):
         for key, item in value.items():
-            if key == "url" and isinstance(item, str):
+            if key == "url" and isinstance(item, str) and is_safe_to_log_url(item):
                 urls.append(item)
             elif key == "urls" and isinstance(item, list):
-                urls.extend(str(url) for url in item if isinstance(url, str))
+                urls.extend(url for url in item if isinstance(url, str) and is_safe_to_log_url(url))
             else:
                 urls.extend(_collect_urls(item))
     elif isinstance(value, list):
@@ -331,7 +336,11 @@ class LoggedCall:
             conv_id = conv_ids[0] if conv_ids else ""
         if conv_id:
             detail["conversation_id"] = conv_id
-        collected_urls = [*(urls or []), *_collect_urls(result)]
+        collected_urls = [
+            url
+            for url in [*(urls or []), *_collect_urls(result)]
+            if is_safe_to_log_url(url)
+        ]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

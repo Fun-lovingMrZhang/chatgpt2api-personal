@@ -4,13 +4,14 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
-from services.log_service import LOG_TYPE_CALL, log_service
+from services.log_service import LOG_TYPE_CALL, is_safe_to_log_url, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
 TASK_STATUS_QUEUED = "queued"
@@ -56,7 +57,7 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     for item in data:
         if isinstance(item, dict):
             url = item.get("url")
-            if isinstance(url, str) and url:
+            if isinstance(url, str) and is_safe_to_log_url(url):
                 urls.append(url)
     return urls
 
@@ -395,6 +396,7 @@ class ImageTaskService:
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
+                task["_persisted_data"] = deepcopy(data)
             usage = item.get("usage")
             if isinstance(usage, dict):
                 task["usage"] = usage
@@ -406,10 +408,17 @@ class ImageTaskService:
 
     def _save_locked(self) -> None:
         tasks = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        items = [
-            {key: value for key, value in task.items() if key != "data"}
-            for task in tasks
-        ]
+        items = []
+        for task in tasks:
+            item = {
+                key: value
+                for key, value in task.items()
+                if key not in {"data", "_persisted_data"}
+            }
+            persisted_data = task.get("_persisted_data")
+            if isinstance(persisted_data, list):
+                item["data"] = persisted_data
+            items.append(item)
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(self.path)
@@ -520,8 +529,7 @@ class ImageTaskService:
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
                 "b64_json",
-                "",
-                int(time.time()),
+                created=int(time.time()),
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(

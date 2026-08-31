@@ -56,8 +56,9 @@ async function downloadStoredImage(image: StoredImage, index: number) {
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       blob = new Blob([bytes], { type: "image/png" });
     } else if (image.url) {
-      // 确保 URL 是绝对路径
-      const url = image.url.startsWith("http") ? image.url : `${window.location.origin}${image.url}`;
+      const url = image.url.startsWith("data:") || image.url.startsWith("blob:")
+        ? image.url
+        : new URL(image.url, window.location.origin).toString();
       const res = await fetch(url);
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}: ${res.statusText}`);
