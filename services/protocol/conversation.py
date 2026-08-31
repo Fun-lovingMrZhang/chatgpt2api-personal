@@ -13,7 +13,6 @@ import tiktoken
 
 from services.account_service import account_service
 from services.config import config
-from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
@@ -148,10 +147,6 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
-
-
 def message_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -266,7 +261,6 @@ def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
     response_format: str,
-    base_url: str | None = None,
     created: int | None = None,
     message: str = "",
 ) -> dict[str, Any]:
@@ -279,12 +273,11 @@ def format_image_result(
         if response_format == "b64_json":
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": f"data:image/png;base64,{b64_json}",
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -304,7 +297,6 @@ class ConversationRequest:
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
-    base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
 
@@ -1009,7 +1001,6 @@ def stream_image_outputs(
             image_items,
             request.prompt,
             request.response_format,
-            request.base_url,
             int(time.time()),
         )["data"]
         if data:
@@ -1106,7 +1097,6 @@ def stream_image_outputs(
                         image_items,
                         request.prompt,
                         request.response_format,
-                        request.base_url,
                         int(time.time()),
                     )["data"]
                     if data:
@@ -1218,7 +1208,6 @@ def stream_image_outputs(
                     image_items,
                     request.prompt,
                     request.response_format,
-                    request.base_url,
                     int(time.time()),
                 )["data"]
                 if data:
@@ -1278,7 +1267,6 @@ def stream_codex_image_outputs(
         [{"b64_json": item, "revised_prompt": request.prompt} for item in images],
         request.prompt,
         request.response_format,
-        request.base_url,
         int(time.time()),
     )["data"]
     if data:

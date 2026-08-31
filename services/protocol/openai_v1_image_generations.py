@@ -19,7 +19,6 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")
-    base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
@@ -28,7 +27,6 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         size=size,
         quality=quality,
         response_format=response_format,
-        base_url=base_url,
         message_as_error=True,
         progress_callback=progress_callback,
     ))
