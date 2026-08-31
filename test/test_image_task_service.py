@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import tempfile
 import time
@@ -105,7 +106,37 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(result["missing_ids"], [])
             self.assertEqual(result["items"][0]["status"], "success")
-            self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
+            self.assertNotIn("data", result["items"][0])
+
+    def test_success_task_keeps_result_in_memory_without_persisting_image_data(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            encoded = base64.b64encode(b"generated-image").decode("ascii")
+
+            def handler(_payload):
+                return {"data": [{"b64_json": encoded, "revised_prompt": "cat"}]}
+
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="memory-only-result",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            current = wait_for_task(service, OWNER, "memory-only-result", "success")
+            self.assertEqual(current["data"][0]["b64_json"], encoded)
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted_task = persisted["tasks"][0]
+            self.assertNotIn("data", persisted_task)
+
+            reloaded = self.make_service(path, handler)
+            reloaded_task = reloaded.list_tasks(OWNER, ["memory-only-result"])["items"][0]
+            self.assertEqual(reloaded_task["status"], "success")
+            self.assertNotIn("data", reloaded_task)
 
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
