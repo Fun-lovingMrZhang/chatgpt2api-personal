@@ -35,6 +35,41 @@ function formatDateTime(value?: string | null) {
   }).format(date);
 }
 
+function parseQuotaLimit(value: string) {
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function QuotaSummary({
+  label,
+  used,
+  reserved,
+  remaining,
+  limit,
+}: {
+  label: string;
+  used: number;
+  reserved: number;
+  remaining: number;
+  limit: number;
+}) {
+  return (
+    <div className="min-w-0 text-xs text-stone-500">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="font-medium text-stone-700">{label}</span>
+        <span>
+          已用 {used} / {limit}
+        </span>
+      </div>
+      <div className="mt-1">剩余 {remaining} · 处理中 {reserved}</div>
+    </div>
+  );
+}
+
 export function UserKeysCard() {
   const didLoadRef = useRef(false);
   const [items, setItems] = useState<UserKey[]>([]);
@@ -48,16 +83,26 @@ export function UserKeysCard() {
   const [editingItem, setEditingItem] = useState<UserKey | null>(null);
   const [editName, setEditName] = useState("");
   const [editKey, setEditKey] = useState("");
+  const [createTextLimit, setCreateTextLimit] = useState("0");
+  const [createImageLimit, setCreateImageLimit] = useState("0");
+  const [editTextLimit, setEditTextLimit] = useState("0");
+  const [editImageLimit, setEditImageLimit] = useState("0");
 
-  const load = async () => {
-    setIsLoading(true);
+  const load = async (silent = false) => {
+    if (!silent) {
+      setIsLoading(true);
+    }
     try {
       const data = await fetchUserKeys();
       setItems(data.items);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载用户密钥失败");
+      if (!silent) {
+        toast.error(error instanceof Error ? error.message : "加载用户密钥失败");
+      }
     } finally {
-      setIsLoading(false);
+      if (!silent) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -69,13 +114,56 @@ export function UserKeysCard() {
     void load();
   }, []);
 
+  useEffect(() => {
+    let intervalId: number | undefined;
+
+    const stopPolling = () => {
+      if (intervalId !== undefined) {
+        window.clearInterval(intervalId);
+        intervalId = undefined;
+      }
+    };
+
+    const startPolling = () => {
+      stopPolling();
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      intervalId = window.setInterval(() => void load(true), 5000);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void load(true);
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    };
+
+    startPolling();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      stopPolling();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
   const handleCreate = async () => {
+    const textLimit = parseQuotaLimit(createTextLimit);
+    const imageLimit = parseQuotaLimit(createImageLimit);
+    if (textLimit === null || imageLimit === null) {
+      toast.error("额度必须是大于等于 0 的整数");
+      return;
+    }
     setIsCreating(true);
     try {
-      const data = await createUserKey(name.trim());
+      const data = await createUserKey(name.trim(), textLimit, imageLimit);
       setItems(data.items);
       setRevealedKey(data.key);
       setName("");
+      setCreateTextLimit("0");
+      setCreateImageLimit("0");
       setIsDialogOpen(false);
       toast.success("用户密钥已创建");
     } catch (error) {
@@ -132,6 +220,8 @@ export function UserKeysCard() {
     setEditingItem(item);
     setEditName(item.name);
     setEditKey("");
+    setEditTextLimit(String(item.text_limit ?? 0));
+    setEditImageLimit(String(item.image_limit ?? 0));
   };
 
   const handleEdit = async () => {
@@ -141,7 +231,14 @@ export function UserKeysCard() {
     const item = editingItem;
     const trimmedName = editName.trim();
     const trimmedKey = editKey.trim();
-    if (trimmedName === item.name && !trimmedKey) {
+    const textLimit = parseQuotaLimit(editTextLimit);
+    const imageLimit = parseQuotaLimit(editImageLimit);
+    if (textLimit === null || imageLimit === null) {
+      toast.error("额度必须是大于等于 0 的整数");
+      return;
+    }
+    const limitsChanged = textLimit !== item.text_limit || imageLimit !== item.image_limit;
+    if (trimmedName === item.name && !trimmedKey && !limitsChanged) {
       setEditingItem(null);
       return;
     }
@@ -150,11 +247,12 @@ export function UserKeysCard() {
       const data = await updateUserKey(item.id, {
         ...(trimmedName !== item.name ? { name: trimmedName } : {}),
         ...(trimmedKey ? { key: trimmedKey } : {}),
+        ...(limitsChanged ? { text_limit: textLimit, image_limit: imageLimit } : {}),
       });
       setItems(data.items);
       setEditingItem(null);
       setEditKey("");
-      toast.success(trimmedKey ? "用户密钥已更新" : "用户名称已更新");
+      toast.success(limitsChanged ? "用户密钥与额度已更新" : trimmedKey ? "用户密钥已更新" : "用户名称已更新");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
     } finally {
@@ -234,6 +332,22 @@ export function UserKeysCard() {
                         <span>创建时间 {formatDateTime(item.created_at)}</span>
                         <span>最近使用 {formatDateTime(item.last_used_at)}</span>
                       </div>
+                      <div className="grid max-w-xl grid-cols-1 gap-x-6 gap-y-2 border-t border-stone-100 pt-2 sm:grid-cols-2">
+                        <QuotaSummary
+                          label="文本额度"
+                          used={item.text_used}
+                          reserved={item.text_reserved}
+                          remaining={item.text_remaining}
+                          limit={item.text_limit}
+                        />
+                        <QuotaSummary
+                          label="图片额度（生成+编辑）"
+                          used={item.image_used}
+                          reserved={item.image_reserved}
+                          remaining={item.image_remaining}
+                          limit={item.image_limit}
+                        />
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -298,6 +412,38 @@ export function UserKeysCard() {
               placeholder="例如：设计同学 A、运营临时账号"
               className="h-11 rounded-xl border-stone-200 bg-white"
             />
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700" htmlFor="create-text-limit">
+                文本额度（总次数）
+              </label>
+              <Input
+                id="create-text-limit"
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                value={createTextLimit}
+                onChange={(event) => setCreateTextLimit(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700" htmlFor="create-image-limit">
+                图片额度（总张数）
+              </label>
+              <Input
+                id="create-image-limit"
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                value={createImageLimit}
+                onChange={(event) => setCreateImageLimit(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -390,6 +536,38 @@ export function UserKeysCard() {
               <p className="text-xs leading-5 text-stone-500">
                 保存后旧密钥会立即失效，新密钥生效。系统仍只保存哈希，不会回显当前密钥。
               </p>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700" htmlFor="edit-text-limit">
+                  文本额度（总次数）
+                </label>
+                <Input
+                  id="edit-text-limit"
+                  type="number"
+                  min={0}
+                  step={1}
+                  inputMode="numeric"
+                  value={editTextLimit}
+                  onChange={(event) => setEditTextLimit(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700" htmlFor="edit-image-limit">
+                  图片额度（总张数）
+                </label>
+                <Input
+                  id="edit-image-limit"
+                  type="number"
+                  min={0}
+                  step={1}
+                  inputMode="numeric"
+                  value={editImageLimit}
+                  onChange={(event) => setEditImageLimit(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+              </div>
             </div>
           </div>
           <DialogFooter>
