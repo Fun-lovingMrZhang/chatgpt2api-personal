@@ -11,6 +11,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from services.scheduler.context import current_execution_context
 from services.protocol.conversation import count_message_tokens, count_text_tokens, normalize_messages
 from services.protocol.openai_v1_chat_complete import collect_chat_content, stream_text_chat_completion
 
@@ -110,8 +111,14 @@ def preprocess_payload(payload: dict[str, object], text_mapper: Callable[[str], 
 def message_request(body: dict[str, Any]) -> MessageRequest:
     payload = preprocess_payload(dict(body))
     model = str(payload.get("model") or "auto").strip() or "auto"
+    context = current_execution_context()
+    token = (
+        context.lease.access_token
+        if context is not None and context.lease is not None
+        else account_service.get_text_access_token(model=model)
+    )
     return MessageRequest(
-        backend=OpenAIBackendAPI(access_token=account_service.get_text_access_token(model=model)),
+        backend=OpenAIBackendAPI(access_token=token),
         messages=normalize_messages(payload.get("messages"), payload.get("system")),
         model=model,
         tools=payload.get("tools"),

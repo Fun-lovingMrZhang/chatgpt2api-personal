@@ -19,6 +19,8 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
+from services.scheduler.models import Lane
+from services.scheduler.service import scheduler_service
 
 
 class ImageGenerationRequest(BaseModel):
@@ -77,6 +79,18 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
         raise
 
 
+def _text_scheduler_runner(model: str):
+    requirement = scheduler_service.classify_text(model)
+
+    async def runner(handler, *args, streaming: bool = False):
+        work = lambda _lease, _cancel: handler(*args)
+        if streaming:
+            return await scheduler_service.run_stream(Lane.TEXT, requirement, work)
+        return await scheduler_service.run_text(requirement, work)
+
+    return runner
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -133,7 +147,12 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("messages")),
         )
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_chat_complete.handle, payload)
+        return await call.run(
+            openai_v1_chat_complete.handle,
+            payload,
+            scheduler_runner=_text_scheduler_runner(model),
+            streaming=bool(payload.get("stream")),
+        )
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
@@ -150,7 +169,12 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_response.handle, payload)
+        return await call.run(
+            openai_v1_response.handle,
+            payload,
+            scheduler_runner=_text_scheduler_runner(model),
+            streaming=bool(payload.get("stream")),
+        )
 
     @router.post("/v1/messages")
     async def create_message(
@@ -165,14 +189,24 @@ def create_router() -> APIRouter:
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
         call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
         await filter_or_log(call, request_preview)
-        return await call.run(anthropic_v1_messages.handle, payload, sse="anthropic")
+        return await call.run(
+            anthropic_v1_messages.handle,
+            payload,
+            sse="anthropic",
+            scheduler_runner=_text_scheduler_runner(model),
+            streaming=bool(payload.get("stream")),
+        )
 
     @router.post("/v1/search")
     async def search(body: SearchRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
-        return await call.run(openai_search.handle, body.model_dump(mode="python"))
+        return await call.run(
+            openai_search.handle,
+            body.model_dump(mode="python"),
+            scheduler_runner=_text_scheduler_runner(openai_search.MODEL),
+        )
 
     @router.get("/v1/editable-file-tasks")
     async def list_editable_file_tasks(ids: str = "", authorization: str | None = Header(default=None)):

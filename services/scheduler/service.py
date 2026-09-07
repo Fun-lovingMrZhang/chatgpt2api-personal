@@ -9,8 +9,9 @@ from typing import Any, Callable
 from services.account_service import AccountService, account_service
 from services.config import DATA_DIR, config
 from services.scheduler.account_pool import AccountPool
+from services.scheduler.context import ExecutionContext
 from services.scheduler.lane import BoundedStream, LaneScheduler
-from services.scheduler.models import AccountRequirement, Lane, SchedulerSettings
+from services.scheduler.models import AccountRequirement, Lane, Lease, Outcome, SchedulerSettings
 from services.scheduler.reconciler import AccountReconciler
 from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter
 from utils.helper import anonymize_token, split_image_model
@@ -50,7 +51,13 @@ class SchedulerService:
             interval_seconds=self.settings.snapshot_flush_interval_ms / 1000.0,
         )
         self._lanes = {
-            lane: LaneScheduler(lane, self.settings, self.account_pool, clock=clock)
+            lane: LaneScheduler(
+                lane,
+                self.settings,
+                self.account_pool,
+                clock=clock,
+                lease_replacer=self._replace_execution_lease,
+            )
             for lane in Lane
         }
         self._cooldown_thread: Thread | None = None
@@ -205,12 +212,31 @@ class SchedulerService:
 
     @staticmethod
     def _default_model_router(model: str) -> object:
-        try:
-            from services.model_service import model_catalog_service
+        # Model catalog refresh performs network I/O. The scheduler starts with
+        # a local all-capability fallback and can be given a warmed route map.
+        return set()
 
-            return model_catalog_service.route_for_model(model)
-        except Exception:
-            return set()
+    def _replace_execution_lease(
+        self,
+        context: ExecutionContext,
+        excluded_tokens: set[str],
+        outcome: Outcome,
+    ) -> Lease | None:
+        current = context.lease
+        if current is not None:
+            self.account_pool.release(current, outcome=outcome, latency_ms=0.0)
+            context.lease = None
+            context.lease_released = True
+        replacement = self.account_pool.try_acquire(
+            context.requirement,
+            deadline=current.deadline if current is not None else self._clock() + 1,
+            excluded=excluded_tokens,
+        )
+        if replacement is None:
+            return None
+        context.lease = replacement
+        context.lease_released = False
+        return replacement
 
     def _start_thread(self, name: str, target: Callable[[], None]) -> Thread:
         thread = Thread(target=target, name=name, daemon=True)

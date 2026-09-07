@@ -15,6 +15,11 @@ from services.scheduler.errors import (
     SchedulerDeadlineError,
     SchedulerError,
 )
+from services.scheduler.context import (
+    ExecutionContext,
+    install_execution_context,
+    reset_execution_context,
+)
 from services.scheduler.models import AccountRequirement, Lane, Lease, Outcome
 
 
@@ -74,6 +79,7 @@ class _QueuedJob:
     stream: BoundedStream | None = None
     started: bool = False
     client_cancelled: bool = False
+    execution_context: ExecutionContext | None = None
 
 
 class LaneScheduler:
@@ -88,6 +94,7 @@ class LaneScheduler:
         clock: Callable[[], float] = time.monotonic,
         stream_queue_size: int = 8,
         aging_seconds: float = 1.0,
+        lease_replacer: Callable[[ExecutionContext, set[str], Outcome], Lease | None] | None = None,
     ):
         self.lane = lane
         self.settings = settings.lanes[lane] if hasattr(settings, "lanes") else settings
@@ -95,6 +102,7 @@ class LaneScheduler:
         self._clock = clock
         self._stream_queue_size = max(1, int(stream_queue_size))
         self._aging_seconds = max(0.01, float(aging_seconds))
+        self._lease_replacer = lease_replacer
         self._loop: asyncio.AbstractEventLoop | None = None
         self._condition: asyncio.Condition | None = None
         self._executor: ThreadPoolExecutor | None = None
@@ -417,29 +425,40 @@ class LaneScheduler:
         lease: Lease,
         loop: asyncio.AbstractEventLoop,
     ) -> Any:
-        result = self._invoke_work(job.work, lease, job.cancel_event)
-        if inspect.isawaitable(result):
-            result = asyncio.run(result)
-        if not job.is_stream:
-            return result
-        if hasattr(result, "__aiter__"):
-            raise TypeError("stream work must return a synchronous iterable")
+        context = ExecutionContext(
+            lease=lease,
+            requirement=job.requirement,
+            cancel_event=job.cancel_event,
+            replace_lease=self._lease_replacer,
+        )
+        job.execution_context = context
+        context_token = install_execution_context(context)
         try:
-            for item in result:
-                if job.cancel_event.is_set():
-                    break
-                put_future = asyncio.run_coroutine_threadsafe(
-                    self._put_stream_item(job, item),
-                    loop,
-                )
-                try:
-                    if not put_future.result():
+            result = self._invoke_work(job.work, lease, job.cancel_event)
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            if not job.is_stream:
+                return result
+            if hasattr(result, "__aiter__"):
+                raise TypeError("stream work must return a synchronous iterable")
+            try:
+                for item in result:
+                    if job.cancel_event.is_set():
                         break
-                except BaseException:
-                    break
-        except TypeError:
-            raise TypeError("stream work must return an iterable") from None
-        return None
+                    put_future = asyncio.run_coroutine_threadsafe(
+                        self._put_stream_item(job, item),
+                        loop,
+                    )
+                    try:
+                        if not put_future.result():
+                            break
+                    except BaseException:
+                        break
+            except TypeError:
+                raise TypeError("stream work must return an iterable") from None
+            return None
+        finally:
+            reset_execution_context(context_token)
 
     @staticmethod
     def _invoke_work(
@@ -528,7 +547,11 @@ class LaneScheduler:
         outcome: Outcome,
         latency_ms: float,
     ) -> None:
-        self.account_pool.release(lease, outcome=outcome, latency_ms=latency_ms)
+        active_lease = lease
+        if job.execution_context is not None:
+            active_lease = job.execution_context.lease
+        if active_lease is not None:
+            self.account_pool.release(active_lease, outcome=outcome, latency_ms=latency_ms)
         self._active_jobs = max(0, self._active_jobs - 1)
         self._active_cost = max(0, self._active_cost - job.cost)
         condition = self._condition

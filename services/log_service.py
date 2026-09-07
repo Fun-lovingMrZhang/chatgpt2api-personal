@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import itertools
 import threading
 import time
@@ -247,11 +248,22 @@ class LoggedCall:
     request_text: str = ""
     request_shape: dict[str, int] | None = None
 
-    async def run(self, handler, *args, sse: str = "openai"):
+    async def run(
+        self,
+        handler,
+        *args,
+        sse: str = "openai",
+        scheduler_runner=None,
+        streaming: bool = False,
+    ):
         from services.protocol.conversation import ImageGenerationError
+        from services.scheduler.errors import SchedulerError
 
         try:
-            result = await run_in_threadpool(handler, *args)
+            if scheduler_runner is None:
+                result = await run_in_threadpool(handler, *args)
+            else:
+                result = await scheduler_runner(handler, *args, streaming=streaming)
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
@@ -259,6 +271,16 @@ class LoggedCall:
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
+        except SchedulerError as exc:
+            self.log("调用失败", status="failed", error=str(exc))
+            headers = {}
+            if exc.retry_after_seconds is not None:
+                headers["Retry-After"] = str(max(1, int(exc.retry_after_seconds)))
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error": str(exc)},
+                headers=headers or None,
+            ) from exc
         except Exception as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
@@ -270,6 +292,9 @@ class LoggedCall:
             response = dict(result)
             response.pop("_account_email", None)
             return response
+
+        if hasattr(result, "__aiter__"):
+            return await self._run_async_stream(result, sse=sse)
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
@@ -290,6 +315,94 @@ class LoggedCall:
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+
+    async def _run_async_stream(self, result, *, sse: str):
+        try:
+            first = await result.__anext__()
+        except StopAsyncIteration:
+            self.log("流式调用结束")
+            return StreamingResponse(
+                self._async_sender((), sse=sse),
+                media_type="text/event-stream",
+            )
+        return StreamingResponse(
+            self._async_sender(self.async_stream(result, first), sse=sse),
+            media_type="text/event-stream",
+        )
+
+    async def async_stream(self, items, first):
+        urls: list[str] = []
+        account_emails: list[str] = []
+        conversation_ids: list[str] = []
+        failed = False
+        try:
+            for item in [first]:
+                urls.extend(_collect_urls(item))
+                account_emails.extend(_collect_account_emails(item))
+                conversation_ids.extend(_collect_conversation_ids(item))
+                yield _strip_internal_response_fields(item)
+            async for item in items:
+                urls.extend(_collect_urls(item))
+                account_emails.extend(_collect_account_emails(item))
+                conversation_ids.extend(_collect_conversation_ids(item))
+                yield _strip_internal_response_fields(item)
+        except Exception as exc:
+            failed = True
+            self.log(
+                "流式调用失败",
+                status="failed",
+                error=str(exc),
+                urls=urls,
+                account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
+                conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
+            )
+            raise
+        finally:
+            close = getattr(items, "aclose", None)
+            if close is not None:
+                await close()
+            if not failed:
+                self.log(
+                    "流式调用结束",
+                    urls=urls,
+                    account_email=account_emails[0] if account_emails else "",
+                    conversation_id=conversation_ids[0] if conversation_ids else "",
+                )
+
+    @staticmethod
+    async def _async_sender(items, *, sse: str):
+        if sse == "openai":
+            yield ": stream-open\n\n"
+        try:
+            if hasattr(items, "__aiter__"):
+                iterator = items.__aiter__()
+                async for item in iterator:
+                    if sse == "anthropic":
+                        event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
+                        yield f"event: {event}\n"
+                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                    else:
+                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            else:
+                for item in items:
+                    if sse == "anthropic":
+                        event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
+                        yield f"event: {event}\n"
+                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                    else:
+                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            if sse == "anthropic":
+                error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
+                yield "event: error\n"
+                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+            else:
+                error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
+                    "error": {"message": str(exc), "type": exc.__class__.__name__}
+                }
+                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        if sse == "openai":
+            yield "data: [DONE]\n\n"
 
     def stream(self, items):
         urls: list[str] = []

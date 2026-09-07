@@ -14,6 +14,8 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.scheduler.context import current_execution_context
+from services.scheduler.models import Outcome
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -699,11 +701,15 @@ def conversation_events(
 
 
 def text_backend(model: str = "auto") -> OpenAIBackendAPI:
+    context = current_execution_context()
+    if context is not None and context.lease is not None:
+        return OpenAIBackendAPI(access_token=context.lease.access_token)
     return OpenAIBackendAPI(access_token=account_service.get_text_access_token(model=model))
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
+    execution_context = current_execution_context()
     token = getattr(backend, "access_token", "")
     emitted = False
     while True:
@@ -732,6 +738,16 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         except Exception as exc:
             error_message = str(exc)
             if token and not emitted and is_token_invalid_error(error_message):
+                if execution_context is not None and execution_context.replace_lease is not None:
+                    replacement = execution_context.replace_lease(
+                        execution_context,
+                        set(attempted_tokens),
+                        Outcome.AUTH_ERROR,
+                    )
+                    if replacement is None:
+                        raise RuntimeError("no available text account") from exc
+                    token = replacement.access_token
+                    continue
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
