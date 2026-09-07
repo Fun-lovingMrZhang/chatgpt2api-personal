@@ -14,7 +14,7 @@ from services.scheduler.lane import BoundedStream, LaneScheduler
 from services.scheduler.models import AccountRequirement, Lane, Lease, Outcome, SchedulerSettings
 from services.scheduler.reconciler import AccountReconciler
 from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter
-from utils.helper import anonymize_token, split_image_model
+from utils.helper import anonymize_token, is_codex_image_model, split_image_model
 
 
 class SchedulerService:
@@ -149,6 +149,81 @@ class SchedulerService:
             deadline=deadline,
         )
 
+    async def run_image_units(
+        self,
+        requirement: AccountRequirement,
+        work_factory: Callable[[int], Any],
+        *,
+        priority: int = 0,
+        deadline: float | None = None,
+    ) -> list[Any]:
+        """Run one bounded lane job per requested image output."""
+        if requirement.lane not in {Lane.IMAGE_GENERATION, Lane.IMAGE_EDIT}:
+            raise ValueError("run_image_units requires an image lane")
+        count = max(1, int(requirement.cost))
+        unit_requirement = AccountRequirement(
+            lane=requirement.lane,
+            model=requirement.model,
+            plan_type=requirement.plan_type,
+            source_type=requirement.source_type,
+            cost=1,
+        )
+
+        works = [
+            (lambda _lease, _cancel, index=index: work_factory(index))
+            for index in range(1, count + 1)
+        ]
+        futures = await self.lane(requirement.lane).submit_batch(
+            works,
+            unit_requirement,
+            cost=1,
+            priority=priority,
+            deadline=deadline,
+        )
+        try:
+            completed = await asyncio.gather(
+                *(asyncio.shield(future) for future in futures),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            for future in futures:
+                future.cancel()
+            await asyncio.gather(
+                *(asyncio.shield(future) for future in futures),
+                return_exceptions=True,
+            )
+            raise
+
+        results: list[Any] = []
+        errors: list[BaseException] = []
+        for item in completed:
+            if isinstance(item, BaseException):
+                errors.append(item)
+            else:
+                results.append(item)
+        if not results and errors:
+            raise errors[0]
+        return results
+
+    async def admit_background(
+        self,
+        requirement: AccountRequirement,
+        work: Callable[..., Any],
+        *,
+        priority: int = 0,
+        deadline: float | None = None,
+    ) -> asyncio.Future[Any]:
+        """Admit a background image job and return its completion future."""
+        if requirement.lane not in {Lane.IMAGE_GENERATION, Lane.IMAGE_EDIT}:
+            raise ValueError("admit_background requires an image lane")
+        return await self.lane(requirement.lane).submit_background(
+            work,
+            requirement,
+            cost=max(1, requirement.cost),
+            priority=priority,
+            deadline=deadline,
+        )
+
     async def run_stream(
         self,
         lane: Lane,
@@ -206,15 +281,24 @@ class SchedulerService:
             lane,
             model or requested_model,
             plan_type=plan_type,
-            source_type=str(payload.get("source_type") or "web"),
+            source_type=str(
+                payload.get("source_type")
+                or ("codex" if is_codex_image_model(requested_model) else "web")
+            ),
             cost=cost,
         )
 
     @staticmethod
     def _default_model_router(model: str) -> object:
-        # Model catalog refresh performs network I/O. The scheduler starts with
-        # a local all-capability fallback and can be given a warmed route map.
-        return set()
+        # Only consult the already-warmed catalog. A refresh performs network
+        # I/O and must stay outside the request admission path.
+        try:
+            from services.model_service import model_catalog_service
+
+            route = model_catalog_service.cached_route_for_model(model)
+            return route if route is not None else set()
+        except Exception:
+            return set()
 
     def _replace_execution_lease(
         self,

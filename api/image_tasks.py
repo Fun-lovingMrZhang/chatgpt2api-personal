@@ -9,6 +9,7 @@ from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
+from services.scheduler.errors import SchedulerError
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -55,8 +56,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
-            return await run_in_threadpool(
-                image_task_service.submit_generation,
+            return await image_task_service.submit_generation_async(
                 identity,
                 client_task_id=body.client_task_id,
                 prompt=body.prompt,
@@ -67,6 +67,9 @@ def create_router() -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except SchedulerError as exc:
+            headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
+            raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
 
     @router.post("/api/image-tasks/edits")
     async def create_edit_task(
@@ -84,8 +87,7 @@ def create_router() -> APIRouter:
         images = await read_image_sources(image_sources)
         masks = await read_image_sources(mask_sources) if mask_sources else None
         try:
-            return await run_in_threadpool(
-                image_task_service.submit_edit,
+            return await image_task_service.submit_edit_async(
                 identity,
                 client_task_id=client_task_id,
                 prompt=prompt,
@@ -98,6 +100,9 @@ def create_router() -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except SchedulerError as exc:
+            headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
+            raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(
@@ -108,13 +113,15 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         try:
-            return await run_in_threadpool(
-                image_task_service.resume_poll,
+            return await image_task_service.resume_poll_async(
                 identity,
                 task_id,
                 body.extra_timeout_secs,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except SchedulerError as exc:
+            headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
+            raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
 
     return router

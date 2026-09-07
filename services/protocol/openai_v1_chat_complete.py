@@ -229,15 +229,25 @@ def image_result_content(result: dict[str, Any]) -> str:
     return str(result.get("message") or "Image generation completed.")
 
 
-def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
+def build_image_request(body: dict[str, Any]) -> ConversationRequest:
     model, prompt, n, images = chat_image_args(body)
-    result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
+    return ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
-    )))
+    )
+
+
+def format_image_outputs(
+    outputs: Iterable[ImageOutput],
+    body: dict[str, Any],
+) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    model, prompt, _n, images = chat_image_args(body)
+    if body.get("stream"):
+        return stream_image_chat_completion(outputs, model)
+    result = collect_image_outputs(outputs)
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
@@ -248,15 +258,13 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
+    return format_image_outputs(stream_image_outputs_with_pool(build_image_request(body)), body)
+
+
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    model, prompt, n, images = chat_image_args(body)
-    image_outputs = stream_image_outputs_with_pool(ConversationRequest(
-        prompt=prompt,
-        model=model,
-        n=n,
-        response_format="b64_json",
-        images=encode_images(images) or None,
-    ))
+    model, _prompt, _n, _images = chat_image_args(body)
+    image_outputs = stream_image_outputs_with_pool(build_image_request(body))
     yield from stream_image_chat_completion(image_outputs, model)
 
 

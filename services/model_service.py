@@ -178,5 +178,21 @@ class ModelCatalogService:
                 allow_anonymous=model in self._anonymous_models,
             )
 
+    def cached_route_for_model(self, model: str) -> ModelRoute | None:
+        """Return a warmed route without refreshing models or doing network I/O."""
+        model = str(model or "").strip()
+        with self._lock:
+            if not self._models_by_account_type and not self._anonymous_models:
+                return None
+            account_types = frozenset(
+                account_type
+                for account_type, models in self._models_by_account_type.items()
+                if model in models
+            )
+            return ModelRoute(
+                account_types=account_types,
+                allow_anonymous=model in self._anonymous_models,
+            )
+
 
 model_catalog_service = ModelCatalogService(account_service)

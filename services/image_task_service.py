@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +15,9 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, is_safe_to_log_url, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.scheduler.errors import SchedulerError
+from services.scheduler.models import Lane
+from services.scheduler.service import scheduler_service
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -105,20 +110,63 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        scheduler_service_instance: Any | None = None,
+        state_store: Any | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.scheduler_service = scheduler_service_instance
+        self.state_store = state_store
+        self._fallback_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(config.get_scheduler_settings().lanes[Lane.IMAGE_GENERATION].worker_count)),
+            thread_name_prefix="image-task-fallback",
+        )
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._admission_tasks: dict[str, asyncio.Task[Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            self._tasks = self._load_locked()
+            self._tasks = self._load_state_store_locked() if self.state_store is not None else self._load_locked()
             changed = self._recover_unfinished_locked()
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
+
+    def _load_state_store_locked(self) -> dict[str, dict[str, Any]]:
+        try:
+            self.state_store.initialize()
+            if self.path.exists():
+                self.state_store.import_legacy_tasks(self.path)
+            tasks: dict[str, dict[str, Any]] = {}
+            for record in self.state_store.list_tasks():
+                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                task_id = _clean(record.get("task_id"))
+                owner = _clean(record.get("owner_id"))
+                if not task_id or not owner:
+                    continue
+                task = {
+                    "id": task_id,
+                    "owner_id": owner,
+                    "status": _clean(record.get("status"), TASK_STATUS_ERROR),
+                    "mode": "edit" if record.get("mode") == "edit" else "generate",
+                    "model": _clean(record.get("model"), "gpt-image-2"),
+                    "size": _clean(metadata.get("size")),
+                    "quality": _clean(metadata.get("quality"), "auto"),
+                    "created_at": _clean(metadata.get("created_at"), _now_iso()),
+                    "updated_at": _now_iso(),
+                    "updated_ts": record.get("updated_at"),
+                }
+                remote_task_id = _clean(record.get("remote_task_id"))
+                if remote_task_id:
+                    task["conversation_id"] = remote_task_id
+                if record.get("error"):
+                    task["error"] = _clean(record.get("error"))
+                tasks[_task_key(owner, task_id)] = task
+            return tasks
+        except Exception:
+            return self._load_locked()
 
     def submit_generation(
         self,
@@ -141,6 +189,28 @@ class ImageTaskService:
             "base_url": base_url,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
+
+    async def submit_generation_async(
+        self,
+        identity: dict[str, object],
+        *,
+        client_task_id: str,
+        prompt: str,
+        model: str,
+        size: str | None,
+        quality: str = "auto",
+        base_url: str = "",
+    ) -> dict[str, Any]:
+        payload = {
+            "prompt": prompt,
+            "model": model,
+            "n": 1,
+            "size": size,
+            "quality": quality,
+            "response_format": "url",
+            "base_url": base_url,
+        }
+        return await self._submit_async(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
     def submit_edit(
         self,
@@ -168,6 +238,32 @@ class ImageTaskService:
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
+    async def submit_edit_async(
+        self,
+        identity: dict[str, object],
+        *,
+        client_task_id: str,
+        prompt: str,
+        model: str,
+        size: str | None,
+        quality: str = "auto",
+        base_url: str = "",
+        images: list[tuple[bytes, str, str]] | None = None,
+        masks: list[tuple[bytes, str, str]] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "prompt": prompt,
+            "images": images or [],
+            "mask": masks or [],
+            "model": model,
+            "n": 1,
+            "size": size,
+            "quality": quality,
+            "response_format": "url",
+            "base_url": base_url,
+        }
+        return await self._submit_async(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
@@ -191,6 +287,32 @@ class ImageTaskService:
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
+
+    async def _submit_async(
+        self,
+        identity: dict[str, object],
+        *,
+        client_task_id: str,
+        mode: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = _clean(client_task_id)
+        if not task_id:
+            raise ValueError("client_task_id is required")
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        result = self._submit(identity, client_task_id=task_id, mode=mode, payload=payload)
+        admission = self._admission_tasks.get(key)
+        if admission is None:
+            return result
+        try:
+            await admission
+        except SchedulerError:
+            with self._lock:
+                self._tasks.pop(key, None)
+                self._save_locked()
+            raise
+        return result
 
     def _submit(
         self,
@@ -231,14 +353,78 @@ class ImageTaskService:
             should_start = True
 
         if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
+            self._dispatch_task(
+                key,
+                mode,
+                payload,
+                dict(identity),
+                _clean(payload.get("model"), "gpt-image-2"),
             )
-            thread.start()
         return _public_task(task)
+
+    def _dispatch_task(
+        self,
+        key: str,
+        mode: str,
+        payload: dict[str, Any],
+        identity: dict[str, object],
+        model: str,
+    ) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._fallback_executor.submit(
+                self._run_task,
+                key,
+                mode,
+                payload,
+                identity,
+                model,
+            )
+        else:
+            admission = asyncio.create_task(
+                self._admit_task(
+                    key,
+                    mode,
+                    payload,
+                    identity,
+                    model,
+                )
+            )
+            self._admission_tasks[key] = admission
+
+            def clear_admission(_task: asyncio.Task[Any]) -> None:
+                self._admission_tasks.pop(key, None)
+
+            admission.add_done_callback(clear_admission)
+
+    async def _admit_task(
+        self,
+        key: str,
+        mode: str,
+        payload: dict[str, Any],
+        identity: dict[str, object],
+        model: str,
+    ) -> None:
+        if self.scheduler_service is None:
+            self._fallback_executor.submit(self._run_task, key, mode, payload, identity, model)
+            return
+        requirement = (
+            self.scheduler_service.classify_image_edit(payload)
+            if mode == "edit"
+            else self.scheduler_service.classify_image_generation(payload)
+        )
+        await self.scheduler_service.admit_background(
+            requirement,
+            lambda _lease, _cancel: self._run_task(
+                key,
+                mode,
+                payload,
+                identity,
+                model,
+                raise_on_error=True,
+            ),
+        )
 
     def _run_task(
         self,
@@ -247,6 +433,8 @@ class ImageTaskService:
         payload: dict[str, Any],
         identity: dict[str, object],
         model: str,
+        *,
+        raise_on_error: bool = False,
     ) -> None:
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
@@ -306,6 +494,8 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+            if raise_on_error:
+                raise
 
     def _log_call(
         self,
@@ -407,6 +597,28 @@ class ImageTaskService:
         return tasks
 
     def _save_locked(self) -> None:
+        if self.state_store is not None:
+            for task in self._tasks.values():
+                metadata = {
+                    "size": task.get("size"),
+                    "quality": task.get("quality"),
+                    "n": task.get("n", 1),
+                    "created_at": task.get("created_at"),
+                }
+                self.state_store.save_task({
+                    "task_key": _task_key(str(task.get("owner_id") or ""), str(task.get("id") or "")),
+                    "owner_id": task.get("owner_id"),
+                    "task_id": task.get("id"),
+                    "mode": task.get("mode"),
+                    "status": task.get("status"),
+                    "model": task.get("model"),
+                    "remote_task_id": task.get("conversation_id"),
+                    "metadata": metadata,
+                    "result": None,
+                    "error": task.get("error"),
+                    "updated_at": task.get("updated_ts") or time.time(),
+                })
+            return
         tasks = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         items = []
         for task in tasks:
@@ -474,15 +686,113 @@ class ImageTaskService:
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
+        self._dispatch_resume_poll(
+            key,
+            conversation_id,
+            extra_timeout_secs,
+            dict(identity),
+            mode,
+            model,
         )
-        thread.start()
         return _public_task(task)
+
+    async def resume_poll_async(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        extra_timeout_secs: float = 30.0,
+    ) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        result = self.resume_poll(identity, task_id, extra_timeout_secs)
+        admission = self._admission_tasks.get(key)
+        if admission is None:
+            return result
+        try:
+            await admission
+        except SchedulerError:
+            with self._lock:
+                self._update_task(key, status=TASK_STATUS_ERROR, error="scheduler queue is full")
+            raise
+        return result
+
+    def _dispatch_resume_poll(
+        self,
+        key: str,
+        conversation_id: str,
+        extra_timeout_secs: float,
+        identity: dict[str, object],
+        mode: str,
+        model: str,
+    ) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._fallback_executor.submit(
+                self._run_resume_poll,
+                key,
+                conversation_id,
+                extra_timeout_secs,
+                identity,
+                mode,
+                model,
+            )
+        else:
+            admission = asyncio.create_task(
+                self._admit_resume_poll(
+                    key,
+                    conversation_id,
+                    extra_timeout_secs,
+                    identity,
+                    mode,
+                    model,
+                )
+            )
+            self._admission_tasks[key] = admission
+
+            def clear_admission(_task: asyncio.Task[Any]) -> None:
+                self._admission_tasks.pop(key, None)
+
+            admission.add_done_callback(clear_admission)
+
+    async def _admit_resume_poll(
+        self,
+        key: str,
+        conversation_id: str,
+        extra_timeout_secs: float,
+        identity: dict[str, object],
+        mode: str,
+        model: str,
+    ) -> None:
+        if self.scheduler_service is None:
+            self._fallback_executor.submit(
+                self._run_resume_poll,
+                key,
+                conversation_id,
+                extra_timeout_secs,
+                identity,
+                mode,
+                model,
+            )
+            return
+        payload = {"model": model, "n": 1}
+        requirement = (
+            self.scheduler_service.classify_image_edit(payload)
+            if mode == "edit"
+            else self.scheduler_service.classify_image_generation(payload)
+        )
+        await self.scheduler_service.admit_background(
+            requirement,
+            lambda _lease, _cancel: self._run_resume_poll(
+                key,
+                conversation_id,
+                extra_timeout_secs,
+                identity,
+                mode,
+                model,
+                raise_on_error=True,
+            ),
+        )
 
     def _run_resume_poll(
         self,
@@ -492,6 +802,8 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        *,
+        raise_on_error: bool = False,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -554,9 +866,15 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
             )
+            if raise_on_error:
+                raise
         finally:
             if backend is not None:
                 backend.close()
 
 
-image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")
+image_task_service = ImageTaskService(
+    DATA_DIR / "image_tasks.json",
+    scheduler_service_instance=scheduler_service,
+    state_store=scheduler_service.state_store,
+)

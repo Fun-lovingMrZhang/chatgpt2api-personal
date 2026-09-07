@@ -317,6 +317,8 @@ class LoggedCall:
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
 
     async def _run_async_stream(self, result, *, sse: str):
+        from services.protocol.conversation import ImageGenerationError
+
         try:
             first = await result.__anext__()
         except StopAsyncIteration:
@@ -325,6 +327,23 @@ class LoggedCall:
                 self._async_sender((), sse=sse),
                 media_type="text/event-stream",
             )
+        except ImageGenerationError as exc:
+            self.log(
+                "调用失败",
+                status="failed",
+                error=str(exc),
+                account_email=getattr(exc, "account_email", ""),
+                conversation_id=getattr(exc, "conversation_id", ""),
+            )
+            return _image_error_response(exc)
+        except HTTPException as exc:
+            self.log("调用失败", status="failed", error=str(exc.detail))
+            raise
+        except Exception as exc:
+            self.log("调用失败", status="failed", error=str(exc))
+            if self.endpoint.startswith("/v1/images"):
+                return _image_error_response(exc)
+            return _protocol_error_response(exc, 502, sse)
         return StreamingResponse(
             self._async_sender(self.async_stream(result, first), sse=sse),
             media_type="text/event-stream",

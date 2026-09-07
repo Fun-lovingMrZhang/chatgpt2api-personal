@@ -19,8 +19,10 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
+from services.protocol.conversation import generate_image_unit
 from services.scheduler.models import Lane
 from services.scheduler.service import scheduler_service
+from utils.helper import extract_chat_image, is_image_chat_request
 
 
 class ImageGenerationRequest(BaseModel):
@@ -91,6 +93,84 @@ def _text_scheduler_runner(model: str):
     return runner
 
 
+def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
+    scheduler_payload = dict(payload)
+    try:
+        requested_count = int(scheduler_payload.get("n") or 0)
+    except (TypeError, ValueError):
+        requested_count = 0
+    if requested_count < 1:
+        for tool in scheduler_payload.get("tools") or []:
+            if isinstance(tool, dict) and tool.get("type") == "image_generation":
+                try:
+                    requested_count = int(tool.get("n") or 0)
+                except (TypeError, ValueError):
+                    requested_count = 0
+                break
+    scheduler_payload["n"] = max(1, requested_count)
+    requirement = (
+        scheduler_service.classify_image_generation(scheduler_payload)
+        if lane == Lane.IMAGE_GENERATION
+        else scheduler_service.classify_image_edit(scheduler_payload)
+    )
+
+    async def runner(handler, *args, streaming: bool = False):
+        body = args[0] if args and isinstance(args[0], dict) else payload
+        adapter = _image_protocol_adapter(handler, body)
+        if adapter is None:
+            # Keep compatibility with tests and extension handlers that wrap
+            # the built-in protocol function. Built-in production handlers
+            # always use the work-unit path below.
+            return await run_in_threadpool(handler, *args)
+
+        build_request, format_outputs = adapter
+        request = build_request(body)
+        unit_results = await scheduler_service.run_image_units(
+            requirement,
+            lambda index: generate_image_unit(request, index, requirement.cost),
+        )
+        outputs = []
+        for result in unit_results:
+            if isinstance(result, list):
+                outputs.extend(result)
+            else:
+                outputs.append(result)
+        formatted = format_outputs(outputs, body)
+        if not streaming:
+            return formatted
+
+        async def async_formatted():
+            for item in formatted:
+                yield item
+
+        return async_formatted()
+
+    return runner
+
+
+def _image_protocol_adapter(handler, body: dict[str, object]):
+    module_name = getattr(handler, "__module__", "")
+    adapters = {
+        openai_v1_image_generations.__name__: (
+            openai_v1_image_generations.build_request,
+            openai_v1_image_generations.format_outputs,
+        ),
+        openai_v1_image_edit.__name__: (
+            openai_v1_image_edit.build_request,
+            openai_v1_image_edit.format_outputs,
+        ),
+        openai_v1_chat_complete.__name__: (
+            openai_v1_chat_complete.build_image_request,
+            openai_v1_chat_complete.format_image_outputs,
+        ),
+        openai_v1_response.__name__: (
+            openai_v1_response.build_image_request,
+            openai_v1_response.format_image_outputs,
+        ),
+    }
+    return adapters.get(module_name)
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -113,7 +193,12 @@ def create_router() -> APIRouter:
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
-        return await call.run(openai_v1_image_generations.handle, payload)
+        return await call.run(
+            openai_v1_image_generations.handle,
+            payload,
+            scheduler_runner=_image_scheduler_runner(body.model, payload, Lane.IMAGE_GENERATION),
+            streaming=bool(payload.get("stream")),
+        )
 
     @router.post("/v1/images/edits")
     async def edit_images(
@@ -130,7 +215,12 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload)
+        return await call.run(
+            openai_v1_image_edit.handle,
+            payload,
+            scheduler_runner=_image_scheduler_runner(model, payload, Lane.IMAGE_EDIT),
+            streaming=bool(payload.get("stream")),
+        )
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
@@ -147,10 +237,15 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("messages")),
         )
         await filter_or_log(call, request_preview)
+        if is_image_chat_request(payload):
+            image_lane = Lane.IMAGE_EDIT if extract_chat_image(payload) else Lane.IMAGE_GENERATION
+            scheduler_runner = _image_scheduler_runner(model, payload, image_lane)
+        else:
+            scheduler_runner = _text_scheduler_runner(model)
         return await call.run(
             openai_v1_chat_complete.handle,
             payload,
-            scheduler_runner=_text_scheduler_runner(model),
+            scheduler_runner=scheduler_runner,
             streaming=bool(payload.get("stream")),
         )
 
@@ -169,10 +264,19 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
+        scheduler_runner = (
+            _image_scheduler_runner(
+                model,
+                payload,
+                Lane.IMAGE_EDIT if openai_v1_response.extract_response_image(payload.get("input")) else Lane.IMAGE_GENERATION,
+            )
+            if openai_v1_response.has_response_image_generation_tool(payload)
+            else _text_scheduler_runner(model)
+        )
         return await call.run(
             openai_v1_response.handle,
             payload,
-            scheduler_runner=_text_scheduler_runner(model),
+            scheduler_runner=scheduler_runner,
             streaming=bool(payload.get("stream")),
         )
 

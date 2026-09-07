@@ -196,6 +196,19 @@ class SchedulerStateStore:
         ).fetchone()
         return self._decode_task(row) if row is not None else None
 
+    def list_tasks(self, owner_id: str | None = None) -> list[dict[str, object]]:
+        self._ensure_initialized()
+        if owner_id:
+            rows = self._connection().execute(
+                "SELECT * FROM scheduler_tasks WHERE owner_id = ? ORDER BY updated_at DESC",
+                (str(owner_id),),
+            ).fetchall()
+        else:
+            rows = self._connection().execute(
+                "SELECT * FROM scheduler_tasks ORDER BY updated_at DESC",
+            ).fetchall()
+        return [self._decode_task(row) for row in rows]
+
     def load_recoverable_tasks(self) -> list[dict[str, object]]:
         self._ensure_initialized()
         rows = self._connection().execute(

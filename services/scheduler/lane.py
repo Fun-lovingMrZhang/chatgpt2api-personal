@@ -123,6 +123,8 @@ class LaneScheduler:
             "timed_out": 0,
             "cancelled": 0,
             "queue_wait_ms": [],
+            "peak_active_cost": 0,
+            "peak_active_jobs": 0,
         }
 
     @property
@@ -220,6 +222,94 @@ class LaneScheduler:
         assert job.stream is not None
         return job.stream
 
+    async def submit_background(
+        self,
+        work: Callable[..., Any],
+        requirement: AccountRequirement,
+        *,
+        cost: int = 1,
+        priority: int = 0,
+        deadline: float | None = None,
+    ) -> asyncio.Future[Any]:
+        """Admit a job without making the caller wait for its result."""
+        job = await self._enqueue(
+            work,
+            requirement,
+            cost=cost,
+            priority=priority,
+            deadline=deadline,
+            is_stream=False,
+        )
+        job.future.add_done_callback(self._consume_background_exception)
+        return job.future
+
+    async def submit_batch(
+        self,
+        works: list[Callable[..., Any]],
+        requirement: AccountRequirement,
+        *,
+        cost: int = 1,
+        priority: int = 0,
+        deadline: float | None = None,
+    ) -> list[asyncio.Future[Any]]:
+        """Atomically admit a bounded set of independent jobs."""
+        if not works:
+            return []
+        await self.start()
+        normalized_cost = max(1, int(cost))
+        now = self._clock()
+        request_deadline = float(deadline) if deadline is not None else float("inf")
+        queue_deadline = min(
+            request_deadline,
+            now + max(0.001, int(self.settings.queue_wait_timeout_ms) / 1000.0),
+        )
+        loop = self._require_loop()
+        condition = self._require_condition()
+        total_cost = normalized_cost * len(works)
+        jobs: list[_QueuedJob] = []
+        async with condition:
+            self._metrics["submitted"] += len(works)
+            if self._stopping:
+                self._metrics["rejected"] += len(works)
+                raise SchedulerError("scheduler lane is stopping")
+            if normalized_cost > int(self.settings.global_concurrency):
+                self._metrics["rejected"] += len(works)
+                raise QueueFullError("request cost exceeds lane capacity")
+            if len(self._queue) + len(works) > int(self.settings.queue_max_items):
+                self._metrics["rejected"] += len(works)
+                raise QueueFullError("scheduler queue is full")
+            if self._pending_cost + self._active_cost + total_cost > int(self.settings.queue_max_cost):
+                self._metrics["rejected"] += len(works)
+                raise QueueFullError("scheduler queue cost is full")
+            normalized_requirement = self._with_cost(requirement, normalized_cost)
+            for work in works:
+                self._sequence += 1
+                job = _QueuedJob(
+                    work=work,
+                    requirement=normalized_requirement,
+                    cost=normalized_cost,
+                    priority=int(priority),
+                    sequence=self._sequence,
+                    enqueued_at=now,
+                    deadline=request_deadline,
+                    queue_deadline=queue_deadline,
+                    future=loop.create_future(),
+                    cancel_event=ThreadEvent(),
+                )
+                jobs.append(job)
+                heapq.heappush(
+                    self._queue,
+                    (-job.priority, job.queue_deadline, job.sequence, job),
+                )
+            self._pending_cost += total_cost
+            self._metrics["admitted"] += len(works)
+            condition.notify_all()
+        for job in jobs:
+            job.future.add_done_callback(
+                lambda future, queued_job=job: self._cancel_job_from_future(future, queued_job),
+            )
+        return [job.future for job in jobs]
+
     async def wait_until_idle(self, timeout: float = 5.0) -> None:
         condition = self._require_condition()
 
@@ -238,6 +328,8 @@ class LaneScheduler:
             "queued_cost": self._pending_cost,
             "active_jobs": self._active_jobs,
             "active_cost": self._active_cost,
+            "peak_active_cost": self._metrics["peak_active_cost"],
+            "peak_active_jobs": self._metrics["peak_active_jobs"],
             "submitted": self._metrics["submitted"],
             "admitted": self._metrics["admitted"],
             "completed": self._metrics["completed"],
@@ -351,6 +443,14 @@ class LaneScheduler:
                     job.started = True
                     self._active_jobs += 1
                     self._active_cost += job.cost
+                    self._metrics["peak_active_jobs"] = max(
+                        self._metrics["peak_active_jobs"],
+                        self._active_jobs,
+                    )
+                    self._metrics["peak_active_cost"] = max(
+                        self._metrics["peak_active_cost"],
+                        self._active_cost,
+                    )
                     queue_waits = self._metrics["queue_wait_ms"]
                     queue_waits.append(max(0.0, (now - job.enqueued_at) * 1000.0))
                     if len(queue_waits) > 1024:
@@ -567,6 +667,17 @@ class LaneScheduler:
             async with condition:
                 condition.notify_all()
 
+    def _cancel_job_from_future(
+        self,
+        future: asyncio.Future[Any],
+        job: _QueuedJob,
+    ) -> None:
+        if not future.cancelled():
+            return
+        job.client_cancelled = True
+        job.cancel_event.set()
+        self._notify_condition()
+
         asyncio.create_task(notify())
 
     def _complete_job_result(self, job: _QueuedJob, result: Any) -> None:
@@ -576,6 +687,15 @@ class LaneScheduler:
     def _complete_job_error(self, job: _QueuedJob, error: BaseException) -> None:
         if not job.future.done():
             job.future.set_exception(error)
+
+    @staticmethod
+    def _consume_background_exception(future: asyncio.Future[Any]) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.exception()
+        except BaseException:
+            pass
 
     def _fail_queued_job(self, job: _QueuedJob, error: BaseException) -> None:
         if job.is_stream and job.stream is not None:

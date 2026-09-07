@@ -400,7 +400,9 @@ class AccountPool:
                 for item in (account_types or set())
                 if self._normalize(item)
             }
-            return normalized or {account.account_type for account in self._accounts.values()}
+            if normalized or hasattr(route, "account_types"):
+                return normalized
+            return {account.account_type for account in self._accounts.values()}
         except Exception:
             return {account.account_type for account in self._accounts.values()}
 

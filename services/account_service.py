@@ -1309,10 +1309,17 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def mark_image_result(
+        self,
+        access_token: str,
+        success: bool,
+        *,
+        release_slot: bool = True,
+    ) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
+        if release_slot:
+            self.release_image_slot(access_token)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)

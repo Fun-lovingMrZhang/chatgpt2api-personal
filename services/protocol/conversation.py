@@ -5,7 +5,6 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -1298,8 +1297,8 @@ def _generate_single_image(
 ) -> list[ImageOutput]:
     """为单张图片执行生成逻辑（含重试），返回结果列表。
 
-    该函数在独立线程中运行，每个线程使用不同的账号，
-    实现并行生图，避免串行超时阻塞。
+    The caller owns the worker and account lease; this function only handles
+    one output and its bounded retry decisions.
     """
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
@@ -1316,17 +1315,52 @@ def _generate_single_image(
     poll_timeout_retry_count = 0
     account_email = ""
 
+    def select_token(excluded_tokens: set[str] | None = None) -> str:
+        context = current_execution_context()
+        if context is not None:
+            if context.lease is None:
+                raise RuntimeError("scheduler lease replacement unavailable")
+            return context.lease.access_token
+        plan_type, _ = split_image_model(request.model)
+        codex_model = is_codex_image_model(request.model)
+        return account_service.get_available_access_token(
+            plan_type=plan_type,
+            source_type="codex" if codex_model else None,
+            plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+        )
+
+    def mark_result(token: str, success: bool) -> None:
+        context = current_execution_context()
+        account_service.mark_image_result(
+            token,
+            success,
+            release_slot=context is None,
+        )
+
+    def replace_lease(token: str, outcome: Outcome) -> str | None:
+        context = current_execution_context()
+        if context is None or context.replace_lease is None:
+            return None
+        replacement = context.replace_lease(context, {token}, outcome)
+        return replacement.access_token if replacement is not None else None
+
+    def replace_or_abort(token: str, outcome: Outcome) -> None:
+        if replace_lease(token, outcome) is not None:
+            return
+        if current_execution_context() is not None:
+            raise ImageGenerationError(
+                "no replacement account is available",
+                status_code=503,
+                error_type="server_error",
+                code="no_replacement_account",
+                account_email=account_email,
+            )
+
     while True:
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
-            plan_type, _ = split_image_model(request.model)
-            codex_model = is_codex_image_model(request.model)
-            token = account_service.get_available_access_token(
-                plan_type=plan_type,
-                source_type="codex" if codex_model else None,
-                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-            )
+            token = select_token()
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
@@ -1375,10 +1409,10 @@ def _generate_single_image(
             finally:
                 _remove_image_conversation_later(backend, last_conversation_id, success=returned_result)
             if returned_message:
-                account_service.mark_image_result(token, False)
+                mark_result(token, False)
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
+                mark_result(token, False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1390,10 +1424,10 @@ def _generate_single_image(
                         conversation_id=conv_id,
                     )
                 return outputs
-            account_service.mark_image_result(token, True)
+            mark_result(token, True)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1408,6 +1442,7 @@ def _generate_single_image(
                         "index": index,
                         "error": str(exc)[:200],
                     })
+                    replace_or_abort(token, Outcome.NETWORK_ERROR)
                     continue
                 logger.warning({
                     "event": "image_poll_timeout_exhausted_retries",
@@ -1419,7 +1454,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(token, False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1436,7 +1471,7 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -1452,6 +1487,7 @@ def _generate_single_image(
                         "index": index,
                         "error": error_text[:200],
                     })
+                    replace_or_abort(token, Outcome.SERVER_ERROR)
                     continue
                 logger.warning({
                     "event": "image_model_text_reply_exhausted_retries",
@@ -1478,7 +1514,7 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(token, False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1488,6 +1524,17 @@ def _generate_single_image(
                 "index": index,
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
+                had_replacement = replace_lease(token, Outcome.AUTH_ERROR) is not None
+                if had_replacement:
+                    continue
+                if current_execution_context() is not None:
+                    raise ImageGenerationError(
+                        "no replacement account is available",
+                        status_code=503,
+                        error_type="server_error",
+                        code="no_replacement_account",
+                        account_email=account_email,
+                    ) from exc
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
@@ -1507,6 +1554,7 @@ def _generate_single_image(
                         "error": last_error[:200],
                     })
                     time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    replace_or_abort(token, Outcome.NETWORK_ERROR)
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
@@ -1523,6 +1571,7 @@ def _generate_single_image(
                         "error": last_error[:200],
                     })
                     time.sleep(wait_secs)
+                    replace_or_abort(token, Outcome.NETWORK_ERROR)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
@@ -1530,90 +1579,44 @@ def _generate_single_image(
                 backend.close()
 
 
+def generate_image_unit(request: ConversationRequest, index: int, total: int) -> list[ImageOutput]:
+    """Generate one output while the scheduler owns the surrounding lease."""
+    return _generate_single_image(request, index, total)
+
+
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    """Generate requested outputs through the caller's bounded scheduler lane."""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
-    if request.n <= 1:
-        # 单张图片，直接执行（无需线程池开销）
-        outputs = _generate_single_image(request, 1, 1)
-        for output in outputs:
-            yield output
-        return
-
-    # 多张图片：根据配置选择并行或串行执行
-    if not config.image_parallel_generation:
-        logger.info({
-            "event": "image_serial_generation_start",
-            "n": request.n,
-            "model": request.model,
-        })
-        for index in range(1, request.n + 1):
-            outputs = _generate_single_image(request, index, request.n)
-            for output in outputs:
-                yield output
-        return
-
-    logger.info({
-        "event": "image_parallel_generation_start",
-        "n": request.n,
-        "model": request.model,
-    })
-    # 每张图片一个线程，同时启动
-    futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
-        for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, request, index, request.n)
-            futures[future] = index
+    for index in range(1, max(1, request.n) + 1):
+        try:
+            results[index] = generate_image_unit(request, index, max(1, request.n))
+        except Exception as exc:
+            errors[index] = exc
+            logger.warning({
+                "event": "image_generation_unit_error",
+                "index": index,
+                "error": str(exc)[:300],
+            })
 
-        # 按完成顺序收集结果
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception as exc:
-                errors[index] = exc
-                logger.warning({
-                    "event": "image_parallel_generation_error",
-                    "index": index,
-                    "error": str(exc)[:300],
-                })
-
-    # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
     emitted = False
     last_error = ""
-    # 先 yield 所有成功的结果
-    for index in range(1, request.n + 1):
+    for index in range(1, max(1, request.n) + 1):
         if index in results:
             for output in results[index]:
                 emitted = True
                 yield output
         elif index in errors:
             last_error = str(errors[index])
-            if not emitted:
-                logger.warning({
-                    "event": "image_parallel_failure_before_success",
-                    "failed_index": index,
-                    "error": last_error[:200],
-                })
-
-    # 如果有失败但也有成功，记录警告
-    if emitted:
-        for index in range(1, request.n + 1):
-            if index in errors:
-                logger.warning({
-                    "event": "image_parallel_partial_failure",
-                    "failed_index": index,
-                    "error": str(errors[index])[:200],
-                })
 
     if not emitted:
-        if not last_error:
-            last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
+        raise ImageGenerationError(
+            image_stream_error_message(last_error or "no account in the pool could generate images"),
+            conversation_id="",
+        )
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:

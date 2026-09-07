@@ -423,6 +423,18 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         )
         return
 
+    request = build_image_request(body)
+    yield from stream_image_response(
+        stream_image_outputs_with_pool(request),
+        request.prompt,
+        request.model,
+        count_image_content_tokens(_input_image_parts(body.get("input")), request.model),
+        request.size,
+        request.quality,
+    )
+
+
+def build_image_request(body: dict[str, Any]) -> ConversationRequest:
     prompt = extract_response_prompt(body.get("input"))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
@@ -433,17 +445,38 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = encode_images([(image_data, "image.png", mime_type)])
     else:
         images = None
-    input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
-    image_outputs = stream_image_outputs_with_pool(ConversationRequest(
+    try:
+        count = max(1, int(tool.get("n") or body.get("n") or 1))
+    except (TypeError, ValueError):
+        count = 1
+    return ConversationRequest(
         prompt=prompt,
         model=model,
+        n=count,
         size=tool.get("size"),
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
-    ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
+    )
+
+
+def format_image_outputs(
+    outputs: Iterable[ImageOutput],
+    body: dict[str, Any],
+) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    request = build_image_request(body)
+    events = stream_image_response(
+        outputs,
+        request.prompt,
+        request.model,
+        count_image_content_tokens(_input_image_parts(body.get("input")), request.model),
+        request.size,
+        request.quality,
+    )
+    if body.get("stream"):
+        return events
+    return collect_response(events)
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
