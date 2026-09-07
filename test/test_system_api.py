@@ -35,6 +35,16 @@ class FakeLogService:
         return len(ids)
 
 
+class FakeSchedulerService:
+    def metrics_snapshot(self):
+        return {
+            "enabled": True,
+            "running": True,
+            "lanes": {"text": {"active_cost": 0}},
+            "account_health": [{"account_ref": "token:abcd", "lane": "text"}],
+        }
+
+
 class SystemLogApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.log_service = FakeLogService()
@@ -93,6 +103,14 @@ class SystemLogApiTests(unittest.TestCase):
         self.assertEqual(response.json(), {"deleted": 2})
         self.assertEqual(self.log_service.delete_calls, [["log-1", "log-2"]])
         self.assertEqual(self.threadpool_calls[0][0], self.log_service.delete)
+
+    def test_scheduler_metrics_are_admin_protected_and_redacted(self) -> None:
+        with mock.patch.object(system_module, "scheduler_service", FakeSchedulerService()):
+            response = self.client.get("/api/system/scheduler", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["running"])
+        self.assertEqual(response.json()["account_health"][0]["account_ref"], "token:abcd")
 
 
 if __name__ == "__main__":

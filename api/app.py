@@ -15,6 +15,7 @@ from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
 from services.log_service import log_service
+from services.scheduler.service import scheduler_service
 
 
 def create_app() -> FastAPI:
@@ -25,6 +26,7 @@ def create_app() -> FastAPI:
         stop_event = Event()
         await run_in_threadpool(log_service.initialize)
         await run_in_threadpool(log_service.cleanup_expired, config.log_retention_days)
+        await scheduler_service.start()
         log_cleanup_thread = log_service.start_retention_scheduler(
             stop_event,
             lambda: config.log_retention_days,
@@ -37,6 +39,7 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            await scheduler_service.stop()
             log_cleanup_thread.join(timeout=1)
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)

@@ -117,6 +117,10 @@ class LaneScheduler:
             "queue_wait_ms": [],
         }
 
+    @property
+    def running(self) -> bool:
+        return self._started and not self._stopping
+
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         if self._started:

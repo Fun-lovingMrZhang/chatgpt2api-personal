@@ -6,6 +6,7 @@ from services.scheduler.models import (
     Outcome,
     SchedulerSettings,
 )
+from services.scheduler.service import SchedulerService, scheduler_service
 
 __all__ = [
     "AccountRequirement",
@@ -14,4 +15,6 @@ __all__ = [
     "LaneSettings",
     "Outcome",
     "SchedulerSettings",
+    "SchedulerService",
+    "scheduler_service",
 ]

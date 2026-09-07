@@ -530,16 +530,19 @@ class SnapshotWriter:
         self.flush()
 
     def _run(self) -> None:
-        while True:
-            self._wake.wait(self.interval_seconds)
-            self._wake.clear()
-            if self._stop.is_set():
-                break
+        try:
+            while True:
+                self._wake.wait(self.interval_seconds)
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
+                try:
+                    self.flush()
+                except Exception:
+                    continue
             try:
                 self.flush()
             except Exception:
-                continue
-        try:
-            self.flush()
-        except Exception:
-            pass
+                pass
+        finally:
+            self.store.close()

@@ -26,6 +26,7 @@ from services.image_storage_service import ImageStorageError, image_storage_serv
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
+from services.scheduler.service import scheduler_service
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -81,6 +82,11 @@ def create_router(app_version: str) -> APIRouter:
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"config": config.get()}
+
+    @router.get("/api/system/scheduler")
+    async def get_scheduler_metrics(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return scheduler_service.metrics_snapshot()
 
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
