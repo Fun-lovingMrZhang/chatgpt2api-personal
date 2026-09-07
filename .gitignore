@@ -29,6 +29,9 @@ docker-compose-local.yml
 # Git cache
 git_cache/
 
+# Local git worktrees
+.worktrees/
+
 # 调试/测试输出目录
 loginwithpassword_*/
 logwithemailverifycode_*/
