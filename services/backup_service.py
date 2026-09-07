@@ -18,6 +18,7 @@ from curl_cffi import requests
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
+from services.quota_service import quota_service
 
 
 def _utc_now() -> datetime:
@@ -301,11 +302,12 @@ class CloudflareR2Client:
 
 
 class BackupService:
-    def __init__(self) -> None:
+    def __init__(self, *, quota_service_instance=None) -> None:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._running = False
+        self.quota_service = quota_service_instance or quota_service
 
     def start(self) -> None:
         with self._lock:
@@ -642,6 +644,11 @@ class BackupService:
                     archive,
                     "snapshots/auth_keys.json",
                     _json_bytes(config.get_storage_backend().load_auth_keys()),
+                )
+                self._add_bytes_to_archive(
+                    archive,
+                    "data/auth_quota.db",
+                    self.quota_service.snapshot_bytes(),
                 )
             if include.get("images"):
                 self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
