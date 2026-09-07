@@ -7,7 +7,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from services.config import DATA_DIR
 from utils.log import logger
@@ -46,6 +46,98 @@ class QuotaReservation:
     quota_type: QuotaType
     requested_units: int
     admin_bypass: bool = False
+
+
+class QuotaSettlementError(QuotaError):
+    pass
+
+
+def _count_chat_image_content(value: object) -> int:
+    if isinstance(value, str):
+        return value.count("data:image/")
+    if isinstance(value, list):
+        total = 0
+        for item in value:
+            if isinstance(item, dict) and str(item.get("type") or "").strip() in {
+                "image_url",
+                "image_generation_call",
+            }:
+                total += 1
+            else:
+                total += _count_chat_image_content(item)
+        return total
+    if isinstance(value, dict):
+        if str(value.get("type") or "").strip() in {"image_url", "image_generation_call"}:
+            return 1
+        return sum(_count_chat_image_content(item) for item in value.values())
+    return 0
+
+
+def count_image_outputs(value: object) -> int:
+    """Count successful image outputs across the supported response shapes."""
+    if not isinstance(value, dict):
+        return 0
+    data = value.get("data")
+    if isinstance(data, list):
+        return sum(1 for item in data if isinstance(item, dict) and item)
+    response = value.get("response")
+    if isinstance(response, dict):
+        return count_image_outputs(response)
+    output = value.get("output")
+    if isinstance(output, list):
+        return sum(
+            1
+            for item in output
+            if isinstance(item, dict) and str(item.get("type") or "").strip() == "image_generation_call"
+        )
+    choices = value.get("choices")
+    if isinstance(choices, list):
+        return sum(_count_chat_image_content(choice) for choice in choices)
+    if str(value.get("object") or "").strip() == "image.generation.result":
+        return count_image_outputs({"data": data})
+    return _count_chat_image_content(value)
+
+
+class QuotaAccounting:
+    def __init__(self, reservation: QuotaReservation, quota_type: QuotaType, *, service: Any = None):
+        self.reservation = reservation
+        self.quota_type = quota_type
+        self.service = service or quota_service
+        self._observed_units = 0
+        self._settled = False
+        self._lock = threading.Lock()
+
+    def observe(self, item: object) -> None:
+        if self.quota_type == "image":
+            self._observed_units += count_image_outputs(item)
+
+    def success_units(self, result: object | None = None) -> int:
+        if self.quota_type == "text":
+            return 1
+        observed = count_image_outputs(result) if result is not None else self._observed_units
+        return min(self.reservation.requested_units, max(0, observed))
+
+    def commit_success(self, result: object | None = None) -> None:
+        with self._lock:
+            if self._settled:
+                return
+            units = self.success_units(result)
+            if self.reservation.admin_bypass:
+                self._settled = True
+                return
+            if units <= 0:
+                self.service.release(self.reservation.reservation_id)
+            elif not self.service.commit(self.reservation.reservation_id, units):
+                raise QuotaSettlementError("quota reservation is no longer active")
+            self._settled = True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._settled:
+                return
+            if not self.reservation.admin_bypass:
+                self.service.release(self.reservation.reservation_id)
+            self._settled = True
 
 
 def _now() -> float:

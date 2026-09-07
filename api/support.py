@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any
 
 from fastapi import HTTPException, Request
 
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.quota_service import QuotaAccounting, QuotaExceededError, QuotaType, quota_service
 from utils.log import logger
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -45,6 +48,57 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
+
+
+def _quota_exhausted_response(exc: QuotaExceededError) -> dict[str, object]:
+    label = "text" if exc.quota_type == "text" else "image"
+    return {
+        "error": {
+            "message": f"{label} quota exhausted",
+            "type": "insufficient_quota",
+            "code": "insufficient_quota",
+        }
+    }
+
+
+async def run_with_quota(
+    call: Any,
+    handler,
+    *args,
+    identity: dict[str, object],
+    quota_type: QuotaType,
+    requested_units: int,
+    endpoint: str,
+    sse: str = "openai",
+    scheduler_runner=None,
+    streaming: bool = False,
+):
+    try:
+        reservation = quota_service.reserve(
+            identity,
+            quota_type,
+            requested_units,
+            request_id=uuid.uuid4().hex,
+            endpoint=endpoint,
+        )
+    except QuotaExceededError as exc:
+        raise HTTPException(status_code=429, detail=_quota_exhausted_response(exc)) from exc
+
+    accounting = QuotaAccounting(reservation, quota_type, service=quota_service)
+    try:
+        return await call.run(
+            handler,
+            *args,
+            sse=sse,
+            scheduler_runner=scheduler_runner,
+            streaming=streaming,
+            on_success=accounting.commit_success,
+            on_failure=accounting.release,
+            on_stream_item=accounting.observe,
+        )
+    except BaseException:
+        accounting.release()
+        raise
 
 
 def resolve_image_base_url(request: Request) -> str:

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import HTTPException
@@ -266,6 +267,15 @@ def _next_item(items):
         raise
 
 
+def _notify_failure(callback: Callable[[], None] | None) -> None:
+    if callback is None:
+        return
+    try:
+        callback()
+    except BaseException:
+        pass
+
+
 @dataclass
 class LoggedCall:
     identity: dict[str, object]
@@ -283,6 +293,9 @@ class LoggedCall:
         sse: str = "openai",
         scheduler_runner=None,
         streaming: bool = False,
+        on_success: Callable[[object | None], None] | None = None,
+        on_failure: Callable[[], None] | None = None,
+        on_stream_item: Callable[[object], None] | None = None,
     ):
         from services.protocol.conversation import ImageGenerationError
         from services.scheduler.errors import SchedulerError
@@ -293,13 +306,16 @@ class LoggedCall:
             else:
                 result = await scheduler_runner(handler, *args, streaming=streaming)
         except ImageGenerationError as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except SchedulerError as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc))
             headers = {}
             if exc.retry_after_seconds is not None:
@@ -310,29 +326,41 @@ class LoggedCall:
                 headers=headers or None,
             ) from exc
         except Exception as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
+            if on_success is not None:
+                on_success(result)
             self.log("调用完成", result)
             return _strip_internal_response_fields(result)
 
         if hasattr(result, "__aiter__"):
-            return await self._run_async_stream(result, sse=sse)
+            return await self._run_async_stream(
+                result,
+                sse=sse,
+                on_success=on_success,
+                on_failure=on_failure,
+                on_stream_item=on_stream_item,
+            )
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except SchedulerError as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc))
             raise HTTPException(
                 status_code=exc.status_code,
@@ -344,16 +372,37 @@ class LoggedCall:
                 ),
             ) from exc
         except Exception as exc:
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
+            if on_success is not None:
+                on_success(None)
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
-        return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+        return StreamingResponse(
+            sender(
+                self.stream(
+                    itertools.chain([first], result),
+                    on_success=on_success,
+                    on_failure=on_failure,
+                    on_stream_item=on_stream_item,
+                )
+            ),
+            media_type="text/event-stream",
+        )
 
-    async def _run_async_stream(self, result, *, sse: str):
+    async def _run_async_stream(
+        self,
+        result,
+        *,
+        sse: str,
+        on_success: Callable[[object | None], None] | None = None,
+        on_failure: Callable[[], None] | None = None,
+        on_stream_item: Callable[[object], None] | None = None,
+    ):
         from services.protocol.conversation import ImageGenerationError
         from services.scheduler.errors import SchedulerError
 
@@ -361,6 +410,8 @@ class LoggedCall:
             first = await result.__anext__()
         except StopAsyncIteration:
             await _close_async_iterator(result)
+            if on_success is not None:
+                on_success(None)
             self.log("流式调用结束")
             return StreamingResponse(
                 self._async_sender((), sse=sse),
@@ -368,9 +419,11 @@ class LoggedCall:
             )
         except asyncio.CancelledError:
             await _close_async_iterator(result)
+            _notify_failure(on_failure)
             raise
         except ImageGenerationError as exc:
             await _close_async_iterator(result)
+            _notify_failure(on_failure)
             self.log(
                 "调用失败",
                 status="failed",
@@ -381,41 +434,68 @@ class LoggedCall:
             return _image_error_response(exc)
         except SchedulerError as exc:
             await _close_async_iterator(result)
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc))
             return _scheduler_error_response(exc, sse)
         except HTTPException as exc:
             await _close_async_iterator(result)
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
             await _close_async_iterator(result)
+            _notify_failure(on_failure)
             self.log("调用失败", status="failed", error=str(exc))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         return StreamingResponse(
-            self._async_sender(self.async_stream(result, first), sse=sse),
+            self._async_sender(
+                self.async_stream(
+                    result,
+                    first,
+                    on_success=on_success,
+                    on_failure=on_failure,
+                    on_stream_item=on_stream_item,
+                ),
+                sse=sse,
+            ),
             media_type="text/event-stream",
         )
 
-    async def async_stream(self, items, first):
+    async def async_stream(
+        self,
+        items,
+        first,
+        *,
+        on_success: Callable[[object | None], None] | None = None,
+        on_failure: Callable[[], None] | None = None,
+        on_stream_item: Callable[[object], None] | None = None,
+    ):
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
         failed = False
         try:
             for item in [first]:
+                if on_stream_item is not None:
+                    on_stream_item(item)
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
             async for item in items:
+                if on_stream_item is not None:
+                    on_stream_item(item)
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
-        except Exception as exc:
+        except BaseException as exc:
             failed = True
+            _notify_failure(on_failure)
+            if not isinstance(exc, Exception):
+                raise
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -429,62 +509,83 @@ class LoggedCall:
             close = getattr(items, "aclose", None)
             if close is not None:
                 await close()
-            if not failed:
-                self.log(
-                    "流式调用结束",
-                    urls=urls,
-                    account_email=account_emails[0] if account_emails else "",
-                    conversation_id=conversation_ids[0] if conversation_ids else "",
-                )
+        if not failed:
+            try:
+                if on_success is not None:
+                    on_success(None)
+            except BaseException:
+                _notify_failure(on_failure)
+                raise
+            self.log(
+                "流式调用结束",
+                urls=urls,
+                account_email=account_emails[0] if account_emails else "",
+                conversation_id=conversation_ids[0] if conversation_ids else "",
+            )
 
     @staticmethod
     async def _async_sender(items, *, sse: str):
         if sse == "openai":
             yield ": stream-open\n\n"
         try:
-            if hasattr(items, "__aiter__"):
-                iterator = items.__aiter__()
-                async for item in iterator:
-                    if sse == "anthropic":
-                        event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
-                        yield f"event: {event}\n"
-                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-                    else:
-                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-            else:
-                for item in items:
-                    if sse == "anthropic":
-                        event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
-                        yield f"event: {event}\n"
-                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-                    else:
-                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-        except Exception as exc:
-            if sse == "anthropic":
-                error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
-                yield "event: error\n"
-                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
-            else:
-                error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-                    "error": {"message": str(exc), "type": exc.__class__.__name__}
-                }
-                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
-        if sse == "openai":
-            yield "data: [DONE]\n\n"
+            try:
+                if hasattr(items, "__aiter__"):
+                    iterator = items.__aiter__()
+                    async for item in iterator:
+                        if sse == "anthropic":
+                            event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
+                            yield f"event: {event}\n"
+                            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                        else:
+                            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                else:
+                    for item in items:
+                        if sse == "anthropic":
+                            event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
+                            yield f"event: {event}\n"
+                            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                        else:
+                            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            except Exception as exc:
+                if sse == "anthropic":
+                    error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
+                    yield "event: error\n"
+                    yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+                else:
+                    error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
+                        "error": {"message": str(exc), "type": exc.__class__.__name__}
+                    }
+                    yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+            if sse == "openai":
+                yield "data: [DONE]\n\n"
+        finally:
+            await _close_async_iterator(items)
 
-    def stream(self, items):
+    def stream(
+        self,
+        items,
+        *,
+        on_success: Callable[[object | None], None] | None = None,
+        on_failure: Callable[[], None] | None = None,
+        on_stream_item: Callable[[object], None] | None = None,
+    ):
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
         failed = False
         try:
             for item in items:
+                if on_stream_item is not None:
+                    on_stream_item(item)
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
-        except Exception as exc:
+        except BaseException as exc:
             failed = True
+            _notify_failure(on_failure)
+            if not isinstance(exc, Exception):
+                raise
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -498,10 +599,15 @@ class LoggedCall:
 
                 raise ImageGenerationError(public_image_error_message(str(exc))) from exc
             raise
-        finally:
-            if not failed:
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
-                         conversation_id=conversation_ids[0] if conversation_ids else "")
+        if not failed:
+            try:
+                if on_success is not None:
+                    on_success(None)
+            except BaseException:
+                _notify_failure(on_failure)
+                raise
+            self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
+                     conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
