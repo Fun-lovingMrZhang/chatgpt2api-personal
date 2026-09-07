@@ -50,10 +50,10 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
 
 DEFAULT_SCHEDULER = {
     "enabled": True,
-    "system_concurrency": 128,
+    "system_concurrency": 192,
     "text": {
-        "worker_count": 16,
-        "global_concurrency": 64,
+        "worker_count": 128,
+        "global_concurrency": 128,
         "per_account_concurrency": 4,
         "queue_max_items": 256,
         "queue_max_cost": 256,
@@ -61,7 +61,7 @@ DEFAULT_SCHEDULER = {
         "request_timeout_ms": 120000,
     },
     "image_generation": {
-        "worker_count": 8,
+        "worker_count": 32,
         "global_concurrency": 32,
         "per_account_concurrency": 2,
         "queue_max_items": 64,
@@ -70,8 +70,8 @@ DEFAULT_SCHEDULER = {
         "request_timeout_ms": 600000,
     },
     "image_edit": {
-        "worker_count": 4,
-        "global_concurrency": 16,
+        "worker_count": 32,
+        "global_concurrency": 32,
         "per_account_concurrency": 2,
         "queue_max_items": 32,
         "queue_max_cost": 64,
