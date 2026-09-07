@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from urllib.parse import quote
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -128,14 +129,47 @@ def create_router(app_version: str) -> APIRouter:
         return get_image_download_response(image_path)
 
     @router.get("/api/logs")
-    async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    async def get_logs(
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        page: int = 1,
+        page_size: int = 20,
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+        if page < 1:
+            raise HTTPException(status_code=400, detail={"error": "page must be at least 1"})
+        if page_size < 1 or page_size > 100:
+            raise HTTPException(status_code=400, detail={"error": "page_size must be between 1 and 100"})
+        clean_start_date = start_date.strip()
+        clean_end_date = end_date.strip()
+        for field_name, value in (("start_date", clean_start_date), ("end_date", clean_end_date)):
+            if not value:
+                continue
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": f"{field_name} must use YYYY-MM-DD format"}) from exc
+        if clean_start_date and clean_end_date and clean_start_date > clean_end_date:
+            raise HTTPException(status_code=400, detail={"error": "start_date must not be after end_date"})
+        try:
+            return await run_in_threadpool(
+                log_service.query,
+                type_filter=type.strip(),
+                start_date=clean_start_date,
+                end_date=clean_end_date,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return log_service.delete(body.ids)
+        deleted = await run_in_threadpool(log_service.delete, body.ids)
+        return {"deleted": deleted}
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
