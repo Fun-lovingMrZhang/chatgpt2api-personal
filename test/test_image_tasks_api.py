@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+from services.quota_service import QuotaExceededError
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -19,6 +20,12 @@ class FakeImageTaskService:
     def __init__(self):
         self.generation_calls = []
         self.edit_calls = []
+        self.reject_quota = False
+
+    async def submit_generation_async(self, identity, **kwargs):
+        if self.reject_quota:
+            raise QuotaExceededError("image", 1, 0)
+        return self.submit_generation(identity, **kwargs)
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -40,6 +47,11 @@ class FakeImageTaskService:
             "created_at": "2026-01-01 00:00:00",
             "updated_at": "2026-01-01 00:00:00",
         }
+
+    async def submit_edit_async(self, identity, **kwargs):
+        if self.reject_quota:
+            raise QuotaExceededError("image", 1, 0)
+        return self.submit_edit(identity, **kwargs)
 
     def list_tasks(self, _identity, ids):
         return {
@@ -63,8 +75,15 @@ class ImageTasksApiTests(unittest.TestCase):
     def setUp(self):
         self.fake_service = FakeImageTaskService()
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)
+        self.identity_patcher = mock.patch.object(
+            image_tasks_module,
+            "require_identity",
+            lambda _authorization: {"id": "admin", "name": "Admin", "role": "admin"},
+        )
         self.service_patcher.start()
+        self.identity_patcher.start()
         self.addCleanup(self.service_patcher.stop)
+        self.addCleanup(self.identity_patcher.stop)
         app = FastAPI()
         app.include_router(image_tasks_module.create_router())
         self.client = TestClient(app)
@@ -81,6 +100,17 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(payload["id"], "task-1")
         self.assertEqual(payload["status"], "success")
         self.assertEqual(len(self.fake_service.generation_calls), 1)
+
+    def test_quota_exhaustion_returns_insufficient_quota(self):
+        self.fake_service.reject_quota = True
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "quota-task", "prompt": "cat", "model": "gpt-image-2"},
+        )
+
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.json()["detail"]["error"]["code"], "insufficient_quota")
 
     def test_create_edit_task_accepts_multiple_images(self):
         """测试图片编辑任务接口支持多个上传图片。"""

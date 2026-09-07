@@ -10,12 +10,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from services.image_task_service import ImageTaskService
+from services.quota_service import AuthQuotaStore, QuotaService
 from services.scheduler.errors import QueueFullError
 from services.scheduler.models import AccountRequirement, Lane
 from services.scheduler.state_store import SchedulerStateStore
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
+USER_OWNER = {"id": "user-1", "name": "User", "role": "user"}
 
 
 class FakeScheduler:
@@ -79,6 +81,27 @@ class SchedulerAsyncTaskTests(unittest.IsolatedAsyncioTestCase):
                     size=None,
                 )
             self.assertEqual(service.list_tasks(OWNER, ["rejected-task"])["items"], [])
+
+    async def test_scheduler_rejection_releases_image_quota_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = QuotaService(AuthQuotaStore(Path(tmp_dir) / "auth_quota.db"))
+            quota.set_limits("user-1", image_limit=1)
+            service = ImageTaskService(
+                Path(tmp_dir) / "tasks.json",
+                scheduler_service_instance=FakeScheduler(reject=True),
+                quota_service_instance=quota,
+            )
+            with self.assertRaises(QueueFullError):
+                await service.submit_generation_async(
+                    USER_OWNER,
+                    client_task_id="quota-rejected-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                )
+
+            self.assertEqual(quota.get_quota("user-1")["image_reserved"], 0)
+            self.assertEqual(quota.list_reservations("user-1")[0]["status"], "released")
 
     async def test_background_failure_updates_task_after_admission(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -24,6 +24,10 @@ class SchedulerStateStore:
         "account_ref",
         "idempotency_key",
         "source",
+        "quota_reservation_id",
+        "quota_requested_units",
+        "quota_status",
+        "quota_committed_units",
     }
     _BLOCKED_METADATA_KEYS = {
         "body",

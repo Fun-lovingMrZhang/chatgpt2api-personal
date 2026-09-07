@@ -9,10 +9,36 @@ from pathlib import Path
 from unittest import mock
 
 from services.image_task_service import ImageTaskService, _collect_image_urls
+from services.quota_service import AuthQuotaStore, QuotaExceededError, QuotaReservation, QuotaService
+from services.scheduler.state_store import SchedulerStateStore
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
 OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
+USER_OWNER = {"id": "user-1", "name": "User", "role": "user"}
+
+
+class FakeQuotaService:
+    def __init__(self, *, reject: bool = False):
+        self.reject = reject
+        self.reservations = []
+        self.commits = []
+        self.releases = []
+
+    def reserve(self, identity, quota_type, units, **kwargs):
+        if self.reject:
+            raise QuotaExceededError(quota_type, units, 0)
+        reservation_id = f"image-reservation-{len(self.reservations) + 1}"
+        self.reservations.append((reservation_id, identity["id"], quota_type, units, kwargs))
+        return QuotaReservation(reservation_id, identity["id"], quota_type, units)
+
+    def commit(self, reservation_id, units):
+        self.commits.append((reservation_id, units))
+        return True
+
+    def release(self, reservation_id):
+        self.releases.append(reservation_id)
+        return True
 
 
 def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_id: str, status: str, timeout: float = 2.0):
@@ -28,13 +54,159 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
-    def make_service(self, path: Path, handler=None) -> ImageTaskService:
+    def make_service(self, path: Path, handler=None, quota_service=None, state_store=None) -> ImageTaskService:
         return ImageTaskService(
             path,
             generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
             retention_days_getter=lambda: 30,
+            quota_service_instance=quota_service,
+            state_store=state_store,
         )
+
+    def test_user_image_task_reserves_and_commits_successful_output(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = FakeQuotaService()
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", quota_service=quota)
+
+            service.submit_generation(
+                USER_OWNER,
+                client_task_id="quota-success",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            task = wait_for_task(service, USER_OWNER, "quota-success", "success")
+            self.assertEqual(len(task["data"]), 1)
+            self.assertEqual([(item[1], item[2], item[3]) for item in quota.reservations], [("user-1", "image", 1)])
+            self.assertEqual(quota.commits, [("image-reservation-1", 1)])
+            self.assertEqual(quota.releases, [])
+
+    def test_failed_user_image_task_releases_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = FakeQuotaService()
+
+            def handler(_payload):
+                raise RuntimeError("upstream failed")
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler, quota)
+            service.submit_generation(
+                USER_OWNER,
+                client_task_id="quota-failure",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            wait_for_task(service, USER_OWNER, "quota-failure", "error")
+            self.assertEqual(quota.commits, [])
+            self.assertEqual(quota.releases, ["image-reservation-1"])
+
+    def test_quota_exhaustion_rejects_image_task_before_persistence(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = FakeQuotaService(reject=True)
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", quota_service=quota)
+
+            with self.assertRaises(QuotaExceededError):
+                service.submit_generation(
+                    USER_OWNER,
+                    client_task_id="quota-rejected",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+
+            self.assertEqual(service.list_tasks(USER_OWNER, ["quota-rejected"])["items"], [])
+
+    def test_timeout_resume_reuses_persisted_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = FakeQuotaService()
+
+            def handler(_payload):
+                error = RuntimeError("生图超时")
+                error.conversation_id = "conversation-quota"
+                raise error
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler, quota)
+            service.submit_generation(
+                USER_OWNER,
+                client_task_id="quota-resume",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            task = wait_for_task(service, USER_OWNER, "quota-resume", "error")
+            self.assertEqual(task["conversation_id"], "conversation-quota")
+            self.assertEqual(len(quota.reservations), 1)
+            self.assertEqual(quota.commits, [])
+            self.assertEqual(quota.releases, [])
+
+            with mock.patch.object(service, "_dispatch_resume_poll") as dispatch:
+                service.resume_poll(USER_OWNER, "quota-resume", 1.0)
+            dispatch.assert_called_once()
+
+            backend = mock.Mock()
+            backend._poll_image_results.return_value = (["file-1"], [])
+            backend.resolve_conversation_image_urls.return_value = ["https://files.example.test/image.png"]
+            with mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend):
+                service._run_resume_poll(
+                    "user-1:quota-resume",
+                    "conversation-quota",
+                    1.0,
+                    USER_OWNER,
+                    "generate",
+                    "gpt-image-2",
+                    access_token="account-token",
+                )
+
+            self.assertEqual(len(quota.reservations), 1)
+            self.assertEqual(quota.commits, [("image-reservation-1", 1)])
+            self.assertEqual(quota.releases, [])
+
+    def test_quota_reservation_metadata_is_persisted_in_scheduler_store(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = FakeQuotaService()
+            store = SchedulerStateStore(Path(tmp_dir) / "scheduler.db")
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                quota_service=quota,
+                state_store=store,
+            )
+            service.submit_generation(
+                USER_OWNER,
+                client_task_id="quota-persisted",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            wait_for_task(service, USER_OWNER, "quota-persisted", "success")
+            record = store.get_task("user-1:quota-persisted")
+            self.assertEqual(record["metadata"]["quota_reservation_id"], "image-reservation-1")
+            self.assertEqual(record["metadata"]["quota_requested_units"], 1)
+
+    def test_admin_image_task_does_not_create_quota_row(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = QuotaService(AuthQuotaStore(Path(tmp_dir) / "auth_quota.db"))
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", quota_service=quota)
+
+            service.submit_generation(
+                OWNER,
+                client_task_id="admin-no-quota",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            wait_for_task(service, OWNER, "admin-no-quota", "success")
+            self.assertIsNone(quota.get_quota(OWNER["id"]))
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

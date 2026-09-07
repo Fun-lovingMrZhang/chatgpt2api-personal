@@ -5,10 +5,11 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
+from api.support import _quota_exhausted_response, require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
+from services.quota_service import QuotaExceededError, QuotaSettlementError
 from services.scheduler.errors import SchedulerError
 
 
@@ -67,6 +68,8 @@ def create_router() -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except QuotaExceededError as exc:
+            raise HTTPException(status_code=429, detail=_quota_exhausted_response(exc)) from exc
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
@@ -100,6 +103,8 @@ def create_router() -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except QuotaExceededError as exc:
+            raise HTTPException(status_code=429, detail=_quota_exhausted_response(exc)) from exc
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
@@ -120,6 +125,8 @@ def create_router() -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except QuotaSettlementError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc

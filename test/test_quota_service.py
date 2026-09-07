@@ -154,6 +154,32 @@ class QuotaServiceTests(unittest.TestCase):
             self.assertEqual(service.get_quota("user-1")["text_reserved"], 0)
             self.assertEqual(service.get_reservation(reservation.reservation_id)["status"], "expired")
 
+    def test_active_reservation_can_be_renewed_but_expired_one_cannot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = make_service(Path(tmp_dir))
+            service.set_limits("user-1", text_limit=2, image_limit=0)
+            active = service.reserve(
+                user_identity(),
+                "text",
+                1,
+                request_id="active",
+                endpoint="/v1/chat/completions",
+                expires_at=time.time() + 30,
+            )
+            old_expiry = service.get_reservation(active.reservation_id)["expires_at"]
+            self.assertTrue(service.renew(active.reservation_id, expires_at=time.time() + 120))
+            self.assertGreater(service.get_reservation(active.reservation_id)["expires_at"], old_expiry)
+
+            expired = service.reserve(
+                user_identity(),
+                "text",
+                1,
+                request_id="expired",
+                endpoint="/v1/chat/completions",
+                expires_at=time.time() - 1,
+            )
+            self.assertFalse(service.renew(expired.reservation_id, expires_at=time.time() + 120))
+
     def test_concurrent_reservations_never_exceed_limit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = make_service(Path(tmp_dir))
