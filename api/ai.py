@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
+from api.support import require_identity, resolve_image_base_url, run_with_quota
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
@@ -118,23 +118,27 @@ def _text_scheduler_runner(model: str):
     return runner
 
 
-def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
-    if not _scheduler_enabled():
-        return None
-    scheduler_payload = dict(payload)
+def _requested_image_count(payload: dict[str, object]) -> int:
     try:
-        requested_count = int(scheduler_payload.get("n") or 0)
+        requested_count = int(payload.get("n") or 0)
     except (TypeError, ValueError):
         requested_count = 0
     if requested_count < 1:
-        for tool in scheduler_payload.get("tools") or []:
+        for tool in payload.get("tools") or []:
             if isinstance(tool, dict) and tool.get("type") == "image_generation":
                 try:
                     requested_count = int(tool.get("n") or 0)
                 except (TypeError, ValueError):
                     requested_count = 0
                 break
-    requested_count = max(1, requested_count)
+    return max(1, requested_count)
+
+
+def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
+    if not _scheduler_enabled():
+        return None
+    scheduler_payload = dict(payload)
+    requested_count = _requested_image_count(scheduler_payload)
     if requested_count > MAX_IMAGE_OUTPUTS:
         raise HTTPException(
             status_code=400,
@@ -245,9 +249,14 @@ def create_router() -> APIRouter:
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
-        return await call.run(
+        return await run_with_quota(
+            call,
             openai_v1_image_generations.handle,
             payload,
+            identity=identity,
+            quota_type="image",
+            requested_units=body.n,
+            endpoint="/v1/images/generations",
             scheduler_runner=_image_scheduler_runner(body.model, payload, Lane.IMAGE_GENERATION),
             streaming=bool(payload.get("stream")),
         )
@@ -267,9 +276,14 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(
+        return await run_with_quota(
+            call,
             openai_v1_image_edit.handle,
             payload,
+            identity=identity,
+            quota_type="image",
+            requested_units=int(payload.get("n") or 1),
+            endpoint="/v1/images/edits",
             scheduler_runner=_image_scheduler_runner(model, payload, Lane.IMAGE_EDIT),
             streaming=bool(payload.get("stream")),
         )
@@ -292,11 +306,20 @@ def create_router() -> APIRouter:
         if is_image_chat_request(payload):
             image_lane = Lane.IMAGE_EDIT if extract_chat_image(payload) else Lane.IMAGE_GENERATION
             scheduler_runner = _image_scheduler_runner(model, payload, image_lane)
+            quota_type = "image"
+            requested_units = _requested_image_count(payload)
         else:
             scheduler_runner = _text_scheduler_runner(model)
-        return await call.run(
+            quota_type = "text"
+            requested_units = 1
+        return await run_with_quota(
+            call,
             openai_v1_chat_complete.handle,
             payload,
+            identity=identity,
+            quota_type=quota_type,
+            requested_units=requested_units,
+            endpoint="/v1/chat/completions",
             scheduler_runner=scheduler_runner,
             streaming=bool(payload.get("stream")),
         )
@@ -316,18 +339,24 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
+        is_image_request = openai_v1_response.has_response_image_generation_tool(payload)
         scheduler_runner = (
             _image_scheduler_runner(
                 model,
                 payload,
                 Lane.IMAGE_EDIT if openai_v1_response.extract_response_image(payload.get("input")) else Lane.IMAGE_GENERATION,
             )
-            if openai_v1_response.has_response_image_generation_tool(payload)
+            if is_image_request
             else _text_scheduler_runner(model)
         )
-        return await call.run(
+        return await run_with_quota(
+            call,
             openai_v1_response.handle,
             payload,
+            identity=identity,
+            quota_type="image" if is_image_request else "text",
+            requested_units=_requested_image_count(payload) if is_image_request else 1,
+            endpoint="/v1/responses",
             scheduler_runner=scheduler_runner,
             streaming=bool(payload.get("stream")),
         )
@@ -345,9 +374,14 @@ def create_router() -> APIRouter:
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
         call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
         await filter_or_log(call, request_preview)
-        return await call.run(
+        return await run_with_quota(
+            call,
             anthropic_v1_messages.handle,
             payload,
+            identity=identity,
+            quota_type="text",
+            requested_units=1,
+            endpoint="/v1/messages",
             sse="anthropic",
             scheduler_runner=_text_scheduler_runner(model),
             streaming=bool(payload.get("stream")),
@@ -358,9 +392,14 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
-        return await call.run(
+        return await run_with_quota(
+            call,
             openai_search.handle,
             body.model_dump(mode="python"),
+            identity=identity,
+            quota_type="text",
+            requested_units=1,
+            endpoint="/v1/search",
             scheduler_runner=_text_scheduler_runner(openai_search.MODEL),
         )
 
