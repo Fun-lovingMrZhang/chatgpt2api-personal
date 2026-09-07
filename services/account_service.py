@@ -53,6 +53,7 @@ class AccountService:
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
+        self._scheduler_state_generation = 0
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -127,6 +128,16 @@ class AccountService:
 
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
+        self._scheduler_state_generation += 1
+
+    def scheduler_state_generation(self) -> int:
+        with self._lock:
+            return self._scheduler_state_generation
+
+    def scheduler_snapshot(self) -> list[dict[str, object]]:
+        """Return the internal account snapshot consumed by the scheduler."""
+        with self._lock:
+            return [dict(item) for item in self._accounts.values()]
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
