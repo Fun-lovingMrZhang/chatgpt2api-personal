@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from utils.log import logger
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -93,20 +94,13 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
-                    print(
-                        "[account-watcher] checking "
-                        f"{len(limited_tokens)} limited accounts, "
-                        f"{len(normal_tokens)} normal accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
-                    )
                     account_service.refresh_accounts(tokens, quiet=True)
                 if keepalive_tokens:
-                    print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
                     result = account_service.keepalive_refresh_tokens(keepalive_tokens)
                     if result.get("errors"):
-                        print(f"[account-watcher] keepalive errors: {result['errors']}")
+                        logger.warning({"event": "account_watcher_keepalive_failed", "errors": result["errors"]})
             except Exception as exc:
-                print(f"[account-watcher] fail {exc}")
+                logger.error({"event": "account_watcher_failed", "error": str(exc)})
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
