@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 import time
@@ -12,6 +13,8 @@ from uuid import uuid4
 
 class SQLiteLogStore:
     _DELETE_CHUNK_SIZE = 900
+    _MIGRATION_BATCH_SIZE = 500
+    _MIGRATION_METADATA_KEY = "legacy_jsonl_migration"
 
     def __init__(self, db_path: Path, legacy_path: Path):
         self.db_path = Path(db_path)
@@ -66,6 +69,7 @@ class SQLiteLogStore:
                     );
                     """
                 )
+            self._migrate_legacy(connection)
             self._initialized = True
 
     def _ensure_initialized(self) -> None:
@@ -101,6 +105,150 @@ class SQLiteLogStore:
             "summary": row["summary"],
             "detail": detail,
         }
+
+    @staticmethod
+    def _legacy_id(raw_line: str, line_number: int) -> str:
+        payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
+        return hashlib.sha256(payload).hexdigest()[:24]
+
+    @staticmethod
+    def _parse_legacy_time(value: str, fallback_ts: float) -> tuple[str, float]:
+        normalized = value.strip()
+        parsed: datetime | None = None
+        if normalized:
+            try:
+                parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            parsed = datetime.fromtimestamp(fallback_ts)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S"), parsed.timestamp()
+
+    def _metadata(self, connection: sqlite3.Connection) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT value FROM log_metadata WHERE key = ?",
+            (self._MIGRATION_METADATA_KEY,),
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def migration_metadata(self) -> dict[str, Any]:
+        self._ensure_initialized()
+        return self._metadata(self._connection())
+
+    def _migration_backup_path(self) -> Path:
+        candidate = self.legacy_path.with_name(self.legacy_path.name + ".migrated")
+        if not candidate.exists():
+            return candidate
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        candidate = self.legacy_path.with_name(f"{self.legacy_path.name}.migrated.{timestamp}")
+        suffix = 1
+        while candidate.exists():
+            candidate = self.legacy_path.with_name(
+                f"{self.legacy_path.name}.migrated.{timestamp}.{suffix}"
+            )
+            suffix += 1
+        return candidate
+
+    def _insert_legacy_batch(
+        self,
+        connection: sqlite3.Connection,
+        records: list[tuple[str, str, float, str, str, str]],
+    ) -> tuple[int, int]:
+        imported = 0
+        duplicates = 0
+        with connection:
+            for record in records:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO logs
+                        (id, time, created_ts, type, summary, detail_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    record,
+                )
+                if cursor.rowcount == 1:
+                    imported += 1
+                else:
+                    duplicates += 1
+        return imported, duplicates
+
+    def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
+        if not self.legacy_path.exists():
+            return
+        existing_metadata = self._metadata(connection)
+        if existing_metadata.get("completed"):
+            return
+
+        source_mtime = self.legacy_path.stat().st_mtime
+        backup_path = self._migration_backup_path()
+        imported = 0
+        duplicates = 0
+        invalid_lines = 0
+        batch: list[tuple[str, str, float, str, str, str]] = []
+
+        with self.legacy_path.open("r", encoding="utf-8") as file:
+            for line_number, raw_line in enumerate(file, start=1):
+                try:
+                    payload = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    invalid_lines += 1
+                    continue
+                if not isinstance(payload, dict):
+                    invalid_lines += 1
+                    continue
+
+                record_id = str(payload.get("id") or self._legacy_id(raw_line, line_number))
+                time_text, created_ts = self._parse_legacy_time(
+                    str(payload.get("time") or ""),
+                    source_mtime,
+                )
+                detail = payload.get("detail")
+                if not isinstance(detail, dict):
+                    detail = {}
+                batch.append(
+                    (
+                        record_id,
+                        time_text,
+                        created_ts,
+                        str(payload.get("type") or ""),
+                        str(payload.get("summary") or ""),
+                        json.dumps(detail, ensure_ascii=False, separators=(",", ":")),
+                    )
+                )
+                if len(batch) >= self._MIGRATION_BATCH_SIZE:
+                    batch_imported, batch_duplicates = self._insert_legacy_batch(connection, batch)
+                    imported += batch_imported
+                    duplicates += batch_duplicates
+                    batch.clear()
+
+        if batch:
+            batch_imported, batch_duplicates = self._insert_legacy_batch(connection, batch)
+            imported += batch_imported
+            duplicates += batch_duplicates
+
+        metadata = {
+            "completed": True,
+            "source": str(self.legacy_path),
+            "backup_path": str(backup_path),
+            "imported": imported,
+            "duplicates": duplicates,
+            "invalid_lines": invalid_lines,
+            "completed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO log_metadata (key, value) VALUES (?, ?)",
+                (self._MIGRATION_METADATA_KEY, json.dumps(metadata, ensure_ascii=False)),
+            )
+        self.legacy_path.rename(backup_path)
 
     def add(
         self,

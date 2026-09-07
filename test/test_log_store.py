@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from services.log_store import SQLiteLogStore
@@ -86,6 +88,78 @@ class SQLiteLogStoreTests(unittest.TestCase):
 
         self.assertEqual(self.store.delete([item["id"], "missing-id"]), 1)
         self.assertEqual(self.store.delete([item["id"]]), 0)
+
+    def test_migrates_legacy_jsonl_once_and_keeps_metadata(self):
+        self.legacy_path.write_text(
+            json.dumps(
+                {
+                    "id": "old-1",
+                    "time": "2026-09-01 10:00:00",
+                    "type": "call",
+                    "summary": "old",
+                    "detail": {"status": 200},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "time": "2026-09-01 10:01:00",
+                    "type": "account",
+                    "summary": "legacy",
+                    "detail": {},
+                }
+            )
+            + "\nnot-json\n[]\n",
+            encoding="utf-8",
+        )
+
+        self.store.initialize()
+
+        result = self.store.query(page=1, page_size=100)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["items"][1]["id"], "old-1")
+        self.assertTrue(result["items"][0]["id"])
+        self.assertFalse(self.legacy_path.exists())
+        self.assertTrue((self.root / "logs.jsonl.migrated").exists())
+        metadata = self.store.migration_metadata()
+        self.assertEqual(metadata["imported"], 2)
+        self.assertEqual(metadata["invalid_lines"], 2)
+
+        self.store.initialize()
+        self.assertEqual(self.store.query(page=1, page_size=100)["total"], 2)
+
+    def test_migration_uses_timestamped_backup_if_default_exists(self):
+        self.legacy_path.write_text("{}\n", encoding="utf-8")
+        (self.root / "logs.jsonl.migrated").write_text("existing\n", encoding="utf-8")
+
+        self.store.initialize()
+
+        backups = list(self.root.glob("logs.jsonl.migrated.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertFalse(self.legacy_path.exists())
+
+    def test_migration_failure_keeps_source_file(self):
+        self.legacy_path.write_text(
+            json.dumps({"type": "call", "summary": "will fail", "detail": {}}) + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(self.store, "_insert_legacy_batch", side_effect=RuntimeError("db failure"), create=True):
+            with self.assertRaises(RuntimeError):
+                self.store.initialize()
+
+        self.assertTrue(self.legacy_path.exists())
+
+    def test_cleanup_expired_removes_only_old_rows(self):
+        self.store.initialize()
+        now = time.time()
+        old_item = self.store.add("call", "old", {}, created_ts=now - 3 * 86400)
+        new_item = self.store.add("call", "new", {}, created_ts=now)
+
+        self.assertEqual(self.store.cleanup_expired(2), 1)
+        remaining = self.store.query(page=1, page_size=100)
+        self.assertEqual([item["id"] for item in remaining["items"]], [new_item["id"]])
+        self.assertNotEqual(old_item["id"], new_item["id"])
 
 
 if __name__ == "__main__":
