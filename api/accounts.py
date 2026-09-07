@@ -26,6 +26,7 @@ from api.support import (
 from services.account_service import account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
+from services.quota_service import QuotaKeyNotFoundError, QuotaLimitError, quota_service
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
@@ -37,12 +38,16 @@ from services.sub2api_service import (
 
 class UserKeyCreateRequest(BaseModel):
     name: str = ""
+    text_limit: int = Field(default=0, ge=0)
+    image_limit: int = Field(default=0, ge=0)
 
 
 class UserKeyUpdateRequest(BaseModel):
     name: str | None = None
     enabled: bool | None = None
     key: str | None = None
+    text_limit: int | None = Field(default=None, ge=0)
+    image_limit: int | None = Field(default=None, ge=0)
 
 
 class AccountCreateRequest(BaseModel):
@@ -137,6 +142,15 @@ def _safe_export_name(value: str, fallback: str) -> str:
     return (clean or fallback)[:80]
 
 
+def _list_user_keys_with_quota() -> list[dict[str, object]]:
+    return quota_service.list_user_quotas(auth_service.list_keys(role="user"))
+
+
+def _merge_user_key_quota(item: dict[str, object]) -> dict[str, object]:
+    items = quota_service.list_user_quotas([item])
+    return items[0] if items else dict(item)
+
+
 def _account_zip_bytes(items: list[dict[str, str]]) -> bytes:
     buf = io.BytesIO()
     used_names: set[str] = set()
@@ -163,7 +177,7 @@ def create_router() -> APIRouter:
     @router.get("/api/auth/users")
     async def list_user_keys(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": _list_user_keys_with_quota()}
 
     @router.post("/api/auth/users")
     async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
@@ -172,7 +186,16 @@ def create_router() -> APIRouter:
             item, raw_key = auth_service.create_key(role="user", name=body.name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
+        try:
+            quota = quota_service.set_limits(
+                str(item.get("id") or ""),
+                text_limit=body.text_limit,
+                image_limit=body.image_limit,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail={"error": "failed to initialize user key quota"}) from exc
+        item = {**item, **{key: value for key, value in quota.items() if key != "key_id"}}
+        return {"item": item, "key": raw_key, "items": _list_user_keys_with_quota()}
 
     @router.post("/api/auth/users/{key_id}")
     async def update_user_key(
@@ -181,7 +204,7 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        updates = {
+        auth_updates = {
             key: value
             for key, value in {
                 "name": body.name,
@@ -190,22 +213,51 @@ def create_router() -> APIRouter:
             }.items()
             if value is not None
         }
-        if not updates:
+        has_quota_updates = body.text_limit is not None or body.image_limit is not None
+        if not auth_updates and not has_quota_updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
+
+        quota: dict[str, object] | None = None
+        if has_quota_updates:
+            try:
+                quota = quota_service.set_limits(
+                    key_id,
+                    text_limit=body.text_limit,
+                    image_limit=body.image_limit,
+                )
+            except QuotaLimitError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": str(exc), "code": exc.code},
+                ) from exc
+            except QuotaKeyNotFoundError as exc:
+                raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"}) from exc
         try:
-            item = auth_service.update_key(key_id, updates, role="user")
+            item = auth_service.update_key(key_id, auth_updates, role="user") if auth_updates else None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        if auth_updates and item is None:
+            raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
+        if item is None:
+            item = next(
+                (candidate for candidate in auth_service.list_keys(role="user") if candidate.get("id") == key_id),
+                None,
+            )
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"item": item, "items": auth_service.list_keys(role="user")}
+        if quota is None:
+            item = _merge_user_key_quota(item)
+        else:
+            item = {**item, **{key: value for key, value in quota.items() if key != "key_id"}}
+        return {"item": item, "items": _list_user_keys_with_quota()}
 
     @router.delete("/api/auth/users/{key_id}")
     async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         if not auth_service.delete_key(key_id, role="user"):
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"items": auth_service.list_keys(role="user")}
+        quota_service.mark_deleted(key_id)
+        return {"items": _list_user_keys_with_quota()}
 
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
