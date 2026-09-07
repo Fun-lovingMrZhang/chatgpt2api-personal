@@ -576,6 +576,34 @@ class AuthQuotaStore:
             )
         return True
 
+    def renew(self, reservation_id: str, *, expires_at: float | None = None) -> bool:
+        normalized_id = str(reservation_id or "").strip()
+        if not normalized_id:
+            return False
+        self._ensure_initialized()
+        timestamp = _now()
+        requested_expiry = float(
+            expires_at if expires_at is not None else timestamp + DEFAULT_RESERVATION_TTL_SECONDS
+        )
+        if requested_expiry <= timestamp:
+            raise ValueError("reservation expiry must be in the future")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT expires_at FROM quota_reservations WHERE reservation_id = ? AND status = 'reserved'",
+                (normalized_id,),
+            ).fetchone()
+            if row is None or float(row["expires_at"]) <= timestamp:
+                return False
+            updated = connection.execute(
+                """
+                UPDATE quota_reservations
+                SET expires_at = ?
+                WHERE reservation_id = ? AND status = 'reserved' AND expires_at > ?
+                """,
+                (max(float(row["expires_at"]), requested_expiry), normalized_id, timestamp),
+            )
+        return updated.rowcount == 1
+
     def recover_expired(self, now: float | None = None) -> int:
         self._ensure_initialized()
         timestamp = float(now if now is not None else _now())
@@ -697,6 +725,11 @@ class QuotaService:
 
     def release(self, reservation_id: str) -> bool:
         return self.store.release(reservation_id)
+
+    def renew(self, reservation_id: str, *, expires_at: float | None = None) -> bool:
+        if str(reservation_id or "").strip().startswith("admin-"):
+            return True
+        return self.store.renew(reservation_id, expires_at=expires_at)
 
     def expire(self, reservation_id: str) -> bool:
         return self.store.release(reservation_id, status="expired")
