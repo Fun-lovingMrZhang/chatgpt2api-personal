@@ -29,6 +29,8 @@ class ProxyRuntimeConfigTests(unittest.TestCase):
             runtime = store.get_proxy_runtime_settings()
             self.assertEqual(runtime, expected_default)
             self.assertEqual(store.get_proxy_settings(), "http://legacy.example:8080")
+            self.assertEqual(store.log_retention_days, 30)
+            self.assertEqual(store.get()["log_retention_days"], 30)
 
             expected_public = copy.deepcopy(expected_default)
             expected_public["clearance"]["has_cf_cookies"] = False
@@ -42,6 +44,17 @@ class ProxyRuntimeConfigTests(unittest.TestCase):
             runtime["clearance"]["enabled"] = True
             self.assertEqual(DEFAULT_PROXY_RUNTIME, expected_default)
             self.assertEqual(store.get_proxy_runtime_settings(), expected_default)
+
+    def test_log_retention_days_normalizes_invalid_values(self) -> None:
+        tmp_dir, store = self._make_store({"log_retention_days": "7"})
+        with tmp_dir:
+            self.assertEqual(store.log_retention_days, 7)
+            self.assertEqual(store.update({"log_retention_days": "14"})["log_retention_days"], 14)
+
+            store.data["log_retention_days"] = 0
+            self.assertEqual(store.log_retention_days, 1)
+            store.data["log_retention_days"] = "not-a-number"
+            self.assertEqual(store.log_retention_days, 30)
 
     def test_normalize_proxy_runtime_sanitizes_invalid_values(self) -> None:
         normalized = _normalize_proxy_runtime_settings(

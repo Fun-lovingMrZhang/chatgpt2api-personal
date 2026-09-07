@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+from threading import Event
 from pathlib import Path
 from unittest import mock
 
@@ -74,6 +75,28 @@ class LogServiceTests(unittest.TestCase):
             self.assertEqual(service.list(type="call", limit=1)[0]["id"], item["id"])
             self.assertEqual(service.delete([item["id"]]), 1)
             self.assertEqual(service.query(page=1, page_size=20)["total"], 0)
+
+    def test_retention_scheduler_runs_and_stops(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            service = LogService(root / "logs.db", root / "logs.jsonl")
+            stopped = Event()
+            ran = Event()
+
+            def cleanup(_retention_days: int) -> int:
+                ran.set()
+                return 0
+
+            with mock.patch.object(service, "cleanup_expired", side_effect=cleanup):
+                thread = service.start_retention_scheduler(
+                    stopped,
+                    lambda: 30,
+                    interval_seconds=0.01,
+                )
+                self.assertTrue(ran.wait(1))
+                stopped.set()
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":
