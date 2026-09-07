@@ -71,6 +71,38 @@
     }
   },
   "image_account_concurrency": 3,
+  "scheduler": {
+    "enabled": true,
+    "system_concurrency": 128,
+    "text": {
+      "worker_count": 16,
+      "global_concurrency": 64,
+      "per_account_concurrency": 4,
+      "queue_max_items": 256,
+      "queue_max_cost": 256,
+      "queue_wait_timeout_ms": 1500
+    },
+    "image_generation": {
+      "worker_count": 8,
+      "global_concurrency": 32,
+      "per_account_concurrency": 2,
+      "queue_max_items": 64,
+      "queue_max_cost": 128,
+      "queue_wait_timeout_ms": 1000
+    },
+    "image_edit": {
+      "worker_count": 4,
+      "global_concurrency": 16,
+      "per_account_concurrency": 2,
+      "queue_max_items": 32,
+      "queue_max_cost": 64,
+      "queue_wait_timeout_ms": 1000
+    },
+    "image_total_per_account_concurrency": 3,
+    "account_reconcile_interval_ms": 1000,
+    "lease_watchdog_interval_ms": 1000,
+    "snapshot_flush_interval_ms": 1000
+  },
   "image_parallel_generation": true,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,

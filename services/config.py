@@ -48,6 +48,39 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "drop_assistant_history": False,
 }
 
+DEFAULT_SCHEDULER = {
+    "enabled": True,
+    "system_concurrency": 128,
+    "text": {
+        "worker_count": 16,
+        "global_concurrency": 64,
+        "per_account_concurrency": 4,
+        "queue_max_items": 256,
+        "queue_max_cost": 256,
+        "queue_wait_timeout_ms": 1500,
+    },
+    "image_generation": {
+        "worker_count": 8,
+        "global_concurrency": 32,
+        "per_account_concurrency": 2,
+        "queue_max_items": 64,
+        "queue_max_cost": 128,
+        "queue_wait_timeout_ms": 1000,
+    },
+    "image_edit": {
+        "worker_count": 4,
+        "global_concurrency": 16,
+        "per_account_concurrency": 2,
+        "queue_max_items": 32,
+        "queue_max_cost": 64,
+        "queue_wait_timeout_ms": 1000,
+    },
+    "image_total_per_account_concurrency": 3,
+    "account_reconcile_interval_ms": 1000,
+    "lease_watchdog_interval_ms": 1000,
+    "snapshot_flush_interval_ms": 1000,
+}
+
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -194,6 +227,91 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
         "drop_assistant_history": _normalize_bool(
             source.get("drop_assistant_history"),
             bool(DEFAULT_CHAT_COMPLETION_CACHE["drop_assistant_history"]),
+        ),
+    }
+
+
+def _normalize_scheduler_settings(value: object, legacy_image_concurrency: object = 3) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    system_concurrency = _normalize_positive_int(
+        source.get("system_concurrency"),
+        int(DEFAULT_SCHEDULER["system_concurrency"]),
+        1,
+    )
+
+    lanes: dict[str, dict[str, int]] = {}
+    for lane_name in ("text", "image_generation", "image_edit"):
+        defaults = DEFAULT_SCHEDULER[lane_name]
+        lane_source = source.get(lane_name) if isinstance(source.get(lane_name), dict) else {}
+        global_concurrency = min(
+            system_concurrency,
+            _normalize_positive_int(
+                lane_source.get("global_concurrency"),
+                int(defaults["global_concurrency"]),
+                1,
+            ),
+        )
+        lanes[lane_name] = {
+            "worker_count": min(
+                global_concurrency,
+                _normalize_positive_int(
+                    lane_source.get("worker_count"),
+                    int(defaults["worker_count"]),
+                    1,
+                ),
+            ),
+            "global_concurrency": global_concurrency,
+            "per_account_concurrency": min(
+                global_concurrency,
+                _normalize_positive_int(
+                    lane_source.get("per_account_concurrency"),
+                    int(defaults["per_account_concurrency"]),
+                    1,
+                ),
+            ),
+            "queue_max_items": _normalize_positive_int(
+                lane_source.get("queue_max_items"),
+                int(defaults["queue_max_items"]),
+                1,
+            ),
+            "queue_max_cost": _normalize_positive_int(
+                lane_source.get("queue_max_cost"),
+                int(defaults["queue_max_cost"]),
+                1,
+            ),
+            "queue_wait_timeout_ms": _normalize_positive_int(
+                lane_source.get("queue_wait_timeout_ms"),
+                int(defaults["queue_wait_timeout_ms"]),
+                1,
+            ),
+        }
+
+    image_total = source.get("image_total_per_account_concurrency")
+    if image_total is None:
+        image_total = legacy_image_concurrency
+    return {
+        "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_SCHEDULER["enabled"])),
+        "system_concurrency": system_concurrency,
+        **lanes,
+        "image_total_per_account_concurrency": _normalize_positive_int(
+            image_total,
+            int(DEFAULT_SCHEDULER["image_total_per_account_concurrency"]),
+            1,
+        ),
+        "account_reconcile_interval_ms": _normalize_positive_int(
+            source.get("account_reconcile_interval_ms"),
+            int(DEFAULT_SCHEDULER["account_reconcile_interval_ms"]),
+            1,
+        ),
+        "lease_watchdog_interval_ms": _normalize_positive_int(
+            source.get("lease_watchdog_interval_ms"),
+            int(DEFAULT_SCHEDULER["lease_watchdog_interval_ms"]),
+            1,
+        ),
+        "snapshot_flush_interval_ms": _normalize_positive_int(
+            source.get("snapshot_flush_interval_ms"),
+            int(DEFAULT_SCHEDULER["snapshot_flush_interval_ms"]),
+            1,
         ),
     }
 
@@ -591,6 +709,7 @@ class ConfigStore:
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
+        data["scheduler"] = self.get_scheduler_settings_dict()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data.pop("auth-key", None)
@@ -653,6 +772,34 @@ class ConfigStore:
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
+
+    def get_scheduler_settings(self):
+        from services.scheduler.models import Lane, LaneSettings, SchedulerSettings
+
+        normalized = _normalize_scheduler_settings(
+            self.data.get("scheduler"),
+            self.data.get("image_account_concurrency", 3),
+        )
+        lanes = {
+            Lane.TEXT: LaneSettings(**normalized["text"]),
+            Lane.IMAGE_GENERATION: LaneSettings(**normalized["image_generation"]),
+            Lane.IMAGE_EDIT: LaneSettings(**normalized["image_edit"]),
+        }
+        return SchedulerSettings(
+            enabled=bool(normalized["enabled"]),
+            system_concurrency=int(normalized["system_concurrency"]),
+            lanes=lanes,
+            image_total_per_account_concurrency=int(normalized["image_total_per_account_concurrency"]),
+            account_reconcile_interval_ms=int(normalized["account_reconcile_interval_ms"]),
+            lease_watchdog_interval_ms=int(normalized["lease_watchdog_interval_ms"]),
+            snapshot_flush_interval_ms=int(normalized["snapshot_flush_interval_ms"]),
+        )
+
+    def get_scheduler_settings_dict(self) -> dict[str, object]:
+        return _normalize_scheduler_settings(
+            self.data.get("scheduler"),
+            self.data.get("image_account_concurrency", 3),
+        )
 
     def get_storage_backend(self) -> StorageBackend:
         """获取存储后端实例（单例）"""
