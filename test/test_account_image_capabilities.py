@@ -86,7 +86,7 @@ class AccountCapabilityTests(unittest.TestCase):
                 ]
             )
 
-            service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(access_token)
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info", **_: service.get_account(access_token)
 
             plus_token = service.get_available_access_token(plan_type="plus")
             pro_token = service.get_available_access_token(plan_type="pro")
@@ -95,6 +95,48 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
+
+    def test_periodic_refresh_is_quiet_and_explicit_refresh_is_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "refresh-token", "status": "正常", "quota": 3}])
+
+            def fake_fetch(
+                access_token: str,
+                event: str = "fetch_remote_info",
+                defer_invalid_removal: bool = True,
+                *,
+                quiet: bool = False,
+            ):
+                return service.update_account(
+                    access_token,
+                    {"status": "正常", "quota": 3},
+                    quiet=quiet,
+                )
+
+            with patch.object(service, "fetch_remote_info", side_effect=fake_fetch):
+                with patch("services.account_service.log_service.add") as add_log:
+                    service.refresh_accounts(["refresh-token"], quiet=True)
+                    success_summaries = [
+                        call.args[1]
+                        for call in add_log.call_args_list
+                        if len(call.args) > 1
+                    ]
+                    self.assertNotIn("更新账号", success_summaries)
+
+                    add_log.reset_mock()
+                    service.refresh_accounts(
+                        ["refresh-token"],
+                        quiet=True,
+                        log_summary=True,
+                    )
+
+            self.assertEqual(add_log.call_count, 1)
+            self.assertEqual(add_log.call_args.args[1], "批量刷新账号")
+            self.assertEqual(
+                add_log.call_args.args[2],
+                {"requested": 1, "refreshed": 1, "failed": 0, "removed": 0},
+            )
 
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")

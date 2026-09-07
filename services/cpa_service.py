@@ -298,7 +298,7 @@ class CPAImportService:
             return
 
         add_result = account_service.add_accounts(tokens, source_type="codex")
-        refresh_result = account_service.refresh_accounts(tokens)
+        refresh_result = account_service.refresh_accounts(tokens, quiet=True, log_summary=True)
         current = self._config.get_import_job(pool_id) or {}
         self._update_job(
             pool_id,

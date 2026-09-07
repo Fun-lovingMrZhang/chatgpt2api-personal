@@ -230,7 +230,7 @@ def create_router() -> APIRouter:
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
         else:
             result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+        refresh_result = account_service.refresh_accounts(tokens, quiet=True)
         return {
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
@@ -259,7 +259,14 @@ def create_router() -> APIRouter:
 
         async def _do_refresh():
             try:
-                await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id, False)
+                await run_in_threadpool(
+                    account_service.refresh_accounts,
+                    access_tokens,
+                    progress_id,
+                    False,
+                    quiet=True,
+                    log_summary=True,
+                )
             except Exception as e:
                 account_service.finish_refresh_progress(progress_id, error=str(e))
 

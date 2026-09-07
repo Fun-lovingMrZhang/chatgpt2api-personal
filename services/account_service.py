@@ -975,7 +975,7 @@ class AccountService:
             )
             attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
+                account = self.fetch_remote_info(access_token, "get_available_access_token", quiet=True)
             except Exception:
                 self.release_image_slot(access_token)
                 continue
@@ -1337,6 +1337,8 @@ class AccountService:
         access_token: str,
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
+        *,
+        quiet: bool = False,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
@@ -1365,7 +1367,7 @@ class AccountService:
                         str(retry_exc),
                         defer_invalid_removal=defer_invalid_removal,
                     ):
-                        self.remove_invalid_token(refreshed_token, event)
+                        self.remove_invalid_token(refreshed_token, event, quiet=quiet)
                     raise
                 active_token = refreshed_token
             else:
@@ -1375,10 +1377,10 @@ class AccountService:
                     str(exc),
                     defer_invalid_removal=defer_invalid_removal,
                 ):
-                    self.remove_invalid_token(active_token, event)
+                    self.remove_invalid_token(active_token, event, quiet=quiet)
                 raise
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        return self.update_account(active_token, result, quiet=quiet)
 
     # ---- 刷新进度追踪 ----
 
@@ -1485,16 +1487,26 @@ class AccountService:
         access_tokens: list[str],
         progress_id: str | None = None,
         defer_invalid_removal: bool = True,
+        *,
+        quiet: bool = False,
+        log_summary: bool = False,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             items = self.list_accounts()
-            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0, "removed": 0}
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
+            if log_summary:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "批量刷新账号",
+                    {"requested": 0, "refreshed": 0, "failed": 0, "removed": 0},
+                )
             return result
 
         refreshed = 0
+        removed = 0
         errors = []
         max_workers = min(10, len(access_tokens))
 
@@ -1504,7 +1516,13 @@ class AccountService:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
+                executor.submit(
+                    self.fetch_remote_info,
+                    token,
+                    "refresh_accounts",
+                    defer_invalid_removal,
+                    quiet=quiet,
+                ): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
@@ -1520,9 +1538,13 @@ class AccountService:
                     from services.protocol.conversation import is_tls_connection_error
                     if not is_tls_connection_error(error_str):
                         errors.append({"token": anonymize_token(token), "error": error_str})
+                    if self.get_account(token) is None:
+                        removed += 1
                 else:
                     if account is not None:
                         refreshed += 1
+                    elif self.get_account(token) is None:
+                        removed += 1
 
                 if progress_id:
                     self.update_refresh_progress(progress_id, token)
@@ -1561,10 +1583,23 @@ class AccountService:
             "errors": errors,
             "items": self.list_accounts(),
             "relogined": relogined,
+            "removed": removed,
         }
 
         if progress_id:
             self.finish_refresh_progress(progress_id, result)
+
+        if log_summary:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "批量刷新账号",
+                {
+                    "requested": len(access_tokens),
+                    "refreshed": refreshed,
+                    "failed": len(errors),
+                    "removed": removed,
+                },
+            )
 
         return result
 
