@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -10,6 +12,7 @@ from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
+from services.model_service import model_catalog_service
 from services.protocol import (
     anthropic_v1_messages,
     openai_v1_chat_complete,
@@ -21,8 +24,16 @@ from services.protocol import (
 )
 from services.protocol.conversation import generate_image_unit
 from services.scheduler.models import Lane
+from services.scheduler.errors import NoProviderAvailableError
 from services.scheduler.service import scheduler_service
 from utils.helper import extract_chat_image, is_image_chat_request
+
+MAX_IMAGE_OUTPUTS = 4
+
+
+def _scheduler_enabled() -> bool:
+    settings = getattr(scheduler_service, "settings", None)
+    return bool(getattr(settings, "enabled", True))
 
 
 class ImageGenerationRequest(BaseModel):
@@ -82,18 +93,34 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
 
 
 def _text_scheduler_runner(model: str):
+    if not _scheduler_enabled():
+        return None
     requirement = scheduler_service.classify_text(model)
+
+    def allows_anonymous() -> bool:
+        try:
+            route = model_catalog_service.cached_route_for_model(model)
+        except Exception:
+            return False
+        return bool(route is not None and route.allow_anonymous)
 
     async def runner(handler, *args, streaming: bool = False):
         work = lambda _lease, _cancel: handler(*args)
-        if streaming:
-            return await scheduler_service.run_stream(Lane.TEXT, requirement, work)
-        return await scheduler_service.run_text(requirement, work)
+        try:
+            if streaming:
+                return await scheduler_service.run_stream(Lane.TEXT, requirement, work)
+            return await scheduler_service.run_text(requirement, work)
+        except NoProviderAvailableError:
+            if not allows_anonymous():
+                raise
+            return await run_in_threadpool(handler, *args)
 
     return runner
 
 
 def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
+    if not _scheduler_enabled():
+        return None
     scheduler_payload = dict(payload)
     try:
         requested_count = int(scheduler_payload.get("n") or 0)
@@ -107,7 +134,13 @@ def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
                 except (TypeError, ValueError):
                     requested_count = 0
                 break
-    scheduler_payload["n"] = max(1, requested_count)
+    requested_count = max(1, requested_count)
+    if requested_count > MAX_IMAGE_OUTPUTS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"n must be between 1 and {MAX_IMAGE_OUTPUTS}"},
+        )
+    scheduler_payload["n"] = requested_count
     requirement = (
         scheduler_service.classify_image_generation(scheduler_payload)
         if lane == Lane.IMAGE_GENERATION
@@ -124,7 +157,33 @@ def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
             return await run_in_threadpool(handler, *args)
 
         build_request, format_outputs = adapter
-        request = build_request(body)
+        request = await run_in_threadpool(build_request, body)
+        if streaming:
+            futures = await scheduler_service.submit_image_units(
+                requirement,
+                lambda index: generate_image_unit(request, index, requirement.cost),
+            )
+
+            async def async_formatted():
+                try:
+                    for completed in asyncio.as_completed(futures):
+                        result = await completed
+                        outputs = result if isinstance(result, list) else [result]
+                        formatted = await run_in_threadpool(
+                            lambda: list(format_outputs(outputs, body))
+                        )
+                        for item in formatted:
+                            yield item
+                finally:
+                    for future in futures:
+                        if not future.done():
+                            future.cancel()
+                    await asyncio.gather(
+                        *(asyncio.shield(future) for future in futures),
+                        return_exceptions=True,
+                    )
+
+            return async_formatted()
         unit_results = await scheduler_service.run_image_units(
             requirement,
             lambda index: generate_image_unit(request, index, requirement.cost),
@@ -135,15 +194,8 @@ def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
                 outputs.extend(result)
             else:
                 outputs.append(result)
-        formatted = format_outputs(outputs, body)
-        if not streaming:
-            return formatted
-
-        async def async_formatted():
-            for item in formatted:
-                yield item
-
-        return async_formatted()
+        formatted = await run_in_threadpool(format_outputs, outputs, body)
+        return formatted
 
     return runner
 

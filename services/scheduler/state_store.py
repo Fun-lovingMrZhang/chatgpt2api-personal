@@ -21,6 +21,7 @@ class SchedulerStateStore:
         "created_at",
         "conversation_id",
         "remote_task_id",
+        "account_ref",
         "idempotency_key",
         "source",
     }
@@ -174,6 +175,34 @@ class SchedulerStateStore:
             )
         return self.get_task(str(record[0]))
 
+    def save_task_batch(self, tasks: Iterable[dict[str, object]]) -> None:
+        records = [self._task_record(task) for task in tasks]
+        if not records:
+            return
+        self._ensure_initialized()
+        connection = self._connection()
+        with connection:
+            connection.executemany(
+                """
+                INSERT INTO scheduler_tasks (
+                    task_key, owner_id, task_id, mode, status, model,
+                    remote_task_id, metadata_json, result_json, error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_key) DO UPDATE SET
+                    owner_id = excluded.owner_id,
+                    task_id = excluded.task_id,
+                    mode = excluded.mode,
+                    status = excluded.status,
+                    model = excluded.model,
+                    remote_task_id = excluded.remote_task_id,
+                    metadata_json = excluded.metadata_json,
+                    result_json = excluded.result_json,
+                    error = excluded.error,
+                    updated_at = excluded.updated_at
+                """,
+                records,
+            )
+
     def update_task(self, task_key: str, updates: dict[str, object]) -> dict[str, object] | None:
         self._ensure_initialized()
         current = self.get_task(task_key)
@@ -208,6 +237,27 @@ class SchedulerStateStore:
                 "SELECT * FROM scheduler_tasks ORDER BY updated_at DESC",
             ).fetchall()
         return [self._decode_task(row) for row in rows]
+
+    def delete_task(self, task_key: str) -> None:
+        self._ensure_initialized()
+        connection = self._connection()
+        with connection:
+            connection.execute(
+                "DELETE FROM scheduler_tasks WHERE task_key = ?",
+                (str(task_key),),
+            )
+
+    def delete_tasks(self, task_keys: Iterable[str]) -> None:
+        keys = [(str(task_key),) for task_key in task_keys if str(task_key).strip()]
+        if not keys:
+            return
+        self._ensure_initialized()
+        connection = self._connection()
+        with connection:
+            connection.executemany(
+                "DELETE FROM scheduler_tasks WHERE task_key = ?",
+                keys,
+            )
 
     def load_recoverable_tasks(self) -> list[dict[str, object]]:
         self._ensure_initialized()
@@ -539,7 +589,8 @@ class SnapshotWriter:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
-        self._thread = None
+        if thread is None or not thread.is_alive():
+            self._thread = None
         self.flush()
 
     def _run(self) -> None:
@@ -557,5 +608,128 @@ class SnapshotWriter:
                 self.flush()
             except Exception:
                 pass
+        finally:
+            self.store.close()
+
+
+class TaskStateWriter:
+    """Coalesce task metadata updates outside scheduler and image workers."""
+
+    def __init__(
+        self,
+        store: SchedulerStateStore,
+        *,
+        interval_seconds: float = 1.0,
+        pending_threshold: int = 100,
+    ):
+        self.store = store
+        self.interval_seconds = max(0.001, float(interval_seconds))
+        self.pending_threshold = max(1, int(pending_threshold))
+        self._lock = threading.RLock()
+        self._db_lock = threading.RLock()
+        self._pending: dict[str, dict[str, object]] = {}
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def submit(self, task: dict[str, object]) -> None:
+        task_key = str(task.get("task_key") or "").strip()
+        if not task_key:
+            raise ValueError("task state requires task_key")
+        with self._lock:
+            self._pending[task_key] = dict(task)
+            if len(self._pending) >= self.pending_threshold:
+                self._wake.set()
+
+    def discard(self, task_key: str) -> None:
+        with self._lock:
+            self._pending.pop(str(task_key), None)
+
+    def delete(self, task_key: str) -> None:
+        """Delete a task after serializing with any in-flight writer flush."""
+        normalized = str(task_key)
+        with self._db_lock:
+            with self._lock:
+                self._pending.pop(normalized, None)
+            self.store.delete_task(normalized)
+
+    def delete_tasks(self, task_keys: Iterable[str]) -> None:
+        normalized = [str(task_key) for task_key in task_keys if str(task_key).strip()]
+        if not normalized:
+            return
+        with self._db_lock:
+            with self._lock:
+                for task_key in normalized:
+                    self._pending.pop(task_key, None)
+            self.store.delete_tasks(normalized)
+
+    def save_now(self, task: dict[str, object]) -> None:
+        """Synchronously persist one task in the same order as queued writes."""
+        task_key = str(task.get("task_key") or "").strip()
+        if not task_key:
+            raise ValueError("task state requires task_key")
+        with self._db_lock:
+            with self._lock:
+                self._pending.pop(task_key, None)
+            self.store.save_task(task)
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def start(self) -> None:
+        with self._lock:
+            if self.running:
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="scheduler-task-state-writer",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def flush(self) -> None:
+        with self._db_lock:
+            with self._lock:
+                batch = list(self._pending.values())
+                self._pending.clear()
+            if not batch:
+                return
+            try:
+                self.store.save_task_batch(batch)
+            except Exception:
+                with self._lock:
+                    for item in batch:
+                        task_key = str(item["task_key"])
+                        self._pending.setdefault(task_key, item)
+                raise
+
+    def stop(self, timeout: float | None = None) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        if thread is None or not thread.is_alive():
+            self._thread = None
+        self.flush()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                self._wake.wait(self.interval_seconds)
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
+                try:
+                    self.flush()
+                except Exception:
+                    continue
         finally:
             self.store.close()

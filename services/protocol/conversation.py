@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import re
 import threading
@@ -17,6 +18,7 @@ from services.scheduler.context import current_execution_context
 from services.scheduler.models import Outcome
 from utils.helper import (
     IMAGE_MODELS,
+    anonymize_token,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -299,7 +301,32 @@ class ConversationRequest:
     quality: str = "auto"
     response_format: str = "b64_json"
     message_as_error: bool = False
-    progress_callback: Any = None  # Callable[[str], None] | None
+    progress_callback: Any = None  # Callable[[str, str], None] | None
+
+
+def _report_image_progress(
+    request: ConversationRequest,
+    step: str,
+    conversation_id: str = "",
+) -> None:
+    callback = request.progress_callback
+    if callback is None:
+        return
+    if conversation_id:
+        try:
+            signature = inspect.signature(callback)
+        except (TypeError, ValueError):
+            callback(step, conversation_id)
+            return
+        try:
+            signature.bind(step, conversation_id)
+        except TypeError:
+            # Keep compatibility with integrations that still accept one arg.
+            callback(step)
+        else:
+            callback(step, conversation_id)
+        return
+    callback(step)
 
 
 @dataclass
@@ -732,7 +759,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if delta:
                     emitted = True
                     yield delta
-            account_service.mark_text_used(token)
+            if execution_context is None:
+                account_service.mark_text_used(token)
             return
         except Exception as exc:
             error_message = str(exc)
@@ -849,6 +877,7 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
+    reported_conversation_id = ""
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -858,6 +887,10 @@ def stream_image_outputs(
             quality=request.quality,
     ):
         last = event
+        event_conversation_id = str(event.get("conversation_id") or "")
+        if event_conversation_id and event_conversation_id != reported_conversation_id:
+            _report_image_progress(request, "image_conversation_id", event_conversation_id)
+            reported_conversation_id = event_conversation_id
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
@@ -893,8 +926,7 @@ def stream_image_outputs(
         "tool_invoked": last.get("tool_invoked"),
         "turn_use_case": last.get("turn_use_case"),
     })
-    if request.progress_callback:
-        request.progress_callback("image_stream_resolve_start")
+    _report_image_progress(request, "image_stream_resolve_start", conversation_id)
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -928,6 +960,7 @@ def stream_image_outputs(
             )
             if recovered_id:
                 conversation_id = recovered_id
+                _report_image_progress(request, "image_conversation_id", conversation_id)
                 logger.info({
                     "event": "image_conversation_id_recovered",
                     "conversation_id": conversation_id,
@@ -1035,6 +1068,7 @@ def stream_image_outputs(
                 )
                 if recovered_id:
                     conversation_id = recovered_id
+                    _report_image_progress(request, "image_conversation_id", conversation_id)
                     logger.info({
                         "event": "image_text_reply_conversation_id_recovered",
                         "conversation_id": conversation_id,
@@ -1144,6 +1178,7 @@ def stream_image_outputs(
             )
             if recovered_id:
                 conversation_id = recovered_id
+                _report_image_progress(request, "image_conversation_id", conversation_id)
                 logger.info({
                     "event": "image_fallback_conversation_id_recovered",
                     "conversation_id": conversation_id,
@@ -1371,7 +1406,7 @@ def _generate_single_image(
         account_email = str(account.get("email") or "").strip()
         logger.debug({
             "event": "image_account_lookup",
-            "token_prefix": token[:12] + "..." if len(token) > 12 else token,
+            "account_ref": anonymize_token(token),
             "account_email": account_email,
             "account_found": bool(account),
             "index": index,
@@ -1387,6 +1422,8 @@ def _generate_single_image(
             try:
                 for output in stream_fn(backend, request, index, total):
                     last_conversation_id = output.conversation_id or last_conversation_id
+                    if output.conversation_id:
+                        _report_image_progress(request, "image_conversation_id", output.conversation_id)
                     if account_email and not output.account_email:
                         output.account_email = account_email
                     if output.kind == "message" and request.message_as_error:
@@ -1405,6 +1442,17 @@ def _generate_single_image(
             except Exception as exc:
                 # 异常路径（内容政策拒绝、轮询超时等）会话 ID 只挂在异常上
                 last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
+                if last_conversation_id:
+                    _report_image_progress(request, "image_conversation_id", last_conversation_id)
+                    if not getattr(exc, "conversation_id", ""):
+                        if isinstance(exc, ImageGenerationError):
+                            exc.conversation_id = last_conversation_id
+                        else:
+                            raise ImageGenerationError(
+                                image_stream_error_message(str(exc)),
+                                account_email=account_email,
+                                conversation_id=last_conversation_id,
+                            ) from exc
                 raise
             finally:
                 _remove_image_conversation_later(backend, last_conversation_id, success=returned_result)
@@ -1430,13 +1478,26 @@ def _generate_single_image(
             mark_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
+            remote_conversation_id = str(getattr(exc, "conversation_id", "") or "")
+            if remote_conversation_id:
+                # The upstream task was already accepted. Switching accounts
+                # here would submit a duplicate generation; async task callers
+                # can resume polling this conversation ID instead.
+                raise ImageGenerationError(
+                    str(exc) or "image generation polling timed out",
+                    status_code=504,
+                    error_type="server_error",
+                    code="image_poll_timeout",
+                    account_email=account_email,
+                    conversation_id=remote_conversation_id,
+                ) from exc
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                     logger.warning({
                         "event": "image_poll_timeout_retry",
-                        "request_token": token,
+                        "account_ref": anonymize_token(token),
                         "account_email": account_email,
                         "retry_count": poll_timeout_retry_count,
                         "index": index,
@@ -1446,7 +1507,7 @@ def _generate_single_image(
                     continue
                 logger.warning({
                     "event": "image_poll_timeout_exhausted_retries",
-                    "request_token": token,
+                    "account_ref": anonymize_token(token),
                     "account_email": account_email,
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
@@ -1457,7 +1518,7 @@ def _generate_single_image(
             mark_result(token, False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
-                "request_token": token,
+                "account_ref": anonymize_token(token),
                 "account_email": account_email,
                 "error": str(exc),
                 "index": index,
@@ -1476,12 +1537,13 @@ def _generate_single_image(
                 exc.account_email = account_email
             error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            remote_conversation_id = str(getattr(exc, "conversation_id", "") or "")
+            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token and not remote_conversation_id:
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
                         "event": "image_model_text_reply_retry",
-                        "request_token": token,
+                        "account_ref": anonymize_token(token),
                         "account_email": account_email,
                         "retry_count": text_reply_retry_count,
                         "index": index,
@@ -1491,7 +1553,7 @@ def _generate_single_image(
                     continue
                 logger.warning({
                     "event": "image_model_text_reply_exhausted_retries",
-                    "request_token": token,
+                    "account_ref": anonymize_token(token),
                     "account_email": account_email,
                     "retry_count": text_reply_retry_count,
                     "index": index,
@@ -1507,7 +1569,7 @@ def _generate_single_image(
                 ) from exc
             logger.warning({
                 "event": "image_stream_generation_error",
-                "request_token": token,
+                "account_ref": anonymize_token(token),
                 "account_email": account_email,
                 "error": error_text,
                 "index": index,
@@ -1518,11 +1580,22 @@ def _generate_single_image(
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
-                "request_token": token,
+                "account_ref": anonymize_token(token),
                 "account_email": account_email,
                 "error": last_error,
                 "index": index,
             })
+            remote_conversation_id = str(getattr(exc, "conversation_id", "") or "")
+            if remote_conversation_id:
+                _report_image_progress(request, "image_conversation_id", remote_conversation_id)
+                raise ImageGenerationError(
+                    image_stream_error_message(last_error),
+                    status_code=504,
+                    error_type="server_error",
+                    code="image_poll_timeout",
+                    account_email=account_email,
+                    conversation_id=remote_conversation_id,
+                ) from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
                 had_replacement = replace_lease(token, Outcome.AUTH_ERROR) is not None
                 if had_replacement:
@@ -1547,7 +1620,7 @@ def _generate_single_image(
                 if tls_retry_count <= MAX_TLS_RETRIES:
                     logger.warning({
                         "event": "image_stream_tls_retry",
-                        "request_token": token,
+                        "account_ref": anonymize_token(token),
                         "account_email": account_email,
                         "retry_count": tls_retry_count,
                         "index": index,
@@ -1563,7 +1636,7 @@ def _generate_single_image(
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
                     logger.warning({
                         "event": "image_stream_conn_timeout_retry",
-                        "request_token": token,
+                        "account_ref": anonymize_token(token),
                         "account_email": account_email,
                         "retry_count": conn_timeout_retry_count,
                         "index": index,
@@ -1630,10 +1703,13 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    conversation_id = ""
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
             account_email = output.account_email
+        if output.conversation_id:
+            conversation_id = output.conversation_id
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1648,4 +1724,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if conversation_id:
+        result["_conversation_id"] = conversation_id
     return result

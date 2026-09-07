@@ -26,6 +26,7 @@ class SchedulerConfigTests(unittest.TestCase):
         self.assertTrue(settings.enabled)
         self.assertGreater(settings.system_concurrency, 0)
         self.assertGreater(settings.lanes[Lane.TEXT].worker_count, 0)
+        self.assertGreater(settings.lanes[Lane.TEXT].request_timeout_ms, 0)
         self.assertGreater(settings.lanes[Lane.IMAGE_GENERATION].queue_max_cost, 0)
         self.assertGreater(settings.image_total_per_account_concurrency, 0)
 

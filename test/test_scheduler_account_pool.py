@@ -8,6 +8,7 @@ from pathlib import Path
 from services.config import ConfigStore
 from services.scheduler.account_pool import AccountPool
 from services.scheduler.models import AccountRequirement, Lane, Outcome
+from utils.helper import anonymize_token
 
 
 def fake_router(model: str) -> set[str]:
@@ -135,6 +136,100 @@ class AccountPoolTests(unittest.TestCase):
         pool.release(lease, outcome=Outcome.SUCCESS, latency_ms=10)
 
         self.assertEqual(pool.inflight("one", Lane.TEXT), 0)
+
+    def test_health_snapshot_redacts_account_token(self) -> None:
+        pool = AccountPool(make_accounts("secret-token"), self.settings, model_router=fake_router)
+
+        snapshot = pool.snapshot_health()
+
+        self.assertTrue(snapshot)
+        self.assertNotIn("secret-token", str(snapshot))
+        self.assertTrue(snapshot[0]["account_key"].startswith("token:"))
+
+    def test_health_snapshot_restores_breaker_by_redacted_reference(self) -> None:
+        pool = AccountPool(make_accounts("secret-token"), self.settings, model_router=fake_router)
+        pool.open_breaker("secret-token", Lane.TEXT, cooldown_seconds=30)
+        restored = AccountPool(make_accounts("secret-token"), self.settings, model_router=fake_router)
+
+        restored.restore_health(pool.snapshot_health())
+
+        self.assertIsNone(
+            restored.try_acquire(
+                self.text_requirement,
+                deadline=restored.clock() + 5,
+            )
+        )
+
+    def test_reconcile_removes_stale_capability_state(self) -> None:
+        pool = AccountPool(make_accounts("one"), self.settings, model_router=fake_router)
+
+        pool.reconcile([{
+            "access_token": "one",
+            "type": "Free",
+            "status": "禁用",
+            "source_type": "web",
+            "quota": 5,
+        }])
+
+        self.assertEqual(pool.provider_status(self.text_requirement), ("missing", None))
+
+    def test_account_ref_pins_selection_to_the_original_account(self) -> None:
+        pool = AccountPool(make_accounts("one", "two"), self.settings, model_router=fake_router)
+        requirement = replace(
+            self.text_requirement,
+            account_ref=anonymize_token("two"),
+        )
+
+        lease = pool.try_acquire(requirement, deadline=pool.clock() + 5)
+
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease.account_key, "two")
+
+    def test_image_capability_index_does_not_match_wildcard_dimensions(self) -> None:
+        accounts = [
+            {
+                "access_token": "plus-web",
+                "type": "Plus",
+                "status": "正常",
+                "source_type": "web",
+                "quota": 5,
+            },
+            {
+                "access_token": "pro-codex",
+                "type": "Pro",
+                "status": "正常",
+                "source_type": "codex",
+                "quota": 5,
+            },
+        ]
+        pool = AccountPool(accounts, self.settings, model_router=fake_router)
+        requirement = AccountRequirement(
+            Lane.IMAGE_GENERATION,
+            "codex-gpt-image-2",
+            plan_type="plus",
+            source_type="codex",
+        )
+
+        self.assertEqual(pool.provider_status(requirement), ("missing", None))
+        self.assertIsNone(pool.try_acquire(requirement, deadline=pool.clock() + 5))
+
+    def test_cooldown_promotion_uses_due_breaker_entries(self) -> None:
+        current_time = [0.0]
+        pool = AccountPool(
+            make_accounts("one"),
+            self.settings,
+            model_router=fake_router,
+            clock=lambda: current_time[0],
+        )
+        pool.open_breaker("one", Lane.TEXT, cooldown_seconds=5)
+
+        self.assertEqual(pool.promote_due_cooldowns(), 0)
+        current_time[0] = 5.1
+
+        self.assertEqual(pool.promote_due_cooldowns(), 1)
+        self.assertIsNotNone(
+            pool.try_acquire(self.text_requirement, deadline=current_time[0] + 5)
+        )
 
 
 if __name__ == "__main__":

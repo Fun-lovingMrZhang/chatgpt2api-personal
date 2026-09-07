@@ -77,6 +77,21 @@ class SchedulerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.lane, Lane.IMAGE_EDIT)
         self.assertEqual(request.cost, 4)
 
+    def test_classifier_does_not_restrict_regular_images_to_web_accounts(self) -> None:
+        service = SchedulerService(
+            FakeAccountService(),
+            settings=make_settings(),
+            state_store=SchedulerStateStore(Path(tempfile.mkdtemp()) / "scheduler.db"),
+            model_router=lambda _model: {"plus"},
+        )
+
+        regular = service.classify_image_generation({"model": "gpt-image-2", "n": 1})
+        codex = service.classify_image_generation({"model": "plus-codex-gpt-image-2", "n": 1})
+
+        self.assertIsNone(regular.source_type)
+        self.assertEqual(codex.source_type, "codex")
+        self.assertEqual(codex.plan_type, "plus")
+
     def test_metrics_redact_account_token(self) -> None:
         service = SchedulerService(
             FakeAccountService(),

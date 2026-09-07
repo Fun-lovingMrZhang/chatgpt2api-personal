@@ -5,6 +5,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from services.scheduler.context import current_execution_context
 
 WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview", "web_search_preview_2025_03_11"}
 SEARCH_CHAT_MODEL_PREFIXES = (
@@ -154,7 +155,17 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 
 def run_web_search(query: str) -> dict[str, Any]:
-    token = account_service.get_text_access_token()
-    result = OpenAIBackendAPI(token).search(query)
-    account_service.mark_text_used(token)
+    context = current_execution_context()
+    token = (
+        context.lease.access_token
+        if context is not None and context.lease is not None
+        else account_service.get_text_access_token()
+    )
+    backend = OpenAIBackendAPI(access_token=token)
+    try:
+        result = backend.search(query)
+    finally:
+        backend.close()
+    if context is None:
+        account_service.mark_text_used(token)
     return result

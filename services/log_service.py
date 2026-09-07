@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import itertools
 import threading
@@ -231,11 +232,38 @@ def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSON
     return openai_error_response(message, status_code)
 
 
+def _scheduler_error_response(exc: Exception, sse: str) -> JSONResponse:
+    status_code = int(getattr(exc, "status_code", 503))
+    response = _protocol_error_response(exc, status_code, sse)
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    if retry_after is not None:
+        response.headers["Retry-After"] = str(max(1, int(retry_after)))
+    return response
+
+
+async def _close_async_iterator(iterator: object) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except BaseException:
+        pass
+
+
 def _next_item(items):
     try:
         return True, next(items)
     except StopIteration:
         return False, None
+    except BaseException:
+        close = getattr(items, "close", None)
+        if close is not None:
+            try:
+                close()
+            except BaseException:
+                pass
+        raise
 
 
 @dataclass
@@ -289,9 +317,7 @@ class LoggedCall:
 
         if isinstance(result, dict):
             self.log("调用完成", result)
-            response = dict(result)
-            response.pop("_account_email", None)
-            return response
+            return _strip_internal_response_fields(result)
 
         if hasattr(result, "__aiter__"):
             return await self._run_async_stream(result, sse=sse)
@@ -306,6 +332,17 @@ class LoggedCall:
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
+        except SchedulerError as exc:
+            self.log("调用失败", status="failed", error=str(exc))
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error": str(exc)},
+                headers=(
+                    {"Retry-After": str(max(1, int(exc.retry_after_seconds)))}
+                    if exc.retry_after_seconds is not None
+                    else None
+                ),
+            ) from exc
         except Exception as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
@@ -318,16 +355,22 @@ class LoggedCall:
 
     async def _run_async_stream(self, result, *, sse: str):
         from services.protocol.conversation import ImageGenerationError
+        from services.scheduler.errors import SchedulerError
 
         try:
             first = await result.__anext__()
         except StopAsyncIteration:
+            await _close_async_iterator(result)
             self.log("流式调用结束")
             return StreamingResponse(
                 self._async_sender((), sse=sse),
                 media_type="text/event-stream",
             )
+        except asyncio.CancelledError:
+            await _close_async_iterator(result)
+            raise
         except ImageGenerationError as exc:
+            await _close_async_iterator(result)
             self.log(
                 "调用失败",
                 status="failed",
@@ -336,10 +379,16 @@ class LoggedCall:
                 conversation_id=getattr(exc, "conversation_id", ""),
             )
             return _image_error_response(exc)
+        except SchedulerError as exc:
+            await _close_async_iterator(result)
+            self.log("调用失败", status="failed", error=str(exc))
+            return _scheduler_error_response(exc, sse)
         except HTTPException as exc:
+            await _close_async_iterator(result)
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            await _close_async_iterator(result)
             self.log("调用失败", status="failed", error=str(exc))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)

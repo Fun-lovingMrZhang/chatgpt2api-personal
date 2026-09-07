@@ -20,6 +20,7 @@ def handle(body: dict[str, object]) -> dict[str, object]:
         result = backend.search(str(body["prompt"]))
     finally:
         backend.close()
-    account_service.mark_text_used(token)
+    if context is None:
+        account_service.mark_text_used(token)
     result["_account_email"] = str(account.get("email") or "")
     return result

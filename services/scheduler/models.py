@@ -17,6 +17,7 @@ class Outcome(str, Enum):
     AUTH_ERROR = "auth_error"
     NETWORK_ERROR = "network_error"
     SERVER_ERROR = "server_error"
+    TIMEOUT = "timeout"
     CANCELLED = "cancelled"
 
 
@@ -36,6 +37,7 @@ class LaneSettings:
     queue_max_items: int
     queue_max_cost: int
     queue_wait_timeout_ms: int
+    request_timeout_ms: int
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class AccountRequirement:
     plan_type: str | None = None
     source_type: str | None = None
     cost: int = 1
+    account_ref: str | None = None
 
 
 @dataclass(frozen=True)

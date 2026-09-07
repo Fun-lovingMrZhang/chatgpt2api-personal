@@ -9,7 +9,7 @@ from pathlib import Path
 
 from services.config import ConfigStore
 from services.scheduler.account_pool import AccountPool
-from services.scheduler.errors import QueueFullError, SchedulerDeadlineError
+from services.scheduler.errors import NoProviderAvailableError, QueueFullError, SchedulerDeadlineError
 from services.scheduler.lane import LaneScheduler
 from services.scheduler.models import AccountRequirement, Lane
 
@@ -156,6 +156,59 @@ class LaneSchedulerTests(unittest.IsolatedAsyncioTestCase):
             sum(pool.inflight(token, Lane.TEXT) for token in ("token-1", "token-2")),
             0,
         )
+        await lane.stop()
+
+    async def test_cancelled_queued_job_wakes_workers_and_reaches_idle(self) -> None:
+        settings = make_settings(queue_max_items=2)
+        pool = make_pool(settings)
+        lane = LaneScheduler(Lane.TEXT, settings, pool)
+        requirement = AccountRequirement(Lane.TEXT, "auto")
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_job(lease, cancel_event):
+            started.set()
+            release.wait(2)
+            return lease.access_token
+
+        first = asyncio.create_task(lane.submit(blocking_job, requirement))
+        await asyncio.to_thread(started.wait, 1)
+        queued = asyncio.create_task(lane.submit(blocking_job, requirement))
+        await asyncio.sleep(0)
+        queued.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await queued
+
+        release.set()
+        await first
+        await lane.wait_until_idle(timeout=1)
+        self.assertEqual(lane.metrics_snapshot()["queued"], 0)
+        await lane.stop()
+
+    async def test_missing_capability_is_rejected_as_no_provider(self) -> None:
+        settings = make_settings()
+        pool = AccountPool([], settings)
+        lane = LaneScheduler(Lane.TEXT, settings, pool)
+
+        with self.assertRaises(NoProviderAvailableError) as caught:
+            await lane.submit(lambda: None, AccountRequirement(Lane.TEXT, "auto"))
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(caught.exception.retry_after_seconds, 5)
+        await lane.stop()
+
+    async def test_all_open_breakers_are_reported_as_provider_unavailable(self) -> None:
+        settings = make_settings()
+        pool = make_pool(settings)
+        for token in ("token-1", "token-2"):
+            pool.open_breaker(token, Lane.TEXT, cooldown_seconds=30)
+        lane = LaneScheduler(Lane.TEXT, settings, pool)
+
+        with self.assertRaises(NoProviderAvailableError) as caught:
+            await lane.submit(lambda: None, AccountRequirement(Lane.TEXT, "auto"))
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertGreaterEqual(caught.exception.retry_after_seconds or 0, 1)
         await lane.stop()
 
 

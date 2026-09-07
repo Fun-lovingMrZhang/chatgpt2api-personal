@@ -80,7 +80,8 @@
       "per_account_concurrency": 4,
       "queue_max_items": 256,
       "queue_max_cost": 256,
-      "queue_wait_timeout_ms": 1500
+      "queue_wait_timeout_ms": 1500,
+      "request_timeout_ms": 120000
     },
     "image_generation": {
       "worker_count": 8,
@@ -88,7 +89,8 @@
       "per_account_concurrency": 2,
       "queue_max_items": 64,
       "queue_max_cost": 128,
-      "queue_wait_timeout_ms": 1000
+      "queue_wait_timeout_ms": 1000,
+      "request_timeout_ms": 600000
     },
     "image_edit": {
       "worker_count": 4,
@@ -96,7 +98,8 @@
       "per_account_concurrency": 2,
       "queue_max_items": 32,
       "queue_max_cost": 64,
-      "queue_wait_timeout_ms": 1000
+      "queue_wait_timeout_ms": 1000,
+      "request_timeout_ms": 600000
     },
     "image_total_per_account_concurrency": 3,
     "account_reconcile_interval_ms": 1000,

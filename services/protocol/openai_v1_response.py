@@ -42,6 +42,8 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
 
+MAX_IMAGE_OUTPUTS = 4
+
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
 
 
@@ -450,6 +452,11 @@ def build_image_request(body: dict[str, Any]) -> ConversationRequest:
         count = max(1, int(tool.get("n") or body.get("n") or 1))
     except (TypeError, ValueError):
         count = 1
+    if count > MAX_IMAGE_OUTPUTS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"n must be between 1 and {MAX_IMAGE_OUTPUTS}"},
+        )
     return ConversationRequest(
         prompt=prompt,
         model=model,

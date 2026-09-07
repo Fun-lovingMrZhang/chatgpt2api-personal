@@ -185,7 +185,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             ["https://files.example.test/image.png"],
         )
 
-    def test_resume_poll_passes_created_as_named_formatter_argument(self):
+    def test_resume_poll_uses_lease_token_and_keeps_remote_urls(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
             service = self.make_service(path)
@@ -207,14 +207,10 @@ class ImageTaskServiceTests(unittest.TestCase):
             backend.resolve_conversation_image_urls.return_value = ["https://files.example.test/image.png"]
             backend.download_image_bytes.return_value = [b"image-bytes"]
 
-            with (
-                mock.patch("services.image_task_service.config.proxy_url", "", create=True),
-                mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
-                mock.patch(
-                    "services.protocol.conversation.format_image_result",
-                    return_value={"data": [{"b64_json": "aW1hZ2UtYnl0ZXM="}]},
-                ) as format_result,
-            ):
+            with mock.patch(
+                "services.openai_backend_api.OpenAIBackendAPI",
+                return_value=backend,
+            ) as backend_factory:
                 service._run_resume_poll(
                     key,
                     "conversation-1",
@@ -222,12 +218,16 @@ class ImageTaskServiceTests(unittest.TestCase):
                     OWNER,
                     "generate",
                     "gpt-image-2",
+                    access_token="account-token",
                 )
 
             self.assertEqual(service._tasks[key].get("status"), "success", service._tasks[key])
-            self.assertIn("created", format_result.call_args.kwargs)
-            self.assertIsInstance(format_result.call_args.kwargs["created"], int)
-            self.assertNotIn("message", format_result.call_args.kwargs)
+            backend_factory.assert_called_once_with(access_token="account-token")
+            self.assertEqual(
+                service._tasks[key]["data"],
+                [{"url": "https://files.example.test/image.png"}],
+            )
+            backend.download_image_bytes.assert_not_called()
 
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -130,6 +130,15 @@ class AccountService:
         self.storage.save_accounts(list(self._accounts.values()))
         self._scheduler_state_generation += 1
 
+    def _save_account(self, account: dict) -> None:
+        """Persist a hot-path account mutation incrementally when supported."""
+        saver = getattr(self.storage, "save_account", None)
+        if callable(saver):
+            saver(dict(account))
+            self._scheduler_state_generation += 1
+            return
+        self._save_accounts()
+
     def scheduler_state_generation(self) -> int:
         with self._lock:
             return self._scheduler_state_generation
@@ -1058,7 +1067,7 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_account(account)
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1241,7 +1250,7 @@ class AccountService:
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_account(account)
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
@@ -1346,7 +1355,7 @@ class AccountService:
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_account(account)
             return dict(account)
         return None
 

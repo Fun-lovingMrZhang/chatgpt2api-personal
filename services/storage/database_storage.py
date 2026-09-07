@@ -63,6 +63,37 @@ class DatabaseStorageBackend(StorageBackend):
         """保存账号数据到数据库"""
         self._save_rows(AccountModel, accounts, "access_token")
 
+    def save_account(self, account: dict[str, Any]) -> None:
+        """Update one account row without reading or rewriting the full table."""
+        if not isinstance(account, dict):
+            return
+        access_token = str(account.get("access_token") or "").strip()
+        if not access_token:
+            return
+        serialized_data = json.dumps(account, ensure_ascii=False)
+        session = self.Session()
+        try:
+            row = (
+                session.query(AccountModel)
+                .filter(AccountModel.access_token == access_token)
+                .one_or_none()
+            )
+            if row is None:
+                session.add(
+                    AccountModel(
+                        access_token=access_token,
+                        data=serialized_data,
+                    )
+                )
+            elif row.data != serialized_data:
+                row.data = serialized_data
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """从数据库加载鉴权密钥数据"""
         return self._load_rows(AuthKeyModel)

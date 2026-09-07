@@ -58,6 +58,7 @@ DEFAULT_SCHEDULER = {
         "queue_max_items": 256,
         "queue_max_cost": 256,
         "queue_wait_timeout_ms": 1500,
+        "request_timeout_ms": 120000,
     },
     "image_generation": {
         "worker_count": 8,
@@ -66,6 +67,7 @@ DEFAULT_SCHEDULER = {
         "queue_max_items": 64,
         "queue_max_cost": 128,
         "queue_wait_timeout_ms": 1000,
+        "request_timeout_ms": 600000,
     },
     "image_edit": {
         "worker_count": 4,
@@ -74,6 +76,7 @@ DEFAULT_SCHEDULER = {
         "queue_max_items": 32,
         "queue_max_cost": 64,
         "queue_wait_timeout_ms": 1000,
+        "request_timeout_ms": 600000,
     },
     "image_total_per_account_concurrency": 3,
     "account_reconcile_interval_ms": 1000,
@@ -282,6 +285,11 @@ def _normalize_scheduler_settings(value: object, legacy_image_concurrency: objec
             "queue_wait_timeout_ms": _normalize_positive_int(
                 lane_source.get("queue_wait_timeout_ms"),
                 int(defaults["queue_wait_timeout_ms"]),
+                1,
+            ),
+            "request_timeout_ms": _normalize_positive_int(
+                lane_source.get("request_timeout_ms"),
+                int(defaults["request_timeout_ms"]),
                 1,
             ),
         }

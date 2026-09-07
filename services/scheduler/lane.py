@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import inspect
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from threading import Event as ThreadEvent
 from typing import Any, AsyncIterator, Callable
 
 from services.scheduler.errors import (
+    NoProviderAvailableError,
     QueueFullError,
     QueueTimeoutError,
     SchedulerDeadlineError,
@@ -30,6 +32,24 @@ class _StreamDone:
 @dataclass(frozen=True)
 class _StreamFailure:
     error: BaseException
+
+
+class GlobalConcurrencyLimiter:
+    """Process-local concurrency budget shared by all scheduler lanes."""
+
+    def __init__(self, limit: int):
+        self.limit = max(1, int(limit))
+        self.active = 0
+
+    def try_acquire(self, cost: int) -> bool:
+        normalized_cost = max(1, int(cost))
+        if self.active + normalized_cost > self.limit:
+            return False
+        self.active += normalized_cost
+        return True
+
+    def release(self, cost: int) -> None:
+        self.active = max(0, self.active - max(1, int(cost)))
 
 
 class BoundedStream(AsyncIterator[Any]):
@@ -95,6 +115,7 @@ class LaneScheduler:
         stream_queue_size: int = 8,
         aging_seconds: float = 1.0,
         lease_replacer: Callable[[ExecutionContext, set[str], Outcome], Lease | None] | None = None,
+        global_limiter: GlobalConcurrencyLimiter | None = None,
     ):
         self.lane = lane
         self.settings = settings.lanes[lane] if hasattr(settings, "lanes") else settings
@@ -103,6 +124,7 @@ class LaneScheduler:
         self._stream_queue_size = max(1, int(stream_queue_size))
         self._aging_seconds = max(0.01, float(aging_seconds))
         self._lease_replacer = lease_replacer
+        self._global_limiter = global_limiter
         self._loop: asyncio.AbstractEventLoop | None = None
         self._condition: asyncio.Condition | None = None
         self._executor: ThreadPoolExecutor | None = None
@@ -197,6 +219,7 @@ class LaneScheduler:
         except asyncio.CancelledError:
             job.client_cancelled = True
             job.cancel_event.set()
+            job.future.add_done_callback(self._consume_background_exception)
             condition = self._require_condition()
             async with condition:
                 condition.notify_all()
@@ -258,7 +281,7 @@ class LaneScheduler:
         await self.start()
         normalized_cost = max(1, int(cost))
         now = self._clock()
-        request_deadline = float(deadline) if deadline is not None else float("inf")
+        request_deadline = self._request_deadline(now, deadline)
         queue_deadline = min(
             request_deadline,
             now + max(0.001, int(self.settings.queue_wait_timeout_ms) / 1000.0),
@@ -272,15 +295,28 @@ class LaneScheduler:
             if self._stopping:
                 self._metrics["rejected"] += len(works)
                 raise SchedulerError("scheduler lane is stopping")
+            provider_error = self._provider_error(requirement)
+            if provider_error is not None:
+                self._metrics["rejected"] += len(works)
+                raise provider_error
             if normalized_cost > int(self.settings.global_concurrency):
                 self._metrics["rejected"] += len(works)
-                raise QueueFullError("request cost exceeds lane capacity")
+                raise QueueFullError(
+                    "request cost exceeds lane capacity",
+                    retry_after_seconds=self._queue_retry_after(),
+                )
             if len(self._queue) + len(works) > int(self.settings.queue_max_items):
                 self._metrics["rejected"] += len(works)
-                raise QueueFullError("scheduler queue is full")
+                raise QueueFullError(
+                    "scheduler queue is full",
+                    retry_after_seconds=self._queue_retry_after(),
+                )
             if self._pending_cost + self._active_cost + total_cost > int(self.settings.queue_max_cost):
                 self._metrics["rejected"] += len(works)
-                raise QueueFullError("scheduler queue cost is full")
+                raise QueueFullError(
+                    "scheduler queue cost is full",
+                    retry_after_seconds=self._queue_retry_after(),
+                )
             normalized_requirement = self._with_cost(requirement, normalized_cost)
             for work in works:
                 self._sequence += 1
@@ -353,7 +389,7 @@ class LaneScheduler:
         await self.start()
         normalized_cost = max(1, int(cost))
         now = self._clock()
-        request_deadline = float(deadline) if deadline is not None else float("inf")
+        request_deadline = self._request_deadline(now, deadline)
         queue_deadline = min(
             request_deadline,
             now + max(0.001, int(self.settings.queue_wait_timeout_ms) / 1000.0),
@@ -383,18 +419,31 @@ class LaneScheduler:
             if self._stopping:
                 self._metrics["rejected"] += 1
                 raise SchedulerError("scheduler lane is stopping")
+            provider_error = self._provider_error(requirement)
+            if provider_error is not None:
+                self._metrics["rejected"] += 1
+                raise provider_error
             if normalized_cost > int(self.settings.global_concurrency):
                 self._metrics["rejected"] += 1
-                raise QueueFullError("request cost exceeds lane capacity")
+                raise QueueFullError(
+                    "request cost exceeds lane capacity",
+                    retry_after_seconds=self._queue_retry_after(),
+                )
             if len(self._queue) >= int(self.settings.queue_max_items):
                 self._metrics["rejected"] += 1
-                raise QueueFullError("scheduler queue is full")
+                raise QueueFullError(
+                    "scheduler queue is full",
+                    retry_after_seconds=self._queue_retry_after(),
+                )
             if (
                 self._pending_cost + self._active_cost + normalized_cost
                 > int(self.settings.queue_max_cost)
             ):
                 self._metrics["rejected"] += 1
-                raise QueueFullError("scheduler queue cost is full")
+                raise QueueFullError(
+                    "scheduler queue cost is full",
+                    retry_after_seconds=self._queue_retry_after(),
+                )
             requirement = self._with_cost(requirement, normalized_cost)
             job.requirement = requirement
             heapq.heappush(
@@ -433,11 +482,24 @@ class LaneScheduler:
                         self._metrics["cancelled"] += 1
                         self._cancel_queued_job(job)
                         continue
+                    provider_error = self._provider_error(job.requirement)
+                    if provider_error is not None:
+                        self._metrics["failed"] += 1
+                        self._fail_queued_job(job, provider_error)
+                        continue
                     lease = self.account_pool.try_acquire(
                         job.requirement,
                         deadline=job.deadline,
                     )
                     if lease is None:
+                        self._push_entry_locked(entry)
+                        continue
+                    if self._global_limiter is not None and not self._global_limiter.try_acquire(job.cost):
+                        self.account_pool.release(
+                            lease,
+                            outcome=Outcome.CANCELLED,
+                            latency_ms=0.0,
+                        )
                         self._push_entry_locked(entry)
                         continue
                     job.started = True
@@ -489,7 +551,7 @@ class LaneScheduler:
                 self._complete_job_result(job, result)
             self._metrics["completed"] += 1
         except asyncio.TimeoutError:
-            outcome = Outcome.CANCELLED
+            outcome = Outcome.TIMEOUT
             self._metrics["timed_out"] += 1
             job.cancel_event.set()
             error = SchedulerDeadlineError("scheduler request deadline exceeded")
@@ -592,11 +654,17 @@ class LaneScheduler:
         if stream is None:
             return False
         while not job.cancel_event.is_set() and not stream._closed:
+            if job.deadline != float("inf") and self._clock() >= job.deadline:
+                job.cancel_event.set()
+                return False
             try:
                 stream._queue.put_nowait(item)
                 return True
             except asyncio.QueueFull:
-                await asyncio.sleep(0.01)
+                wait = 0.01
+                if job.deadline != float("inf"):
+                    wait = min(wait, max(0.001, job.deadline - self._clock()))
+                await asyncio.sleep(wait)
         return False
 
     async def _finish_stream(self, job: _QueuedJob, error: BaseException | None) -> None:
@@ -609,11 +677,18 @@ class LaneScheduler:
             return
         terminal: object = _StreamFailure(error) if error is not None else _StreamDone()
         while not stream._closed:
+            if job.deadline != float("inf") and self._clock() >= job.deadline:
+                job.cancel_event.set()
+                stream._closed = True
+                break
             try:
                 stream._queue.put_nowait(terminal)
                 break
             except asyncio.QueueFull:
-                await asyncio.sleep(0.01)
+                wait = 0.01
+                if job.deadline != float("inf"):
+                    wait = min(wait, max(0.001, job.deadline - self._clock()))
+                await asyncio.sleep(wait)
         if not job.future.done():
             job.future.set_result(None)
 
@@ -652,6 +727,8 @@ class LaneScheduler:
             active_lease = job.execution_context.lease
         if active_lease is not None:
             self.account_pool.release(active_lease, outcome=outcome, latency_ms=latency_ms)
+        if self._global_limiter is not None:
+            self._global_limiter.release(job.cost)
         self._active_jobs = max(0, self._active_jobs - 1)
         self._active_cost = max(0, self._active_cost - job.cost)
         condition = self._condition
@@ -660,12 +737,18 @@ class LaneScheduler:
 
     def _notify_condition(self) -> None:
         condition = self._condition
-        if condition is None:
+        loop = self._loop
+        if condition is None or loop is None:
             return
 
         async def notify() -> None:
             async with condition:
                 condition.notify_all()
+
+        try:
+            loop.create_task(notify())
+        except RuntimeError:
+            return
 
     def _cancel_job_from_future(
         self,
@@ -677,8 +760,6 @@ class LaneScheduler:
         job.client_cancelled = True
         job.cancel_event.set()
         self._notify_condition()
-
-        asyncio.create_task(notify())
 
     def _complete_job_result(self, job: _QueuedJob, result: Any) -> None:
         if not job.future.done():
@@ -725,7 +806,13 @@ class LaneScheduler:
         for entry in expired:
             self._remove_entry_locked(entry)
             self._metrics["failed"] += 1
-            self._fail_queued_job(entry[3], QueueTimeoutError("scheduler queue wait timed out"))
+            self._fail_queued_job(
+                entry[3],
+                QueueTimeoutError(
+                    "scheduler queue wait timed out",
+                    retry_after_seconds=self._queue_retry_after(),
+                ),
+            )
 
     def _runnable_entries_locked(
         self,
@@ -777,6 +864,41 @@ class LaneScheduler:
             raise RuntimeError("LaneScheduler has not started")
         return self._loop
 
+    def _request_deadline(self, now: float, deadline: float | None) -> float:
+        if deadline is not None:
+            normalized = float(deadline)
+            if not math.isfinite(normalized):
+                raise SchedulerDeadlineError("scheduler deadline must be finite")
+            if normalized <= now:
+                raise SchedulerDeadlineError("scheduler request deadline has expired")
+            return normalized
+        timeout_ms = max(1, int(getattr(self.settings, "request_timeout_ms", 120000)))
+        return now + timeout_ms / 1000.0
+
+    def _provider_error(self, requirement: AccountRequirement) -> NoProviderAvailableError | None:
+        provider_status = getattr(self.account_pool, "provider_status", None)
+        if callable(provider_status):
+            status, retry_after = provider_status(requirement)
+            if status in {"missing", "unavailable", "cooldown"}:
+                return NoProviderAvailableError(
+                    "no provider is available for the requested capability",
+                    retry_after_seconds=(
+                        max(1.0, float(retry_after))
+                        if retry_after is not None
+                        else 5.0
+                    ),
+                )
+            return None
+        if not self.account_pool.has_capability(requirement):
+            return NoProviderAvailableError(
+                "no provider is available for the requested capability",
+                retry_after_seconds=5,
+            )
+        return None
+
+    def _queue_retry_after(self) -> float:
+        return max(0.1, int(self.settings.queue_wait_timeout_ms) / 1000.0)
+
     @staticmethod
     def _with_cost(requirement: AccountRequirement, cost: int) -> AccountRequirement:
         return AccountRequirement(
@@ -785,4 +907,5 @@ class LaneScheduler:
             plan_type=requirement.plan_type,
             source_type=requirement.source_type,
             cost=cost,
+            account_ref=requirement.account_ref,
         )

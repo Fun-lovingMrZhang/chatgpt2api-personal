@@ -10,11 +10,12 @@ from services.account_service import AccountService, account_service
 from services.config import DATA_DIR, config
 from services.scheduler.account_pool import AccountPool
 from services.scheduler.context import ExecutionContext
-from services.scheduler.lane import BoundedStream, LaneScheduler
+from services.scheduler.errors import QueueFullError
+from services.scheduler.lane import BoundedStream, GlobalConcurrencyLimiter, LaneScheduler
 from services.scheduler.models import AccountRequirement, Lane, Lease, Outcome, SchedulerSettings
 from services.scheduler.reconciler import AccountReconciler
-from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter
-from utils.helper import anonymize_token, is_codex_image_model, split_image_model
+from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter, TaskStateWriter
+from utils.helper import is_codex_image_model, split_image_model
 
 
 class SchedulerService:
@@ -50,6 +51,11 @@ class SchedulerService:
             self.state_store,
             interval_seconds=self.settings.snapshot_flush_interval_ms / 1000.0,
         )
+        self.task_writer = TaskStateWriter(
+            self.state_store,
+            interval_seconds=self.settings.snapshot_flush_interval_ms / 1000.0,
+        )
+        self._global_limiter = GlobalConcurrencyLimiter(self.settings.system_concurrency)
         self._lanes = {
             lane: LaneScheduler(
                 lane,
@@ -57,6 +63,7 @@ class SchedulerService:
                 self.account_pool,
                 clock=clock,
                 lease_replacer=self._replace_execution_lease,
+                global_limiter=self._global_limiter,
             )
             for lane in Lane
         }
@@ -80,10 +87,11 @@ class SchedulerService:
                 return
             self._stop_event.clear()
             self.state_store.initialize()
-            self.reconciler.reconcile_now()
+            self.account_pool.restore_health(self.state_store.list_health())
             for lane in self._lanes.values():
                 await lane.start()
             self.snapshot_writer.start()
+            self.task_writer.start()
             self._cooldown_thread = self._start_thread(
                 "scheduler-cooldown",
                 self._cooldown_loop,
@@ -103,6 +111,7 @@ class SchedulerService:
             self.reconciler.stop(timeout=1)
             for lane in self._lanes.values():
                 await lane.stop()
+            self.task_writer.stop(timeout=1)
             self.snapshot_writer.stop(timeout=1)
             for thread in (self._cooldown_thread, self._watchdog_thread):
                 if thread is not None and thread.is_alive():
@@ -160,23 +169,9 @@ class SchedulerService:
         """Run one bounded lane job per requested image output."""
         if requirement.lane not in {Lane.IMAGE_GENERATION, Lane.IMAGE_EDIT}:
             raise ValueError("run_image_units requires an image lane")
-        count = max(1, int(requirement.cost))
-        unit_requirement = AccountRequirement(
-            lane=requirement.lane,
-            model=requirement.model,
-            plan_type=requirement.plan_type,
-            source_type=requirement.source_type,
-            cost=1,
-        )
-
-        works = [
-            (lambda _lease, _cancel, index=index: work_factory(index))
-            for index in range(1, count + 1)
-        ]
-        futures = await self.lane(requirement.lane).submit_batch(
-            works,
-            unit_requirement,
-            cost=1,
+        futures = await self.submit_image_units(
+            requirement,
+            work_factory,
             priority=priority,
             deadline=deadline,
         )
@@ -204,6 +199,49 @@ class SchedulerService:
         if not results and errors:
             raise errors[0]
         return results
+
+    async def submit_image_units(
+        self,
+        requirement: AccountRequirement,
+        work_factory: Callable[[int], Any],
+        *,
+        priority: int = 0,
+        deadline: float | None = None,
+    ) -> list[asyncio.Future[Any]]:
+        """Atomically admit one bounded lane job per requested output."""
+        if requirement.lane not in {Lane.IMAGE_GENERATION, Lane.IMAGE_EDIT}:
+            raise ValueError("submit_image_units requires an image lane")
+        count = max(1, int(requirement.cost))
+        lane_settings = self.settings.lanes[requirement.lane]
+        max_batch = max(
+            1,
+            min(int(lane_settings.queue_max_items), int(lane_settings.queue_max_cost)),
+        )
+        if count > max_batch:
+            raise QueueFullError(
+                "image output count exceeds scheduler batch capacity",
+                retry_after_seconds=1,
+            )
+        unit_requirement = AccountRequirement(
+            lane=requirement.lane,
+            model=requirement.model,
+            plan_type=requirement.plan_type,
+            source_type=requirement.source_type,
+            cost=1,
+            account_ref=requirement.account_ref,
+        )
+
+        works = [
+            (lambda _lease, _cancel, index=index: work_factory(index))
+            for index in range(1, count + 1)
+        ]
+        return await self.lane(requirement.lane).submit_batch(
+            works,
+            unit_requirement,
+            cost=1,
+            priority=priority,
+            deadline=deadline,
+        )
 
     async def admit_background(
         self,
@@ -257,8 +295,7 @@ class SchedulerService:
         health = []
         for item in self.account_pool.snapshot_health():
             redacted = dict(item)
-            token = str(redacted.pop("account_key", ""))
-            redacted["account_ref"] = anonymize_token(token)
+            redacted["account_ref"] = str(redacted.pop("account_key", ""))
             health.append(redacted)
         return {
             "enabled": bool(self.settings.enabled),
@@ -281,9 +318,10 @@ class SchedulerService:
             lane,
             model or requested_model,
             plan_type=plan_type,
-            source_type=str(
-                payload.get("source_type")
-                or ("codex" if is_codex_image_model(requested_model) else "web")
+            source_type=(
+                str(payload.get("source_type")).strip()
+                if payload.get("source_type")
+                else ("codex" if is_codex_image_model(requested_model) else None)
             ),
             cost=cost,
         )
@@ -335,7 +373,10 @@ class SchedulerService:
     def _watchdog_loop(self) -> None:
         interval = max(0.05, self.settings.lease_watchdog_interval_ms / 1000.0)
         while not self._stop_event.wait(interval):
-            self.account_pool.reclaim_expired()
+            # Python threads cannot be force-stopped safely. The lane owns
+            # active leases and releases them only after the worker observes
+            # cancellation and exits; reclaiming here could reuse a token
+            # while the old upstream request is still using it.
             for snapshot in self.account_pool.snapshot_health():
                 self.snapshot_writer.submit(snapshot)
 

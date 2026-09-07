@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,11 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, is_safe_to_log_url, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.scheduler.context import current_execution_context
 from services.scheduler.errors import SchedulerError
 from services.scheduler.models import Lane
 from services.scheduler.service import scheduler_service
+from utils.helper import anonymize_token, is_codex_image_model, split_image_model
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -67,6 +70,19 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _task_result_metadata(task: dict[str, Any]) -> dict[str, Any] | None:
+    """Persist only recoverable image URLs, never inline image bytes."""
+    data = task.get("data")
+    if not isinstance(data, list):
+        return None
+    urls = _collect_image_urls(data)
+    return {
+        "urls": urls,
+        "count": len(data),
+        "available": bool(urls),
+    }
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -112,6 +128,7 @@ class ImageTaskService:
         retention_days_getter: Callable[[], int] | None = None,
         scheduler_service_instance: Any | None = None,
         state_store: Any | None = None,
+        task_writer: Any | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
@@ -119,6 +136,7 @@ class ImageTaskService:
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self.scheduler_service = scheduler_service_instance
         self.state_store = state_store
+        self.task_writer = task_writer or getattr(scheduler_service_instance, "task_writer", None)
         self._fallback_executor = ThreadPoolExecutor(
             max_workers=max(1, int(config.get_scheduler_settings().lanes[Lane.IMAGE_GENERATION].worker_count)),
             thread_name_prefix="image-task-fallback",
@@ -139,6 +157,10 @@ class ImageTaskService:
             self.state_store.initialize()
             if self.path.exists():
                 self.state_store.import_legacy_tasks(self.path)
+            recoverable = {
+                str(item.get("task_key")): item
+                for item in self.state_store.load_recoverable_tasks()
+            }
             tasks: dict[str, dict[str, Any]] = {}
             for record in self.state_store.list_tasks():
                 metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -146,10 +168,43 @@ class ImageTaskService:
                 owner = _clean(record.get("owner_id"))
                 if not task_id or not owner:
                     continue
+                task_key = _task_key(owner, task_id)
+                status = _clean(record.get("status"), TASK_STATUS_ERROR)
+                remote_task_id = _clean(record.get("remote_task_id"))
+                persisted_result = record.get("result")
+                persisted_urls = (
+                    persisted_result.get("urls")
+                    if isinstance(persisted_result, dict)
+                    else None
+                )
+                if not isinstance(persisted_urls, list) and isinstance(persisted_result, dict):
+                    persisted_urls = persisted_result.get("data")
+                restored_urls = [
+                    str(url)
+                    for url in (persisted_urls if isinstance(persisted_urls, list) else [])
+                    if isinstance(url, str) and is_safe_to_log_url(url)
+                ]
+                result_available = bool(
+                    isinstance(persisted_result, dict)
+                    and persisted_result.get("available")
+                    and restored_urls
+                )
+                recoverable_record = recoverable.get(task_key)
+                resume_on_start = bool(
+                    recoverable_record
+                    and remote_task_id
+                    and status in UNFINISHED_STATUSES
+                )
+                if status == "unknown":
+                    status = TASK_STATUS_ERROR
+                if status in UNFINISHED_STATUSES and not remote_task_id:
+                    status = TASK_STATUS_ERROR
+                if status == TASK_STATUS_SUCCESS and not result_available:
+                    status = TASK_STATUS_ERROR
                 task = {
                     "id": task_id,
                     "owner_id": owner,
-                    "status": _clean(record.get("status"), TASK_STATUS_ERROR),
+                    "status": status,
                     "mode": "edit" if record.get("mode") == "edit" else "generate",
                     "model": _clean(record.get("model"), "gpt-image-2"),
                     "size": _clean(metadata.get("size")),
@@ -158,12 +213,24 @@ class ImageTaskService:
                     "updated_at": _now_iso(),
                     "updated_ts": record.get("updated_at"),
                 }
-                remote_task_id = _clean(record.get("remote_task_id"))
+                account_ref = _clean(metadata.get("account_ref"))
+                if account_ref:
+                    task["account_ref"] = account_ref
                 if remote_task_id:
                     task["conversation_id"] = remote_task_id
+                if result_available:
+                    task["data"] = [{"url": url} for url in restored_urls]
                 if record.get("error"):
                     task["error"] = _clean(record.get("error"))
-                tasks[_task_key(owner, task_id)] = task
+                if status == TASK_STATUS_ERROR and not task.get("error"):
+                    task["error"] = (
+                        "服务已重启，未完成的图片任务提交结果未知"
+                        if not remote_task_id
+                        else "服务重启后任务结果不可恢复"
+                    )
+                if resume_on_start:
+                    task["_resume_on_start"] = True
+                tasks[task_key] = task
             return tasks
         except Exception:
             return self._load_locked()
@@ -189,6 +256,44 @@ class ImageTaskService:
             "base_url": base_url,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
+
+    async def start(self) -> None:
+        """Resume persisted image polls after the scheduler event loop starts."""
+        pending: list[tuple[str, str, str, str, str]] = []
+        with self._lock:
+            for key, task in self._tasks.items():
+                if not task.pop("_resume_on_start", False):
+                    continue
+                conversation_id = _clean(task.get("conversation_id"))
+                if not conversation_id:
+                    continue
+                task["status"] = TASK_STATUS_RUNNING
+                task["error"] = ""
+                task["updated_at"] = _now_iso()
+                task["updated_ts"] = time.time()
+                self._save_task_locked(task, synchronous=False)
+                pending.append(
+                    (
+                        key,
+                        conversation_id,
+                        _clean(task.get("owner_id")),
+                        _clean(task.get("mode"), "generate"),
+                        _clean(task.get("account_ref")),
+                    )
+                )
+        for key, conversation_id, owner, mode, account_ref in pending:
+            with self._lock:
+                task = self._tasks.get(key) or {}
+                model = _clean(task.get("model"), "gpt-image-2")
+            self._dispatch_resume_poll(
+                key,
+                conversation_id,
+                config.image_poll_timeout_secs,
+                {"id": owner, "name": "scheduler-recovery", "role": "system"},
+                mode,
+                model,
+                account_ref,
+            )
 
     async def submit_generation_async(
         self,
@@ -307,10 +412,16 @@ class ImageTaskService:
             return result
         try:
             await admission
-        except SchedulerError:
+        except Exception:
             with self._lock:
                 self._tasks.pop(key, None)
-                self._save_locked()
+                if self.state_store is not None:
+                    if self.task_writer is not None:
+                        self.task_writer.delete(key)
+                    else:
+                        self.state_store.delete_task(key)
+                else:
+                    self._save_locked()
             raise
         return result
 
@@ -349,7 +460,7 @@ class ImageTaskService:
                 "created_ts": time.time(),
             }
             self._tasks[key] = task
-            self._save_locked()
+            self._save_task_locked(task, synchronous=False)
             should_start = True
 
         if should_start:
@@ -392,11 +503,7 @@ class ImageTaskService:
                 )
             )
             self._admission_tasks[key] = admission
-
-            def clear_admission(_task: asyncio.Task[Any]) -> None:
-                self._admission_tasks.pop(key, None)
-
-            admission.add_done_callback(clear_admission)
+            self._watch_admission_task(key, admission)
 
     async def _admit_task(
         self,
@@ -406,7 +513,9 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
-        if self.scheduler_service is None:
+        if self.scheduler_service is None or not getattr(
+            getattr(self.scheduler_service, "settings", None), "enabled", True
+        ):
             self._fallback_executor.submit(self._run_task, key, mode, payload, identity, model)
             return
         requirement = (
@@ -414,7 +523,7 @@ class ImageTaskService:
             if mode == "edit"
             else self.scheduler_service.classify_image_generation(payload)
         )
-        await self.scheduler_service.admit_background(
+        future = await self.scheduler_service.admit_background(
             requirement,
             lambda _lease, _cancel: self._run_task(
                 key,
@@ -425,6 +534,48 @@ class ImageTaskService:
                 raise_on_error=True,
             ),
         )
+        self._watch_background_future(key, future)
+
+    def _watch_background_future(self, key: str, future: Any) -> None:
+        def completed(done: Any) -> None:
+            if done.cancelled():
+                error = "scheduler task cancelled"
+            else:
+                try:
+                    error = str(done.exception() or "")
+                except BaseException as exc:
+                    error = str(exc)
+            if not error:
+                return
+            with self._lock:
+                task = self._tasks.get(key)
+                if task is None or task.get("status") in TERMINAL_STATUSES:
+                    return
+            self._update_task(key, status=TASK_STATUS_ERROR, error=error, data=[])
+
+        future.add_done_callback(completed)
+
+    def _watch_admission_task(self, key: str, admission: asyncio.Task[Any]) -> None:
+        def completed(done: asyncio.Task[Any]) -> None:
+            if self._admission_tasks.get(key) is done:
+                self._admission_tasks.pop(key, None)
+            if done.cancelled():
+                error = "scheduler admission task cancelled"
+            else:
+                try:
+                    exception = done.exception()
+                except BaseException as exc:
+                    exception = exc
+                if exception is None:
+                    return
+                error = str(exception) or "scheduler admission task failed"
+            with self._lock:
+                task = self._tasks.get(key)
+                if task is None or task.get("status") in TERMINAL_STATUSES:
+                    return
+            self._update_task(key, status=TASK_STATUS_ERROR, error=error, data=[])
+
+        admission.add_done_callback(completed)
 
     def _run_task(
         self,
@@ -437,12 +588,30 @@ class ImageTaskService:
         raise_on_error: bool = False,
     ) -> None:
         started = time.time()
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        context = current_execution_context()
+        account_ref = (
+            anonymize_token(context.lease.access_token)
+            if context is not None and context.lease is not None
+            else ""
+        )
+        self._update_task(
+            key,
+            status=TASK_STATUS_RUNNING,
+            error="",
+            **({"account_ref": account_ref} if account_ref else {}),
+        )
         # 创建进度回调，每个步骤完成后更新任务状态
-        def progress_callback(step: str) -> None:
+        def progress_callback(step: str, conversation_id: str = "") -> None:
             if step == "image_stream_resolve_start":
                 self._update_task(key, started_ts=time.time())
-            self._update_task(key, progress=step)
+            updates: dict[str, Any] = {"progress": step}
+            normalized_conversation_id = _clean(conversation_id)
+            if normalized_conversation_id:
+                updates["conversation_id"] = normalized_conversation_id
+                context = current_execution_context()
+                if context is not None and context.lease is not None:
+                    updates["account_ref"] = anonymize_token(context.lease.access_token)
+            self._update_task(key, **updates)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -451,6 +620,7 @@ class ImageTaskService:
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
+            conversation_id = _clean(result.get("_conversation_id") or result.get("conversation_id"))
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
             if not isinstance(data, list) or not data:
                 upstream = _clean(result.get("message"))
@@ -461,10 +631,20 @@ class ImageTaskService:
                 error = RuntimeError(message)
                 if account_email:
                     setattr(error, "account_email", account_email)
+                if conversation_id:
+                    setattr(error, "conversation_id", conversation_id)
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                duration_ms=duration_ms,
+                **({"conversation_id": conversation_id} if conversation_id else {}),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -545,7 +725,21 @@ class ImageTaskService:
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
-            self._save_locked()
+            if self.state_store is not None:
+                if set(updates).issubset({"progress", "started_ts"}):
+                    return
+                self._save_task_locked(task, synchronous=False)
+                if (
+                    self.task_writer is not None
+                    and self.task_writer.running
+                    and ("conversation_id" in updates or task.get("status") in TERMINAL_STATUSES)
+                ):
+                    try:
+                        self.task_writer.flush()
+                    except Exception:
+                        pass
+            else:
+                self._save_locked()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -599,25 +793,7 @@ class ImageTaskService:
     def _save_locked(self) -> None:
         if self.state_store is not None:
             for task in self._tasks.values():
-                metadata = {
-                    "size": task.get("size"),
-                    "quality": task.get("quality"),
-                    "n": task.get("n", 1),
-                    "created_at": task.get("created_at"),
-                }
-                self.state_store.save_task({
-                    "task_key": _task_key(str(task.get("owner_id") or ""), str(task.get("id") or "")),
-                    "owner_id": task.get("owner_id"),
-                    "task_id": task.get("id"),
-                    "mode": task.get("mode"),
-                    "status": task.get("status"),
-                    "model": task.get("model"),
-                    "remote_task_id": task.get("conversation_id"),
-                    "metadata": metadata,
-                    "result": None,
-                    "error": task.get("error"),
-                    "updated_at": task.get("updated_ts") or time.time(),
-                })
+                self._save_task_locked(task)
             return
         tasks = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         items = []
@@ -635,12 +811,47 @@ class ImageTaskService:
         tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(self.path)
 
+    def _save_task_locked(self, task: dict[str, Any], *, synchronous: bool = True) -> None:
+        if self.state_store is None:
+            self._save_locked()
+            return
+        record = {
+            "task_key": _task_key(str(task.get("owner_id") or ""), str(task.get("id") or "")),
+            "owner_id": task.get("owner_id"),
+            "task_id": task.get("id"),
+            "mode": task.get("mode"),
+            "status": task.get("status"),
+            "model": task.get("model"),
+            "remote_task_id": task.get("conversation_id"),
+            "metadata": {
+                "size": task.get("size"),
+                "quality": task.get("quality"),
+                "n": task.get("n", 1),
+                "created_at": task.get("created_at"),
+                "account_ref": task.get("account_ref"),
+            },
+            "result": _task_result_metadata(task) if task.get("status") == TASK_STATUS_SUCCESS else None,
+            "error": task.get("error"),
+            "updated_at": task.get("updated_ts") or time.time(),
+        }
+        if not synchronous and self.task_writer is not None and self.task_writer.running:
+            self.task_writer.submit(record)
+            return
+        if self.task_writer is not None and hasattr(self.task_writer, "save_now"):
+            self.task_writer.save_now(record)
+            return
+        self.state_store.save_task(record)
+
     def _recover_unfinished_locked(self) -> bool:
         changed = False
         for task in self._tasks.values():
-            if task.get("status") in UNFINISHED_STATUSES:
+            if task.get("status") in UNFINISHED_STATUSES and not _clean(task.get("conversation_id")):
                 task["status"] = TASK_STATUS_ERROR
-                task["error"] = "服务已重启，未完成的图片任务已中断"
+                task["error"] = (
+                    "服务已重启，未完成的图片任务提交结果未知"
+                    if self.state_store is not None
+                    else "服务已重启，未完成的图片任务已中断"
+                )
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed
@@ -658,6 +869,11 @@ class ImageTaskService:
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)
+        if removed_keys and self.state_store is not None:
+            if self.task_writer is not None:
+                self.task_writer.delete_tasks(removed_keys)
+            else:
+                self.state_store.delete_tasks(removed_keys)
         return bool(removed_keys)
 
     def resume_poll(
@@ -683,6 +899,7 @@ class ImageTaskService:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+            account_ref = _clean(task.get("account_ref"))
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
@@ -693,6 +910,7 @@ class ImageTaskService:
             dict(identity),
             mode,
             model,
+            account_ref,
         )
         return _public_task(task)
 
@@ -724,6 +942,7 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        account_ref: str = "",
     ) -> None:
         try:
             asyncio.get_running_loop()
@@ -736,6 +955,7 @@ class ImageTaskService:
                 identity,
                 mode,
                 model,
+                account_ref=account_ref,
             )
         else:
             admission = asyncio.create_task(
@@ -746,14 +966,11 @@ class ImageTaskService:
                     identity,
                     mode,
                     model,
+                    account_ref,
                 )
             )
             self._admission_tasks[key] = admission
-
-            def clear_admission(_task: asyncio.Task[Any]) -> None:
-                self._admission_tasks.pop(key, None)
-
-            admission.add_done_callback(clear_admission)
+            self._watch_admission_task(key, admission)
 
     async def _admit_resume_poll(
         self,
@@ -763,8 +980,11 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        account_ref: str = "",
     ) -> None:
-        if self.scheduler_service is None:
+        if self.scheduler_service is None or not getattr(
+            getattr(self.scheduler_service, "settings", None), "enabled", True
+        ):
             self._fallback_executor.submit(
                 self._run_resume_poll,
                 key,
@@ -773,26 +993,35 @@ class ImageTaskService:
                 identity,
                 mode,
                 model,
+                account_ref=account_ref,
             )
             return
         payload = {"model": model, "n": 1}
+        with self._lock:
+            task = self._tasks.get(key) or {}
+            account_ref = _clean(task.get("account_ref"))
         requirement = (
             self.scheduler_service.classify_image_edit(payload)
             if mode == "edit"
             else self.scheduler_service.classify_image_generation(payload)
         )
-        await self.scheduler_service.admit_background(
+        if account_ref:
+            requirement = replace(requirement, account_ref=account_ref)
+        future = await self.scheduler_service.admit_background(
             requirement,
-            lambda _lease, _cancel: self._run_resume_poll(
+            lambda lease, _cancel: self._run_resume_poll(
                 key,
                 conversation_id,
                 extra_timeout_secs,
                 identity,
                 mode,
                 model,
+                account_ref=account_ref,
+                access_token=lease.access_token,
                 raise_on_error=True,
             ),
         )
+        self._watch_background_future(key, future)
 
     def _run_resume_poll(
         self,
@@ -803,16 +1032,41 @@ class ImageTaskService:
         mode: str,
         model: str,
         *,
+        account_ref: str = "",
+        access_token: str = "",
         raise_on_error: bool = False,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
+        fallback_slot = False
         try:
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            if not access_token:
+                from services.account_service import account_service
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+                if account_ref:
+                    access_token = next(
+                        (
+                            str(item.get("access_token") or "")
+                            for item in account_service.scheduler_snapshot()
+                            if anonymize_token(item.get("access_token")) == account_ref
+                        ),
+                        "",
+                    )
+                    if not access_token:
+                        raise RuntimeError("恢复图片任务时原账号已不可用")
+                else:
+                    plan_type, _ = split_image_model(model)
+                    access_token = account_service.get_available_access_token(
+                        plan_type=plan_type,
+                        source_type="codex" if is_codex_image_model(model) else None,
+                        plan_types=("plus", "team", "pro")
+                        if is_codex_image_model(model) and not plan_type
+                        else None,
+                    )
+                    fallback_slot = True
+            backend = OpenAIBackendAPI(access_token=access_token)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -828,21 +1082,9 @@ class ImageTaskService:
             if not image_urls:
                 raise RuntimeError("图片 URL 解析失败")
 
-            image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                for image_data in backend.download_image_bytes(image_urls)
-            ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
-            data = format_image_result(
-                image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                created=int(time.time()),
-            )["data"]
+            # 异步任务默认返回 URL。保留远端 URL 可让 SQLite 重启恢复继续可用，
+            # 同时避免恢复路径下载并重新编码整张图片。
+            data = [{"url": url} for url in image_urls]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,
@@ -871,6 +1113,13 @@ class ImageTaskService:
         finally:
             if backend is not None:
                 backend.close()
+            if fallback_slot:
+                try:
+                    from services.account_service import account_service
+
+                    account_service.release_image_slot(access_token)
+                except Exception:
+                    pass
 
 
 image_task_service = ImageTaskService(

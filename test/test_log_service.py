@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 import tempfile
 from threading import Event
@@ -7,9 +8,57 @@ from pathlib import Path
 from unittest import mock
 
 from services.log_service import LogService, LoggedCall
+from services.scheduler.errors import QueueFullError
 
 
 class LoggedCallTests(unittest.TestCase):
+    def test_dict_response_strips_scheduler_internal_fields(self):
+        logged_call = LoggedCall(
+            identity={"id": "owner-1"},
+            endpoint="/v1/images/generations",
+            model="gpt-image-2",
+            summary="文生图",
+        )
+
+        with mock.patch("services.log_service.log_service.add"):
+            result = asyncio.run(
+                logged_call.run(
+                    lambda: {
+                        "data": [{"url": "https://files.example.test/image.png"}],
+                        "_account_email": "account@example.test",
+                        "_conversation_id": "conversation-1",
+                    }
+                )
+            )
+
+        self.assertNotIn("_account_email", result)
+        self.assertNotIn("_conversation_id", result)
+
+    def test_stream_scheduler_error_keeps_status_and_retry_after(self):
+        logged_call = LoggedCall(
+            identity={"id": "owner-1"},
+            endpoint="/v1/chat/completions",
+            model="test-model",
+            summary="文本生成",
+        )
+
+        async def runner(_handler, *_args, streaming=False):
+            self.assertTrue(streaming)
+
+            async def stream():
+                raise QueueFullError("scheduler queue is full", retry_after_seconds=7)
+                yield None
+
+            return stream()
+
+        with mock.patch("services.log_service.log_service.add"):
+            response = asyncio.run(
+                logged_call.run(lambda: None, scheduler_runner=runner, streaming=True)
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "7")
+
     @mock.patch("services.log_service.log_service.add")
     def test_inline_data_urls_are_not_written_to_call_logs(self, add_log):
         logged_call = LoggedCall(

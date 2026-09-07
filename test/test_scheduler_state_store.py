@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter
+from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter, TaskStateWriter
 
 
 class SchedulerStateStoreTests(unittest.TestCase):
@@ -130,6 +130,19 @@ class SchedulerStateStoreTests(unittest.TestCase):
         writer.stop(timeout=1)
 
         self.assertGreaterEqual(store.upsert_health_batch.call_count, 1)
+
+    def test_task_state_writer_coalesces_by_task_key(self) -> None:
+        store = Mock()
+        writer = TaskStateWriter(store)
+        writer.submit({"task_key": "owner:task", "status": "running"})
+        writer.submit({"task_key": "owner:task", "status": "success"})
+
+        writer.flush()
+
+        store.save_task_batch.assert_called_once_with([
+            {"task_key": "owner:task", "status": "success"},
+        ])
+        self.assertEqual(writer.pending_count(), 0)
 
     def test_legacy_import_renames_only_after_commit_and_drops_raw_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

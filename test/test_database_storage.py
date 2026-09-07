@@ -67,6 +67,27 @@ def test_save_accounts_deletes_only_rows_missing_from_new_snapshot(tmp_path):
     assert after["token-b"].id == token_b_id
 
 
+def test_save_account_updates_one_row_without_touching_other_rows(tmp_path):
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'accounts.db'}")
+    backend.save_accounts(
+        [
+            {"access_token": "token-a", "name": "A"},
+            {"access_token": "token-b", "name": "B"},
+        ]
+    )
+    before = _account_rows(backend)
+    before_b_data = before["token-b"].data
+    before_b_id = before["token-b"].id
+
+    backend.save_account({"access_token": "token-a", "name": "A updated"})
+
+    after = _account_rows(backend)
+    assert after["token-a"].id == before["token-a"].id
+    assert json.loads(after["token-a"].data)["name"] == "A updated"
+    assert after["token-b"].id == before_b_id
+    assert after["token-b"].data == before_b_data
+
+
 def test_save_accounts_rejects_duplicate_tokens_and_rolls_back(tmp_path):
     backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'accounts.db'}")
     original = {"access_token": "token-a", "name": "A"}

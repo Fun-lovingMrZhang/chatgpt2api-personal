@@ -27,6 +27,7 @@ def create_app() -> FastAPI:
         await run_in_threadpool(log_service.initialize)
         await run_in_threadpool(log_service.cleanup_expired, config.log_retention_days)
         await scheduler_service.start()
+        await image_tasks.image_task_service.start()
         log_cleanup_thread = log_service.start_retention_scheduler(
             stop_event,
             lambda: config.log_retention_days,
