@@ -72,9 +72,29 @@ class LogServiceTests(unittest.TestCase):
 
             self.assertEqual(result["total"], 1)
             self.assertEqual(result["items"][0]["id"], item["id"])
+            self.assertEqual(result["items"][0]["detail"], {"status": 200})
             self.assertEqual(service.list(type="call", limit=1)[0]["id"], item["id"])
             self.assertEqual(service.delete([item["id"]]), 1)
             self.assertEqual(service.query(page=1, page_size=20)["total"], 0)
+
+    def test_add_drops_request_and_response_payload_fields_before_storage(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            service = LogService(root / "logs.db", root / "logs.jsonl")
+
+            item = service.add(
+                "call",
+                "payload policy",
+                {
+                    "request_text": "secret prompt",
+                    "data": "large response",
+                    "status": "success",
+                },
+            )
+
+            self.assertIsNotNone(item)
+            stored = service.query(page=1, page_size=20)["items"][0]["detail"]
+            self.assertEqual(stored, {"status": "success"})
 
     def test_retention_scheduler_runs_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

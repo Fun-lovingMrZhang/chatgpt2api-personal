@@ -185,6 +185,24 @@ environment:
   - DATABASE_URL=sqlite:////app/data/accounts.db
 ```
 
+## 业务日志存储
+
+容器的运行时日志仍通过应用标准输出记录，可使用 `docker logs` 查看；后台“日志管理”页面使用独立的 SQLite 文件 `data/logs.db`，不会再查询或重写整个 `logs.jsonl` 文件。
+
+首次启动新版服务时，如果 `data/logs.jsonl` 存在，服务会逐行、分批迁移有效历史记录。迁移成功并提交后，旧文件会改名为 `logs.jsonl.migrated`；如果该备份名已存在，会生成带时间后缀的备份。迁移过程失败时会保留原始 JSONL，下一次启动可以继续重试。
+
+日志默认保留 30 天，可在 `config.json` 中配置：
+
+```json
+{
+  "log_retention_days": 30
+}
+```
+
+清理在启动时执行，运行期间最多每天执行一次。日志管理 API 按页查询，筛选、详情查看和删除功能保持不变，但浏览器只会加载当前页的记录。
+
+升级或迁移前应备份整个 `data/` 目录，其中包括 `logs.db`、SQLite 可能产生的 `logs.db-wal`/`logs.db-shm` 文件和迁移后的历史备份。生产环境建议先停止服务再打包，以保证数据库文件和 WAL 状态一致。
+
 ## 升级前备份
 
 升级前建议备份：

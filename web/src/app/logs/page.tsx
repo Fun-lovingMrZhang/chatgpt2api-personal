@@ -55,6 +55,7 @@ function LogsContent() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
   const [detailLog, setDetailLog] = useState<SystemLog | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
@@ -86,6 +87,7 @@ function LogsContent() {
       });
       setItems(data.items);
       setTotal(data.total);
+      setHasMore(data.has_more);
       setPage(data.page);
       setSelectedIds([]);
       return data;
@@ -143,7 +145,10 @@ function LogsContent() {
   };
 
   useEffect(() => {
-    void loadLogs(page);
+    const timer = window.setTimeout(() => {
+      void loadLogs(page);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [loadLogs, page]);
 
   return (
@@ -278,7 +283,7 @@ function LogsContent() {
             <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               <ChevronLeft className="size-4" />
             </Button>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={!hasMore || safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
               <ChevronRight className="size-4" />
             </Button>
           </div>

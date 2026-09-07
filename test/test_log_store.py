@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from pathlib import Path
 
@@ -160,6 +161,19 @@ class SQLiteLogStoreTests(unittest.TestCase):
         remaining = self.store.query(page=1, page_size=100)
         self.assertEqual([item["id"] for item in remaining["items"]], [new_item["id"]])
         self.assertNotEqual(old_item["id"], new_item["id"])
+
+    def test_concurrent_writes_from_multiple_threads_are_readable(self):
+        self.store.initialize()
+
+        def write(index: int):
+            return self.store.add("call", f"call-{index}", {"index": index})
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            items = list(executor.map(write, range(40)))
+
+        result = self.store.query(page=1, page_size=100)
+        self.assertEqual(result["total"], 40)
+        self.assertEqual(len({item["id"] for item in items}), 40)
 
 
 if __name__ == "__main__":
