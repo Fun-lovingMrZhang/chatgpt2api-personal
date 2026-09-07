@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import itertools
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.log_store import SQLiteLogStore
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.log import logger
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
@@ -24,93 +24,121 @@ INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
 
 class LogService:
-    def __init__(self, path: Path):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Path, legacy_path: Path | None = None):
+        self.db_path = Path(db_path)
+        self.legacy_path = Path(legacy_path or self.db_path.with_name("logs.jsonl"))
+        self.path = self.legacy_path
+        self.store = SQLiteLogStore(self.db_path, self.legacy_path)
+        self._initialize_lock = threading.RLock()
+        self._initialized = False
+
+    def initialize(self) -> None:
+        if self._initialized:
+            return
+        with self._initialize_lock:
+            if self._initialized:
+                return
+            self.store.initialize()
+            self._initialized = True
+
+    def _ensure_initialized(self) -> None:
+        if not self._initialized:
+            self.initialize()
 
     @staticmethod
-    def _legacy_id(raw_line: str, line_number: int) -> str:
-        payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
-        return hashlib.sha1(payload).hexdigest()[:24]
+    def _sanitize_detail(detail: dict[str, Any]) -> dict[str, Any]:
+        sanitized = dict(detail)
+        for key in (
+            "request_text",
+            "prompt",
+            "response",
+            "response_body",
+            "response_data",
+            "data",
+            "b64_json",
+            "base64",
+            "image_bytes",
+        ):
+            sanitized.pop(key, None)
+        return sanitized
 
-    def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
+    def add(
+        self,
+        type: str,
+        summary: str = "",
+        detail: dict[str, Any] | None = None,
+        **data: Any,
+    ) -> dict[str, Any] | None:
+        payload = detail if detail is not None else data
+        if not isinstance(payload, dict):
+            payload = {}
+        payload = self._sanitize_detail(payload)
         try:
-            item = json.loads(raw_line)
-        except Exception:
+            self._ensure_initialized()
+            return self.store.add(type, summary, payload)
+        except Exception as exc:
+            logger.error({"event": "log_write_failed", "error": str(exc)})
             return None
-        if not isinstance(item, dict):
-            return None
-        parsed = dict(item)
-        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line, line_number))
-        return parsed
 
-    @staticmethod
-    def _serialize_item(item: dict[str, Any]) -> str:
-        return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-
-    @staticmethod
-    def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
-        t = str(item.get("time") or "")
-        day = t[:10]
-        if type and item.get("type") != type:
-            return False
-        if start_date and day < start_date:
-            return False
-        if end_date and day > end_date:
-            return False
-        return True
-
-    def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
-        item = {
-            "id": uuid4().hex,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "type": type,
-            "summary": summary,
-            "detail": detail or data,
-        }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+    def query(
+        self,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        page: int = 1,
+        page_size: int = 20,
+        *,
+        type_filter: str | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_initialized()
+        return self.store.query(
+            type_filter=type if type_filter is None else type_filter,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size,
+        )
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        if limit <= 0:
             return []
-        items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
-                continue
-            items.append(item)
-            if len(items) >= limit:
-                break
-        return items
+        page_size = min(limit, 100)
+        return self.query(
+            type=type,
+            start_date=start_date,
+            end_date=end_date,
+            page=1,
+            page_size=page_size,
+        )["items"]
 
-    def delete(self, ids: list[str]) -> dict[str, int]:
-        target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
-            return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
-        removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
-        return {"removed": removed}
+    def delete(self, ids: list[str]) -> int:
+        self._ensure_initialized()
+        return self.store.delete(ids)
+
+    def cleanup_expired(self, retention_days: int) -> int:
+        self._ensure_initialized()
+        return self.store.cleanup_expired(retention_days)
+
+    def start_retention_scheduler(
+        self,
+        stop_event: threading.Event,
+        retention_days_getter,
+        *,
+        interval_seconds: float = 86400,
+    ) -> threading.Thread:
+        def run() -> None:
+            while not stop_event.wait(interval_seconds):
+                try:
+                    self.cleanup_expired(int(retention_days_getter()))
+                except Exception as exc:
+                    logger.error({"event": "log_retention_failed", "error": str(exc)})
+
+        thread = threading.Thread(target=run, name="log-retention", daemon=True)
+        thread.start()
+        return thread
 
 
-log_service = LogService(DATA_DIR / "logs.jsonl")
+log_service = LogService(DATA_DIR / "logs.db", DATA_DIR / "logs.jsonl")
 
 
 def is_safe_to_log_url(url: str) -> bool:
@@ -172,16 +200,6 @@ def _strip_internal_response_fields(value: object) -> object:
     if isinstance(value, list):
         return [_strip_internal_response_fields(item) for item in value]
     return value
-
-
-def _request_excerpt(text: object, limit: int = 1000) -> str:
-    value = str(text or "").strip()
-    if not value:
-        return ""
-    normalized = " ".join(value.split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 1].rstrip() + "…"
 
 
 def _image_error_response(exc: Exception) -> JSONResponse:
@@ -317,9 +335,6 @@ class LoggedCall:
             "duration_ms": int((time.time() - self.started) * 1000),
             "status": status,
         }
-        request_excerpt = _request_excerpt(self.request_text)
-        if request_excerpt:
-            detail["request_text"] = request_excerpt
         if self.request_shape:
             detail["request_shape"] = self.request_shape
         if error:
