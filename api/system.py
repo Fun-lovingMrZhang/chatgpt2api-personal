@@ -8,7 +8,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from api.support import require_admin, require_identity, resolve_image_base_url
+from api.support import require_admin, require_identity, require_web_identity, resolve_image_base_url
 from services.backup_service import BackupError, backup_service
 from services.config import config
 from services.image_service import (
@@ -65,7 +65,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/auth/login")
     async def login(authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = require_web_identity(authorization)
         return {
             "ok": True,
             "version": app_version,

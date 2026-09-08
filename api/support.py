@@ -31,12 +31,23 @@ def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     return None
 
 
-def require_identity(authorization: str | None) -> dict[str, object]:
+def _require_identity(authorization: str | None, *, web_login: bool = False) -> dict[str, object]:
     token = extract_bearer_token(authorization)
-    identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
+    if web_login:
+        identity = _legacy_admin_identity(token) or auth_service.authenticate_web_login(token)
+    else:
+        identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
     if identity is None:
         raise HTTPException(status_code=401, detail={"error": "密钥无效或已失效，请重新登录"})
     return identity
+
+
+def require_identity(authorization: str | None) -> dict[str, object]:
+    return _require_identity(authorization)
+
+
+def require_web_identity(authorization: str | None) -> dict[str, object]:
+    return _require_identity(authorization, web_login=True)
 
 
 def require_auth_key(authorization: str | None) -> None:

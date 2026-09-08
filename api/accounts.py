@@ -47,6 +47,7 @@ class UserKeyCreateRequest(BaseModel):
 class UserKeyUpdateRequest(BaseModel):
     name: str | None = None
     enabled: bool | None = None
+    web_login_enabled: bool | None = None
     key: str | None = None
     text_limit: int | None = Field(default=None, ge=0)
     image_limit: int | None = Field(default=None, ge=0)
@@ -217,6 +218,7 @@ def create_router() -> APIRouter:
             for key, value in {
                 "name": body.name,
                 "enabled": body.enabled,
+                "web_login_enabled": body.web_login_enabled,
                 "key": body.key,
             }.items()
             if value is not None
