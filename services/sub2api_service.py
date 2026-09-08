@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import threading
 import time
 import uuid
@@ -21,6 +22,8 @@ SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
 # Cached JWT per server to avoid re-login on every list/import call.
 # Token lifetime on sub2api defaults to 24h; we refresh 5 min before expiry.
 _TOKEN_REFRESH_SKEW = 5 * 60
+AUTO_SYNC_STATUSES = {"disabled", "idle", "running", "completed", "failed"}
+MAX_IMPORT_ERRORS = 50
 
 
 def _new_id() -> str:
@@ -35,6 +38,26 @@ def _clean(value: object) -> str:
     return str(value or "").strip()
 
 
+def _normalize_interval(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, str):
+        clean = value.strip()
+        if clean.isdecimal():
+            interval = int(clean)
+            return interval if interval > 0 else 0
+    return 0
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -46,17 +69,38 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
         "status": status,
         "created_at": _clean(raw.get("created_at")) or _now_iso(),
         "updated_at": _clean(raw.get("updated_at")) or _clean(raw.get("created_at")) or _now_iso(),
-        "total": int(raw.get("total") or 0),
-        "completed": int(raw.get("completed") or 0),
-        "added": int(raw.get("added") or 0),
-        "skipped": int(raw.get("skipped") or 0),
-        "refreshed": int(raw.get("refreshed") or 0),
-        "failed": int(raw.get("failed") or 0),
+        "total": _nonnegative_int(raw.get("total")),
+        "completed": _nonnegative_int(raw.get("completed")),
+        "added": _nonnegative_int(raw.get("added")),
+        "skipped": _nonnegative_int(raw.get("skipped")),
+        "refreshed": _nonnegative_int(raw.get("refreshed")),
+        "failed": _nonnegative_int(raw.get("failed")),
         "errors": raw.get("errors") if isinstance(raw.get("errors"), list) else [],
     }
 
 
+def _normalize_auto_sync(raw: object, *, interval: int) -> dict:
+    item = raw if isinstance(raw, dict) else {}
+    status = _clean(item.get("status")) or ("idle" if interval > 0 else "disabled")
+    if status not in AUTO_SYNC_STATUSES:
+        status = "idle" if interval > 0 else "disabled"
+    if interval <= 0:
+        status = "disabled"
+    return {
+        "status": status,
+        "last_started_at": _clean(item.get("last_started_at")) or None,
+        "last_finished_at": _clean(item.get("last_finished_at")) or None,
+        "last_success_at": _clean(item.get("last_success_at")) or None,
+        "next_run_at": _clean(item.get("next_run_at")) or None,
+        "last_error": _clean(item.get("last_error")),
+        "last_remote_count": _nonnegative_int(item.get("last_remote_count")),
+        "last_import_job_id": _clean(item.get("last_import_job_id")),
+        "last_import_failed": _nonnegative_int(item.get("last_import_failed")),
+    }
+
+
 def _normalize_server(raw: dict) -> dict:
+    interval = _normalize_interval(raw.get("auto_sync_interval_minutes"))
     return {
         "id": _clean(raw.get("id")) or _new_id(),
         "name": _clean(raw.get("name")),
@@ -65,6 +109,8 @@ def _normalize_server(raw: dict) -> dict:
         "password": _clean(raw.get("password")),
         "api_key": _clean(raw.get("api_key")),
         "group_id": _clean(raw.get("group_id")),
+        "auto_sync_interval_minutes": interval,
+        "auto_sync": _normalize_auto_sync(raw.get("auto_sync"), interval=interval),
         "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True),
     }
 
@@ -95,13 +141,13 @@ class Sub2APIConfig:
 
     def list_servers(self) -> list[dict]:
         with self._lock:
-            return [dict(server) for server in self._servers]
+            return copy.deepcopy(self._servers)
 
     def get_server(self, server_id: str) -> dict | None:
         with self._lock:
             for server in self._servers:
                 if server["id"] == server_id:
-                    return dict(server)
+                    return copy.deepcopy(server)
         return None
 
     def add_server(
@@ -113,6 +159,7 @@ class Sub2APIConfig:
         password: str,
         api_key: str,
         group_id: str = "",
+        auto_sync_interval_minutes: int = 0,
     ) -> dict:
         server = _normalize_server({
             "id": _new_id(),
@@ -122,12 +169,13 @@ class Sub2APIConfig:
             "password": password,
             "api_key": api_key,
             "group_id": group_id,
+            "auto_sync_interval_minutes": auto_sync_interval_minutes,
         })
         with self._lock:
             self._servers.append(server)
             self._save()
         _token_cache.pop(server["id"], None)
-        return dict(server)
+        return copy.deepcopy(server)
 
     def update_server(self, server_id: str, updates: dict) -> dict | None:
         with self._lock:
@@ -137,12 +185,27 @@ class Sub2APIConfig:
                 merged = {**server, **{k: v for k, v in updates.items() if v is not None}, "id": server_id}
                 self._servers[index] = _normalize_server(merged)
                 self._save()
-                result = dict(self._servers[index])
+                result = copy.deepcopy(self._servers[index])
                 break
             else:
                 return None
         _token_cache.pop(server_id, None)
         return result
+
+    def set_auto_sync_state(self, server_id: str, **updates: object) -> dict | None:
+        with self._lock:
+            for index, server in enumerate(self._servers):
+                if server["id"] != server_id:
+                    continue
+                next_server = copy.deepcopy(server)
+                auto_sync = dict(next_server.get("auto_sync") or {})
+                auto_sync.update(updates)
+                next_server["auto_sync"] = auto_sync
+                normalized = _normalize_server(next_server)
+                self._servers[index] = normalized
+                self._save()
+                return copy.deepcopy(normalized)
+        return None
 
     def delete_server(self, server_id: str) -> bool:
         with self._lock:
@@ -164,7 +227,7 @@ class Sub2APIConfig:
                 next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
                 self._servers[index] = next_server
                 self._save()
-                return dict(next_server)
+                return copy.deepcopy(next_server)
         return None
 
     def get_import_job(self, server_id: str) -> dict | None:
@@ -172,7 +235,7 @@ class Sub2APIConfig:
             for server in self._servers:
                 if server["id"] == server_id:
                     job = server.get("import_job")
-                    return dict(job) if isinstance(job, dict) else None
+                    return copy.deepcopy(job) if isinstance(job, dict) else None
         return None
 
 
@@ -385,6 +448,9 @@ def list_remote_groups(server: dict) -> list[dict]:
     return items
 
 
+SUB2API_EXPORT_BATCH_SIZE = 100
+
+
 def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> tuple[list[str], list[dict]]:
     """Return exported access tokens and per-account errors from sub2api."""
     base_url = _clean(server.get("base_url"))
@@ -393,40 +459,43 @@ def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> t
     if not ids:
         return [], []
 
-    session = Session(verify=True)
-    try:
-        response = session.get(
-            f"{base_url.rstrip('/')}/api/v1/admin/accounts/data",
-            headers=headers,
-            params={"ids": ",".join(ids), "timezone": "Asia/Shanghai"},
-            timeout=30,
-        )
-        if not response.ok:
-            raise RuntimeError(f"HTTP {response.status_code}")
-        payload = response.json()
-    finally:
-        session.close()
-
-    data = _unwrap_envelope(payload)
-    accounts = data.get("accounts") if isinstance(data, dict) else None
-    if not isinstance(accounts, list):
-        raise RuntimeError("invalid export payload")
-
     tokens: list[str] = []
     errors: list[dict] = []
-    for account in accounts:
-        if not isinstance(account, dict):
-            continue
-        credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
-        token = _extract_access_token(credentials)
-        account_id = _clean(account.get("id")) or _clean(credentials.get("chatgpt_account_id")) or _clean(account.get("name"))
-        if token:
-            tokens.append(token)
-        else:
-            errors.append({"name": account_id or _clean(account.get("name")) or "unknown", "error": "missing access_token"})
 
-    if len(accounts) < len(ids):
-        errors.append({"name": ",".join(ids), "error": f"exported {len(accounts)}/{len(ids)} accounts"})
+    for offset in range(0, len(ids), SUB2API_EXPORT_BATCH_SIZE):
+        batch_ids = ids[offset:offset + SUB2API_EXPORT_BATCH_SIZE]
+        session = Session(verify=True)
+        try:
+            response = session.get(
+                f"{base_url.rstrip('/')}/api/v1/admin/accounts/data",
+                headers=headers,
+                params={"ids": ",".join(batch_ids), "timezone": "Asia/Shanghai"},
+                timeout=30,
+            )
+            if not response.ok:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            payload = response.json()
+        finally:
+            session.close()
+
+        data = _unwrap_envelope(payload)
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if not isinstance(accounts, list):
+            raise RuntimeError("invalid export payload")
+
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
+            token = _extract_access_token(credentials)
+            account_id = _clean(account.get("id")) or _clean(credentials.get("chatgpt_account_id")) or _clean(account.get("name"))
+            if token:
+                tokens.append(token)
+            else:
+                errors.append({"name": account_id or _clean(account.get("name")) or "unknown", "error": "missing access_token"})
+
+        if len(accounts) < len(batch_ids):
+            errors.append({"name": ",".join(batch_ids), "error": f"exported {len(accounts)}/{len(batch_ids)} accounts"})
 
     return tokens, errors
 
