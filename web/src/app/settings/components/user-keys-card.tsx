@@ -598,7 +598,7 @@ export function UserKeysCard() {
                   允许 Web 登录
                 </label>
                 <p className="text-xs leading-5 text-stone-500">
-                  关闭后该密钥仍可调用 API，但不能用于登录 Web。
+                  密钥保持启用时，关闭此项仍可调用 API，但不能用于登录 Web。
                 </p>
               </div>
             </div>
