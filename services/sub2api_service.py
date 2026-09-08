@@ -7,6 +7,7 @@ import copy
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -500,16 +501,76 @@ def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> t
     return tokens, errors
 
 
+class Sub2APISyncBusyError(RuntimeError):
+    code = "sub2api_sync_busy"
+
+
+class _OperationLease:
+    def __init__(self, owner: "Sub2APIImportService", server_id: str, lock: Lock):
+        self._owner = owner
+        self._server_id = server_id
+        self._lock = lock
+        self._released = False
+
+    def __enter__(self) -> "_OperationLease":
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._owner._release_operation(self._server_id, self._lock)
+
+
 class Sub2APIImportService:
     def __init__(self, sub2api_config: Sub2APIConfig):
         self._config = sub2api_config
+        self._locks: dict[str, Lock] = {}
+        self._locks_lock = Lock()
+        self._job_events: dict[str, threading.Event] = {}
+        self._job_events_lock = Lock()
 
-    def start_import(self, server: dict, account_ids: list[str]) -> dict:
+    def _acquire_operation(self, server_id: str) -> _OperationLease:
+        with self._locks_lock:
+            operation_lock = self._locks.setdefault(server_id, Lock())
+            if not operation_lock.acquire(blocking=False):
+                raise Sub2APISyncBusyError("该连接已有同步任务正在运行")
+            return _OperationLease(self, server_id, operation_lock)
+
+    @contextmanager
+    def acquire_operation(self, server_id: str):
+        lease = self._acquire_operation(server_id)
+        try:
+            yield lease
+        finally:
+            lease.release()
+
+    def _release_operation(self, server_id: str, operation_lock: Lock) -> None:
+        with self._locks_lock:
+            operation_lock.release()
+            if self._locks.get(server_id) is operation_lock:
+                self._locks.pop(server_id, None)
+
+    def _get_job_event(self, job_id: str) -> threading.Event:
+        with self._job_events_lock:
+            return self._job_events.setdefault(job_id, threading.Event())
+
+    def start_import(
+        self,
+        server: dict,
+        account_ids: list[str],
+        *,
+        operation_lock_held: bool = False,
+    ) -> dict:
         ids = [_clean(item) for item in account_ids if _clean(item)]
         if not ids:
             raise ValueError("account ids is required")
 
         server_id = _clean(server.get("id"))
+        operation_lease = None if operation_lock_held else self._acquire_operation(server_id)
         job = {
             "job_id": uuid.uuid4().hex,
             "status": "pending",
@@ -523,18 +584,24 @@ class Sub2APIImportService:
             "failed": 0,
             "errors": [],
         }
-        saved = self._config.set_import_job(server_id, job)
-        if saved is None:
-            raise ValueError("server not found")
-
-        thread = threading.Thread(
-            target=self._run_import,
-            args=(server_id, server, ids),
-            name=f"sub2api-import-{server_id}",
-            daemon=True,
-        )
-        thread.start()
-        return dict(saved.get("import_job") or job)
+        try:
+            saved = self._config.set_import_job(server_id, job)
+            if saved is None:
+                raise ValueError("server not found")
+            self._get_job_event(job["job_id"])
+            thread = threading.Thread(
+                target=self._run_import,
+                args=(server_id, server, ids, operation_lease),
+                name=f"sub2api-import-{server_id}",
+                daemon=True,
+            )
+            thread.start()
+            operation_lease = None
+            return copy.deepcopy(saved.get("import_job") or job)
+        except BaseException:
+            if operation_lease is not None:
+                operation_lease.release()
+            raise
 
     def _update_job(self, server_id: str, **updates) -> None:
         current = self._config.get_import_job(server_id)
@@ -542,6 +609,41 @@ class Sub2APIImportService:
             return
         next_job = {**current, **updates, "updated_at": _now_iso()}
         self._config.set_import_job(server_id, next_job)
+        if next_job.get("status") in {"completed", "failed"}:
+            with self._job_events_lock:
+                event = self._job_events.pop(next_job["job_id"], None)
+            if event is not None:
+                event.set()
+
+    def wait_for_job(
+        self,
+        server_id: str,
+        job_id: str,
+        *,
+        timeout: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict:
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        event = self._get_job_event(job_id)
+        while True:
+            job = self._config.get_import_job(server_id)
+            if job is None:
+                raise ValueError("server not found")
+            if job.get("job_id") != job_id:
+                raise ValueError("import job was replaced")
+            if job.get("status") in {"completed", "failed"}:
+                with self._job_events_lock:
+                    self._job_events.pop(job_id, None)
+                return job
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("import wait stopped")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for import job")
+            wait_for = 0.25
+            if deadline is not None:
+                wait_for = max(0.01, min(wait_for, deadline - time.monotonic()))
+            event.wait(wait_for)
+            event.clear()
 
     def _append_error(self, server_id: str, account_id: str, message: str) -> None:
         current = self._config.get_import_job(server_id)
@@ -549,51 +651,64 @@ class Sub2APIImportService:
             return
         errors = list(current.get("errors") or [])
         errors.append({"name": account_id, "error": message})
-        self._update_job(server_id, errors=errors, failed=len(errors))
-
-    def _run_import(self, server_id: str, server: dict, account_ids: list[str]) -> None:
-        self._update_job(server_id, status="running")
-
-        try:
-            tokens, errors = _fetch_access_tokens_for_accounts(server, account_ids)
-        except Exception as exc:
-            message = str(exc) or "unknown error"
-            for account_id in account_ids:
-                self._append_error(server_id, account_id, message)
-            tokens = []
-        else:
-            for error in errors:
-                self._append_error(server_id, _clean(error.get("name")), _clean(error.get("error")) or "unknown error")
-
-        current = self._config.get_import_job(server_id) or {}
         self._update_job(
             server_id,
-            completed=len(account_ids),
-            failed=len(current.get("errors") or []),
+            errors=errors[-MAX_IMPORT_ERRORS:],
+            failed=_nonnegative_int(current.get("failed")) + 1,
         )
 
-        if not tokens:
+    def _run_import(
+        self,
+        server_id: str,
+        server: dict,
+        account_ids: list[str],
+        operation_lease: _OperationLease | None,
+    ) -> None:
+        try:
+            self._update_job(server_id, status="running")
+            tokens, errors = _fetch_access_tokens_for_accounts(server, account_ids)
+            for error in errors:
+                self._append_error(server_id, _clean(error.get("name")), _clean(error.get("error")) or "unknown error")
+            current = self._config.get_import_job(server_id) or {}
+            self._update_job(
+                server_id,
+                completed=len(account_ids),
+                failed=_nonnegative_int(current.get("failed")),
+            )
+
+            if not tokens:
+                self._update_job(
+                    server_id,
+                    status="failed",
+                    completed=len(account_ids),
+                    failed=_nonnegative_int(current.get("failed")),
+                )
+                return
+
+            add_result = account_service.add_accounts(tokens, source_type="codex")
+            refresh_result = account_service.refresh_accounts(tokens, quiet=True, log_summary=True)
+            current = self._config.get_import_job(server_id) or {}
+            self._update_job(
+                server_id,
+                status="completed",
+                completed=len(account_ids),
+                added=_nonnegative_int(add_result.get("added")),
+                skipped=_nonnegative_int(add_result.get("skipped")),
+                refreshed=_nonnegative_int(refresh_result.get("refreshed")),
+                failed=_nonnegative_int(current.get("failed")),
+            )
+        except Exception as exc:
+            self._append_error(server_id, "job", str(exc) or "unknown error")
             current = self._config.get_import_job(server_id) or {}
             self._update_job(
                 server_id,
                 status="failed",
-                completed=int(current.get("total") or 0),
-                failed=len(current.get("errors") or []),
+                completed=_nonnegative_int(current.get("total")),
+                failed=max(1, _nonnegative_int(current.get("failed"))),
             )
-            return
-
-        add_result = account_service.add_accounts(tokens, source_type="codex")
-        refresh_result = account_service.refresh_accounts(tokens, quiet=True, log_summary=True)
-        current = self._config.get_import_job(server_id) or {}
-        self._update_job(
-            server_id,
-            status="completed",
-            completed=len(account_ids),
-            added=int(add_result.get("added") or 0),
-            skipped=int(add_result.get("skipped") or 0),
-            refreshed=int(refresh_result.get("refreshed") or 0),
-            failed=len(current.get("errors") or []),
-        )
+        finally:
+            if operation_lease is not None:
+                operation_lease.release()
 
 
 sub2api_config = Sub2APIConfig(SUB2API_CONFIG_FILE)

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from services.sub2api_service import (
-    Sub2APIConfig,
-    _fetch_access_tokens_for_accounts,
-)
+import services.sub2api_service as sub2api_service
+from services.sub2api_service import Sub2APIConfig, Sub2APIImportService, _fetch_access_tokens_for_accounts
 
 
 def make_server(server_id: str = "server-1") -> dict[str, str]:
@@ -62,7 +61,7 @@ class _FakeSession:
 
 class Sub2APIConfigTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.temp_path = Path(self.temp_dir.name)
 
     def tearDown(self) -> None:
@@ -142,6 +141,80 @@ class Sub2APITokenExportTests(unittest.TestCase):
         self.assertEqual([len(batch) for batch in calls], [100, 25])
         self.assertEqual(tokens, [f"token-{account_id}" for account_id in ids])
         self.assertEqual(errors, [])
+
+
+class Sub2APIImportServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.config = Sub2APIConfig(Path(self.temp_dir.name) / "sub2api.json")
+        self.server = self.config.add_server(
+            name="test",
+            base_url="https://sub2api.example.test",
+            email="",
+            password="",
+            api_key="test-api-key",
+            group_id="",
+        )
+        self.import_service = Sub2APIImportService(self.config)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_second_import_for_same_server_is_rejected_while_first_runs(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def fetch(_server, _ids):
+            started.set()
+            release.wait(timeout=2)
+            return ["token-1"], []
+
+        with (
+            mock.patch("services.sub2api_service._fetch_access_tokens_for_accounts", side_effect=fetch),
+            mock.patch("services.sub2api_service.account_service") as account_service_mock,
+        ):
+            account_service_mock.add_accounts.return_value = {"added": 1, "skipped": 0}
+            account_service_mock.refresh_accounts.return_value = {"refreshed": 1}
+            first = self.import_service.start_import(self.server, ["remote-1"])
+            self.assertTrue(started.wait(timeout=1))
+            busy_error = getattr(sub2api_service, "Sub2APISyncBusyError", RuntimeError)
+            with self.assertRaises(busy_error):
+                self.import_service.start_import(self.server, ["remote-2"])
+            release.set()
+            job = self.import_service.wait_for_job(
+                self.server["id"], first["job_id"], timeout=2,
+            )
+
+        self.assertEqual(job["status"], "completed")
+
+    def test_import_exception_marks_job_failed_and_releases_lock(self):
+        with mock.patch(
+            "services.sub2api_service._fetch_access_tokens_for_accounts",
+            side_effect=RuntimeError("export unavailable"),
+        ):
+            first = self.import_service.start_import(self.server, ["remote-1"])
+            job = self.import_service.wait_for_job(
+                self.server["id"], first["job_id"], timeout=2,
+            )
+
+        self.assertEqual(job["status"], "failed")
+        second = self.import_service.start_import(self.server, ["remote-2"])
+        self.assertIsNotNone(second)
+
+    def test_import_error_list_is_bounded_but_failed_count_is_preserved(self):
+        errors = [{"name": str(index), "error": "missing access_token"} for index in range(100)]
+        with mock.patch(
+            "services.sub2api_service._fetch_access_tokens_for_accounts",
+            return_value=([], errors),
+        ):
+            job = self.import_service.start_import(self.server, [str(index) for index in range(100)])
+            result = self.import_service.wait_for_job(
+                self.server["id"], job["job_id"], timeout=2,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failed"], 100)
+        self.assertLessEqual(len(result["errors"]), 50)
 
 
 if __name__ == "__main__":
