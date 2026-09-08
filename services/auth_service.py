@@ -56,6 +56,7 @@ class AuthService:
             "role": role,
             "key_hash": key_hash,
             "enabled": bool(raw.get("enabled", True)),
+            "web_login_enabled": bool(raw.get("web_login_enabled", True)),
             "created_at": created_at,
             "last_used_at": last_used_at,
         }
@@ -77,7 +78,7 @@ class AuthService:
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
-        return {
+        public = {
             "id": item.get("id"),
             "name": item.get("name"),
             "role": item.get("role"),
@@ -85,6 +86,9 @@ class AuthService:
             "created_at": item.get("created_at"),
             "last_used_at": item.get("last_used_at"),
         }
+        if item.get("role") == "user":
+            public["web_login_enabled"] = bool(item.get("web_login_enabled", True))
+        return public
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
         with self._lock:
@@ -164,6 +168,7 @@ class AuthService:
                 "role": role,
                 "key_hash": key_hash,
                 "enabled": True,
+                "web_login_enabled": True,
                 "created_at": _now_iso(),
                 "last_used_at": None,
             }
@@ -198,6 +203,8 @@ class AuthService:
                     )
                 if "enabled" in updates and updates.get("enabled") is not None:
                     next_item["enabled"] = bool(updates.get("enabled"))
+                if next_role == "user" and "web_login_enabled" in updates and updates.get("web_login_enabled") is not None:
+                    next_item["web_login_enabled"] = bool(updates.get("web_login_enabled"))
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
                 self._items[index] = next_item
@@ -222,7 +229,7 @@ class AuthService:
             self._save()
             return True
 
-    def authenticate(self, raw_key: str) -> dict[str, object] | None:
+    def _authenticate(self, raw_key: str, *, require_web_login: bool = False) -> dict[str, object] | None:
         candidate = self._clean(raw_key)
         if not candidate:
             return None
@@ -234,6 +241,8 @@ class AuthService:
                 stored_hash = self._clean(item.get("key_hash"))
                 if not stored_hash or not hmac.compare_digest(stored_hash, candidate_hash):
                     continue
+                if require_web_login and item.get("role") == "user" and not bool(item.get("web_login_enabled", True)):
+                    return None
                 next_item = dict(item)
                 now = datetime.now(timezone.utc)
                 next_item["last_used_at"] = now.isoformat()
@@ -248,6 +257,12 @@ class AuthService:
                         pass
                 return self._public_item(next_item)
         return None
+
+    def authenticate(self, raw_key: str) -> dict[str, object] | None:
+        return self._authenticate(raw_key)
+
+    def authenticate_web_login(self, raw_key: str) -> dict[str, object] | None:
+        return self._authenticate(raw_key, require_web_login=True)
 
 
 auth_service = AuthService(config.get_storage_backend())
