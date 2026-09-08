@@ -27,7 +27,9 @@ from services.account_service import account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.quota_service import QuotaKeyNotFoundError, QuotaLimitError, quota_service
+from services.sub2api_auto_sync_service import sub2api_auto_sync_service
 from services.sub2api_service import (
+    Sub2APISyncBusyError,
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
     sub2api_config,
@@ -99,6 +101,7 @@ class Sub2APIServerCreateRequest(BaseModel):
     password: str = ""
     api_key: str = ""
     group_id: str = ""
+    auto_sync_interval_minutes: int = Field(default=0, ge=0)
 
 
 class Sub2APIServerUpdateRequest(BaseModel):
@@ -108,6 +111,7 @@ class Sub2APIServerUpdateRequest(BaseModel):
     password: str | None = None
     api_key: str | None = None
     group_id: str | None = None
+    auto_sync_interval_minutes: int | None = Field(default=None, ge=0)
 
 
 class Sub2APIImportRequest(BaseModel):
@@ -537,15 +541,26 @@ def create_router() -> APIRouter:
             password=body.password,
             api_key=body.api_key,
             group_id=body.group_id,
+            auto_sync_interval_minutes=body.auto_sync_interval_minutes,
         )
+        if body.auto_sync_interval_minutes > 0:
+            sub2api_auto_sync_service.notify_server_changed(server["id"], immediate=True)
         return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
 
     @router.post("/api/sub2api/servers/{server_id}")
     async def update_sub2api_server(server_id: str, body: Sub2APIServerUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.update_server(server_id, body.model_dump(exclude_none=True))
+        updates = body.model_dump(exclude_none=True)
+        sync_fields = {"base_url", "email", "password", "api_key", "group_id", "auto_sync_interval_minutes"}
+        sync_changed = bool(sync_fields.intersection(updates))
+        server = sub2api_config.update_server(server_id, updates)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
+        if sync_changed:
+            sub2api_auto_sync_service.notify_server_changed(
+                server_id,
+                immediate=int(server.get("auto_sync_interval_minutes") or 0) > 0,
+            )
         return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
 
     @router.delete("/api/sub2api/servers/{server_id}")
@@ -553,6 +568,7 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         if not sub2api_config.delete_server(server_id):
             raise HTTPException(status_code=404, detail={"error": "server not found"})
+        sub2api_auto_sync_service.server_deleted(server_id)
         return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
 
     @router.get("/api/sub2api/servers/{server_id}/groups")
@@ -587,6 +603,11 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
             job = sub2api_import_service.start_import(server, body.account_ids)
+        except Sub2APISyncBusyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": str(exc), "code": Sub2APISyncBusyError.code},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {"import_job": job}

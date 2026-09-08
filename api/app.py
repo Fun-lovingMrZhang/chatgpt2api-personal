@@ -18,6 +18,7 @@ from services.image_service import start_image_cleanup_scheduler
 from services.log_service import log_service
 from services.quota_service import quota_service
 from services.scheduler.service import scheduler_service
+from services.sub2api_auto_sync_service import sub2api_auto_sync_service
 
 
 def create_app() -> FastAPI:
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
         quota_watchdog = quota_service.start_watchdog(stop_event)
         await scheduler_service.start()
         await image_tasks.image_task_service.start()
+        sub2api_auto_sync_service.start(stop_event)
         log_cleanup_thread = log_service.start_retention_scheduler(
             stop_event,
             lambda: config.log_retention_days,
@@ -45,6 +47,7 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            sub2api_auto_sync_service.stop(timeout=2)
             await scheduler_service.stop()
             quota_watchdog.join(timeout=1)
             log_cleanup_thread.join(timeout=1)
