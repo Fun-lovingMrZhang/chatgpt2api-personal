@@ -94,6 +94,7 @@ export function Sub2APIConnections() {
   const [formPassword, setFormPassword] = useState("");
   const [formApiKey, setFormApiKey] = useState("");
   const [formGroupId, setFormGroupId] = useState("");
+  const [formAutoSyncInterval, setFormAutoSyncInterval] = useState("0");
   const [authMode, setAuthMode] = useState<AuthMode>("password");
   const [showSecret, setShowSecret] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -135,7 +136,10 @@ export function Sub2APIConnections() {
 
   useEffect(() => {
     const hasRunningJobs = servers.some(
-      (server) => server.import_job?.status === "pending" || server.import_job?.status === "running",
+      (server) =>
+        server.import_job?.status === "pending" ||
+        server.import_job?.status === "running" ||
+        server.auto_sync?.status === "running",
     );
     if (!hasRunningJobs) {
       if (pollTimerRef.current !== null) {
@@ -175,6 +179,7 @@ export function Sub2APIConnections() {
     setFormPassword("");
     setFormApiKey("");
     setFormGroupId("");
+    setFormAutoSyncInterval("0");
     setAuthMode("password");
     setShowSecret(false);
     setRemoteGroups(null);
@@ -189,6 +194,7 @@ export function Sub2APIConnections() {
     setFormPassword("");
     setFormApiKey("");
     setFormGroupId(server.group_id || "");
+    setFormAutoSyncInterval(String(server.auto_sync_interval_minutes ?? 0));
     setAuthMode(server.has_api_key ? "api_key" : "password");
     setShowSecret(false);
     setRemoteGroups(null);
@@ -221,6 +227,12 @@ export function Sub2APIConnections() {
       toast.error("请输入 Sub2API 地址");
       return;
     }
+    const intervalText = formAutoSyncInterval.trim();
+    const autoSyncInterval = Number(intervalText);
+    if (!/^\d+$/.test(intervalText) || !Number.isSafeInteger(autoSyncInterval) || autoSyncInterval < 0) {
+      toast.error("自动同步间隔必须是大于等于 0 的整数");
+      return;
+    }
     if (authMode === "password") {
       if (!formEmail.trim()) {
         toast.error("请输入管理员邮箱");
@@ -242,6 +254,7 @@ export function Sub2APIConnections() {
           name: formName.trim(),
           base_url: formBaseUrl.trim(),
           group_id: formGroupId.trim(),
+          auto_sync_interval_minutes: autoSyncInterval,
         };
         if (authMode === "password") {
           updates.email = formEmail.trim();
@@ -267,6 +280,7 @@ export function Sub2APIConnections() {
           password: authMode === "password" ? formPassword.trim() : "",
           api_key: authMode === "api_key" ? formApiKey.trim() : "",
           group_id: formGroupId.trim(),
+          auto_sync_interval_minutes: autoSyncInterval,
         });
         setServers(data.servers);
         toast.success("连接已添加");
@@ -425,6 +439,17 @@ export function Sub2APIConnections() {
               {servers.map((server) => {
                 const isBusy = deletingId === server.id || loadingAccountsId === server.id;
                 const importJob = server.import_job ?? null;
+                const autoSync = server.auto_sync;
+                const isAutoSyncRunning = autoSync?.status === "running";
+                const autoSyncLabel = isAutoSyncRunning
+                  ? "自动同步中"
+                  : autoSync?.status === "failed"
+                    ? "自动同步失败"
+                    : autoSync?.status === "completed"
+                      ? "自动同步正常"
+                      : server.auto_sync_interval_minutes > 0
+                        ? "自动同步待执行"
+                        : "自动同步关闭";
                 return (
                   <div
                     key={server.id}
@@ -480,6 +505,38 @@ export function Sub2APIConnections() {
                         同步
                       </Button>
                     </div>
+
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-stone-500">
+                      <Badge
+                        variant={
+                          isAutoSyncRunning
+                            ? "info"
+                            : autoSync?.status === "failed"
+                              ? "danger"
+                              : autoSync?.status === "completed"
+                                ? "success"
+                                : "secondary"
+                        }
+                        className="rounded-md"
+                      >
+                        {autoSyncLabel}
+                      </Badge>
+                      <span>
+                        {server.auto_sync_interval_minutes > 0
+                          ? `每 ${server.auto_sync_interval_minutes} 分钟`
+                          : "未设置间隔"}
+                      </span>
+                      {autoSync ? <span>远端 {autoSync.last_remote_count} 个账号</span> : null}
+                      {autoSync?.next_run_at ? <span>下次 {autoSync.next_run_at}</span> : null}
+                      {autoSync?.last_import_failed ? (
+                        <span className="text-rose-600">最近失败 {autoSync.last_import_failed}</span>
+                      ) : null}
+                    </div>
+                    {autoSync?.last_error ? (
+                      <p className="truncate text-xs text-rose-600" title={autoSync.last_error}>
+                        最近错误：{autoSync.last_error}
+                      </p>
+                    ) : null}
 
                     {importJob ? (
                       <div className="space-y-2 rounded-xl bg-stone-50 px-3 py-3">
@@ -705,6 +762,21 @@ export function Sub2APIConnections() {
                   添加完连接后可在编辑对话框里点「拉取分组」选择具体分组。
                 </div>
               )}
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">自动同步间隔（分钟）</label>
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                value={formAutoSyncInterval}
+                onChange={(event) => setFormAutoSyncInterval(event.target.value)}
+                placeholder="0 表示关闭"
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">
+                设为 0 关闭。启用或修改连接后会立即同步一次，之后按此间隔自动导入全部 OpenAI OAuth 账号。
+              </p>
             </div>
           </div>
           <DialogFooter className="pt-2">

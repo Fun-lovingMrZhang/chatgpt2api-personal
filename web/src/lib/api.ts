@@ -802,6 +802,18 @@ export async function fetchCPAPoolImportJob(poolId: string) {
 
 // ── Sub2API ────────────────────────────────────────────────────────
 
+export type Sub2APIAutoSync = {
+  status: "disabled" | "idle" | "running" | "completed" | "failed";
+  last_started_at: string | null;
+  last_finished_at: string | null;
+  last_success_at: string | null;
+  next_run_at: string | null;
+  last_error: string;
+  last_remote_count: number;
+  last_import_job_id: string;
+  last_import_failed: number;
+};
+
 export type Sub2APIServer = {
   id: string;
   name: string;
@@ -809,6 +821,8 @@ export type Sub2APIServer = {
   email: string;
   has_api_key: boolean;
   group_id: string;
+  auto_sync_interval_minutes: number;
+  auto_sync: Sub2APIAutoSync;
   import_job?: CPAImportJob | null;
 };
 
@@ -843,6 +857,7 @@ export async function createSub2APIServer(server: {
   password: string;
   api_key: string;
   group_id: string;
+  auto_sync_interval_minutes: number;
 }) {
   return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>("/api/sub2api/servers", {
     method: "POST",
@@ -859,6 +874,7 @@ export async function updateSub2APIServer(
     password?: string;
     api_key?: string;
     group_id?: string;
+    auto_sync_interval_minutes?: number;
   },
 ) {
   return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>(`/api/sub2api/servers/${serverId}`, {
