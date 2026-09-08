@@ -323,6 +323,7 @@ export type UserKey = {
   name: string;
   role: "user";
   enabled: boolean;
+  web_login_enabled: boolean;
   created_at: string | null;
   last_used_at: string | null;
   text_limit: number;
@@ -712,6 +713,7 @@ export async function updateUserKey(
   keyId: string,
   updates: {
     enabled?: boolean;
+    web_login_enabled?: boolean;
     name?: string;
     key?: string;
     text_limit?: number;

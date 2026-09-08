@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -87,6 +88,7 @@ export function UserKeysCard() {
   const [createImageLimit, setCreateImageLimit] = useState("0");
   const [editTextLimit, setEditTextLimit] = useState("0");
   const [editImageLimit, setEditImageLimit] = useState("0");
+  const [editWebLoginEnabled, setEditWebLoginEnabled] = useState(true);
 
   const load = async (silent = false) => {
     if (!silent) {
@@ -222,6 +224,7 @@ export function UserKeysCard() {
     setEditKey("");
     setEditTextLimit(String(item.text_limit ?? 0));
     setEditImageLimit(String(item.image_limit ?? 0));
+    setEditWebLoginEnabled(item.web_login_enabled);
   };
 
   const handleEdit = async () => {
@@ -238,7 +241,8 @@ export function UserKeysCard() {
       return;
     }
     const limitsChanged = textLimit !== item.text_limit || imageLimit !== item.image_limit;
-    if (trimmedName === item.name && !trimmedKey && !limitsChanged) {
+    const webLoginChanged = editWebLoginEnabled !== item.web_login_enabled;
+    if (trimmedName === item.name && !trimmedKey && !limitsChanged && !webLoginChanged) {
       setEditingItem(null);
       return;
     }
@@ -248,11 +252,20 @@ export function UserKeysCard() {
         ...(trimmedName !== item.name ? { name: trimmedName } : {}),
         ...(trimmedKey ? { key: trimmedKey } : {}),
         ...(limitsChanged ? { text_limit: textLimit, image_limit: imageLimit } : {}),
+        ...(webLoginChanged ? { web_login_enabled: editWebLoginEnabled } : {}),
       });
       setItems(data.items);
       setEditingItem(null);
       setEditKey("");
-      toast.success(limitsChanged ? "用户密钥与额度已更新" : trimmedKey ? "用户密钥已更新" : "用户名称已更新");
+      toast.success(
+        webLoginChanged
+          ? "用户密钥与 Web 登录权限已更新"
+          : limitsChanged
+            ? "用户密钥与额度已更新"
+            : trimmedKey
+              ? "用户密钥已更新"
+              : "用户名称已更新",
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
     } finally {
@@ -280,7 +293,7 @@ export function UserKeysCard() {
               </div>
               <div>
                 <h2 className="text-lg font-semibold tracking-tight">用户密钥管理</h2>
-                <p className="text-sm text-stone-500">为普通用户创建专用密钥；普通用户只能进入画图页，不能查看设置和号池。</p>
+                <p className="text-sm text-stone-500">为普通用户创建专用密钥；可分别控制 API 使用状态和 Web 登录权限。</p>
               </div>
             </div>
             <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={() => setIsDialogOpen(true)}>
@@ -326,6 +339,9 @@ export function UserKeysCard() {
                         <div className="truncate text-sm font-medium text-stone-800">{item.name}</div>
                         <Badge variant={item.enabled ? "success" : "secondary"} className="rounded-md">
                           {item.enabled ? "已启用" : "已禁用"}
+                        </Badge>
+                        <Badge variant={item.web_login_enabled ? "info" : "secondary"} className="rounded-md">
+                          {item.web_login_enabled ? "允许 Web 登录" : "禁止 Web 登录"}
                         </Badge>
                       </div>
                       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-500">
@@ -567,6 +583,23 @@ export function UserKeysCard() {
                   onChange={(event) => setEditImageLimit(event.target.value)}
                   className="h-11 rounded-xl border-stone-200 bg-white"
                 />
+              </div>
+            </div>
+            <div className="flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3">
+              <Checkbox
+                id="edit-web-login-enabled"
+                checked={editWebLoginEnabled}
+                onCheckedChange={(checked) => setEditWebLoginEnabled(checked === true)}
+                disabled={editingItem ? pendingIds.has(editingItem.id) : false}
+                className="mt-0.5"
+              />
+              <div className="space-y-1">
+                <label htmlFor="edit-web-login-enabled" className="text-sm font-medium text-stone-700">
+                  允许 Web 登录
+                </label>
+                <p className="text-xs leading-5 text-stone-500">
+                  关闭后该密钥仍可调用 API，但不能用于登录 Web。
+                </p>
               </div>
             </div>
           </div>
