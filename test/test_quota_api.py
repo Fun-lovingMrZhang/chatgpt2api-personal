@@ -27,6 +27,7 @@ class FakeAuthService:
             "name": name or "普通用户",
             "role": role,
             "enabled": True,
+            "web_login_enabled": True,
             "created_at": "2026-09-08T00:00:00+00:00",
             "last_used_at": None,
         }
@@ -38,7 +39,7 @@ class FakeAuthService:
         for item in self.items:
             if item["id"] != key_id or (role is not None and item["role"] != role):
                 continue
-            item.update({key: value for key, value in updates.items() if key in {"name", "enabled"}})
+            item.update({key: value for key, value in updates.items() if key in {"name", "enabled", "web_login_enabled"}})
             return dict(item)
         return None
 
@@ -145,6 +146,24 @@ class QuotaApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["item"]["text_limit"], 10)
         self.assertEqual(response.json()["item"]["image_limit"], 4)
+
+    def test_update_user_key_changes_web_login_permission(self):
+        created = self.client.post(
+            "/api/auth/users",
+            headers=AUTH_HEADERS,
+            json={"name": "Web 登录测试"},
+        ).json()["item"]
+        self.assertTrue(created["web_login_enabled"])
+
+        response = self.client.post(
+            f"/api/auth/users/{created['id']}",
+            headers=AUTH_HEADERS,
+            json={"web_login_enabled": False},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["item"]["web_login_enabled"])
+        self.assertFalse(response.json()["items"][0]["web_login_enabled"])
 
     def test_list_and_update_return_remaining_and_reject_low_limit(self):
         created = self.client.post(

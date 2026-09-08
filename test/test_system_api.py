@@ -67,6 +67,18 @@ class SystemLogApiTests(unittest.TestCase):
         app.include_router(system_module.create_router("test-version"))
         self.client = TestClient(app)
 
+    def test_login_uses_web_identity_check(self) -> None:
+        identity = {"id": "user-1", "name": "普通用户", "role": "user"}
+        with (
+            mock.patch.object(system_module, "require_web_identity", return_value=identity) as web_check,
+            mock.patch.object(system_module, "require_identity", side_effect=AssertionError("login used API identity check")),
+        ):
+            response = self.client.post("/auth/login", headers={"Authorization": "Bearer user-key"})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["role"], "user")
+        web_check.assert_called_once_with("Bearer user-key")
+
     def test_get_logs_uses_server_pagination_and_threadpool(self) -> None:
         response = self.client.get(
             "/api/logs?type=call&start_date=2026-09-01&end_date=2026-09-07&page=2&page_size=5",
