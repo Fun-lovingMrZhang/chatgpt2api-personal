@@ -56,6 +56,7 @@ class FakeQuotaService:
     def __init__(self):
         self.quotas = {}
         self.deleted = []
+        self.fail_on_set_limits = False
 
     def ensure_key(self, key_id):
         self.quotas.setdefault(key_id, self._empty(key_id))
@@ -87,6 +88,8 @@ class FakeQuotaService:
         return quota
 
     def set_limits(self, key_id, *, text_limit=None, image_limit=None):
+        if self.fail_on_set_limits:
+            raise RuntimeError("quota store unavailable")
         self.ensure_key(key_id)
         quota = self.quotas[key_id]
         next_text = quota["text_limit"] if text_limit is None else text_limit
@@ -176,6 +179,28 @@ class QuotaApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.quota_service.deleted, [created["id"]])
         self.assertIsNotNone(self.quota_service.get_quota(created["id"]))
+
+    def test_update_unknown_key_does_not_create_orphan_quota(self):
+        response = self.client.post(
+            "/api/auth/users/missing-user",
+            headers=AUTH_HEADERS,
+            json={"text_limit": 10},
+        )
+
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertNotIn("missing-user", self.quota_service.quotas)
+
+    def test_create_rolls_back_auth_key_when_quota_initialization_fails(self):
+        self.quota_service.fail_on_set_limits = True
+
+        response = self.client.post(
+            "/api/auth/users",
+            headers=AUTH_HEADERS,
+            json={"name": "初始化失败"},
+        )
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(self.auth_service.items, [])
 
 
 if __name__ == "__main__":

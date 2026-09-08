@@ -193,6 +193,10 @@ def create_router() -> APIRouter:
                 image_limit=body.image_limit,
             )
         except Exception as exc:
+            try:
+                auth_service.delete_key(str(item.get("id") or ""), role="user")
+            except Exception:
+                pass
             raise HTTPException(status_code=500, detail={"error": "failed to initialize user key quota"}) from exc
         item = {**item, **{key: value for key, value in quota.items() if key != "key_id"}}
         return {"item": item, "key": raw_key, "items": _list_user_keys_with_quota()}
@@ -217,6 +221,13 @@ def create_router() -> APIRouter:
         if not auth_updates and not has_quota_updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
 
+        existing_item = next(
+            (candidate for candidate in auth_service.list_keys(role="user") if candidate.get("id") == key_id),
+            None,
+        )
+        if existing_item is None:
+            raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
+
         quota: dict[str, object] | None = None
         if has_quota_updates:
             try:
@@ -239,12 +250,7 @@ def create_router() -> APIRouter:
         if auth_updates and item is None:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
         if item is None:
-            item = next(
-                (candidate for candidate in auth_service.list_keys(role="user") if candidate.get("id") == key_id),
-                None,
-            )
-        if item is None:
-            raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
+            item = existing_item
         if quota is None:
             item = _merge_user_key_quota(item)
         else:
