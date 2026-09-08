@@ -198,6 +198,45 @@ class TokenLogTests(unittest.TestCase):
 
 
 class AuthServiceTests(unittest.TestCase):
+    def test_legacy_user_keys_default_to_web_login_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage = JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json")
+            service = AuthService(storage)
+            _item, raw_key = service.create_key(role="user", name="Legacy")
+
+            records = storage.load_auth_keys()
+            records[0].pop("web_login_enabled", None)
+            storage.save_auth_keys(records)
+
+            reloaded = AuthService(storage)
+
+            listed = reloaded.list_keys(role="user")
+            self.assertTrue(listed[0]["web_login_enabled"])
+            self.assertIsNotNone(reloaded.authenticate_web_login(raw_key))
+
+    def test_web_login_permission_does_not_disable_api_authentication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            item, raw_key = service.create_key(role="user", name="Alice")
+
+            updated = service.update_key(item["id"], {"web_login_enabled": False}, role="user")
+
+            self.assertIsNotNone(updated)
+            self.assertFalse(updated["web_login_enabled"])
+            self.assertIsNone(service.authenticate_web_login(raw_key))
+            self.assertIsNotNone(service.authenticate(raw_key))
+
+    def test_admin_authentication_ignores_web_login_permission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            item, raw_key = service.create_key(role="admin", name="Admin")
+
+            updated = service.update_key(item["id"], {"web_login_enabled": False}, role="admin")
+
+            self.assertIsNotNone(updated)
+            self.assertNotIn("web_login_enabled", updated)
+            self.assertIsNotNone(service.authenticate_web_login(raw_key))
+
     def test_create_authenticate_disable_and_delete_user_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
