@@ -164,6 +164,21 @@ class Sub2APIAutoSyncTests(unittest.TestCase):
         self.assertIn("interrupted", state["last_error"])
         self.assertIsNotNone(state["next_run_at"])
 
+    def test_stop_sets_stop_event_and_terminates_coordinator(self):
+        self.config.set_auto_sync_state(
+            self.server["id"],
+            next_run_at="2999-01-01T00:00:00+00:00",
+        )
+        stop_event = threading.Event()
+
+        self.service.start(stop_event)
+        coordinator = self.service._coordinator_thread
+        self.assertIsNotNone(coordinator)
+        self.service.stop(timeout=1)
+
+        self.assertTrue(stop_event.is_set())
+        self.assertFalse(coordinator.is_alive())
+
     def test_running_sync_preserves_new_immediate_deadline(self):
         listed = threading.Event()
         release = threading.Event()

@@ -58,6 +58,7 @@ class Sub2APIAutoSyncService:
             if self._coordinator_thread is not None and self._coordinator_thread.is_alive():
                 return
             self._stop_event = stop_event
+            self._wake_event.clear()
             self._recover_interrupted_runs(time.time())
             self._executor = ThreadPoolExecutor(
                 max_workers=self._max_workers,
@@ -74,6 +75,8 @@ class Sub2APIAutoSyncService:
         with self._lifecycle_lock:
             thread = self._coordinator_thread
             executor = self._executor
+            if self._stop_event is not None:
+                self._stop_event.set()
             self._wake_event.set()
         if thread is not None:
             thread.join(timeout=timeout)
