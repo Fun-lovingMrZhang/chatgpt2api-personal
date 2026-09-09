@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -31,6 +32,8 @@ TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 QUOTA_RESERVATION_GRACE_SECONDS = 5 * 60
+IMAGE_TASK_MAX_ROWS = 10000
+SPOOLED_INPUT_PATH_KEY = "_image_task_spool_path"
 
 
 def _now_iso() -> str:
@@ -38,6 +41,8 @@ def _now_iso() -> str:
 
 
 def _timestamp(value: object) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
     if not isinstance(value, str) or not value.strip():
         return 0.0
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
@@ -148,6 +153,7 @@ class ImageTaskService:
         state_store: Any | None = None,
         task_writer: Any | None = None,
         quota_service_instance: Any | None = None,
+        spool_dir: Path | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
@@ -157,6 +163,7 @@ class ImageTaskService:
         self.state_store = state_store
         self.task_writer = task_writer or getattr(scheduler_service_instance, "task_writer", None)
         self.quota_service = quota_service_instance or quota_service
+        self.spool_dir = spool_dir or path.parent / ".image_task_spool"
         self._fallback_executor = ThreadPoolExecutor(
             max_workers=max(1, int(config.get_scheduler_settings().lanes[Lane.IMAGE_GENERATION].worker_count)),
             thread_name_prefix="image-task-fallback",
@@ -165,6 +172,7 @@ class ImageTaskService:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._admission_tasks: dict[str, asyncio.Task[Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._cleanup_spool_dir()
         with self._lock:
             self._tasks = self._load_state_store_locked() if self.state_store is not None else self._load_locked()
             changed = self._recover_unfinished_locked()
@@ -185,93 +193,94 @@ class ImageTaskService:
                 )
             }
             tasks: dict[str, dict[str, Any]] = {}
-            for record in self.state_store.list_tasks(task_types=("generate", "edit")):
-                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-                task_id = _clean(record.get("task_id"))
-                owner = _clean(record.get("owner_id"))
-                if not task_id or not owner:
-                    continue
-                task_key = _task_key(owner, task_id)
-                status = _clean(record.get("status"), TASK_STATUS_ERROR)
-                remote_task_id = _clean(record.get("remote_task_id"))
-                persisted_result = record.get("result")
-                persisted_urls = (
-                    persisted_result.get("urls")
-                    if isinstance(persisted_result, dict)
-                    else None
-                )
-                if not isinstance(persisted_urls, list) and isinstance(persisted_result, dict):
-                    persisted_urls = persisted_result.get("data")
-                restored_urls = [
-                    str(url)
-                    for url in (persisted_urls if isinstance(persisted_urls, list) else [])
-                    if isinstance(url, str) and is_safe_to_log_url(url)
-                ]
-                result_available = bool(
-                    isinstance(persisted_result, dict)
-                    and persisted_result.get("available")
-                    and restored_urls
-                )
-                recoverable_record = recoverable.get(task_key)
-                resume_on_start = bool(
-                    recoverable_record
-                    and remote_task_id
-                    and status in UNFINISHED_STATUSES
-                )
-                if status == "unknown":
-                    status = TASK_STATUS_ERROR
-                if status in UNFINISHED_STATUSES and not remote_task_id:
-                    status = TASK_STATUS_ERROR
-                if status == TASK_STATUS_SUCCESS and not result_available:
-                    status = TASK_STATUS_ERROR
-                task = {
-                    "id": task_id,
-                    "owner_id": owner,
-                    "status": status,
-                    "mode": "edit" if record.get("mode") == "edit" else "generate",
-                    "model": _clean(record.get("model"), "gpt-image-2"),
-                    "size": _clean(metadata.get("size")),
-                    "quality": _clean(metadata.get("quality"), "auto"),
-                    "created_at": _clean(metadata.get("created_at"), _now_iso()),
-                    "updated_at": _now_iso(),
-                    "updated_ts": record.get("updated_at"),
-                }
-                quota_reservation_id = _clean(metadata.get("quota_reservation_id"))
-                if quota_reservation_id:
-                    task["quota_reservation_id"] = quota_reservation_id
-                    try:
-                        task["quota_requested_units"] = max(1, int(metadata.get("quota_requested_units") or 1))
-                    except (TypeError, ValueError, OverflowError):
-                        task["quota_requested_units"] = 1
-                    quota_status = _clean(metadata.get("quota_status"))
-                    task["quota_status"] = quota_status or (
-                        "committed" if status == TASK_STATUS_SUCCESS else "reserved"
-                    )
-                    try:
-                        task["quota_committed_units"] = max(0, int(metadata.get("quota_committed_units") or 0))
-                    except (TypeError, ValueError, OverflowError):
-                        task["quota_committed_units"] = 0
-                account_ref = _clean(metadata.get("account_ref"))
-                if account_ref:
-                    task["account_ref"] = account_ref
-                if remote_task_id:
-                    task["conversation_id"] = remote_task_id
-                if result_available:
-                    task["data"] = [{"url": url} for url in restored_urls]
-                if record.get("error"):
-                    task["error"] = _clean(record.get("error"))
-                if status == TASK_STATUS_ERROR and not task.get("error"):
-                    task["error"] = (
-                        "服务已重启，未完成的图片任务提交结果未知"
-                        if not remote_task_id
-                        else "服务重启后任务结果不可恢复"
-                    )
-                if resume_on_start:
-                    task["_resume_on_start"] = True
-                tasks[task_key] = task
+            for record in recoverable.values():
+                converted = self._task_from_state_record(record, recoverable=True)
+                if converted is not None:
+                    task_key, task = converted
+                    tasks[task_key] = task
             return tasks
         except Exception:
             return self._load_locked()
+
+    def _task_from_state_record(
+        self,
+        record: dict[str, object],
+        *,
+        recoverable: bool = False,
+    ) -> tuple[str, dict[str, Any]] | None:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        task_id = _clean(record.get("task_id"))
+        owner = _clean(record.get("owner_id"))
+        if not task_id or not owner:
+            return None
+        task_key = _task_key(owner, task_id)
+        status = _clean(record.get("status"), TASK_STATUS_ERROR)
+        remote_task_id = _clean(record.get("remote_task_id"))
+        persisted_result = record.get("result")
+        persisted_urls = persisted_result.get("urls") if isinstance(persisted_result, dict) else None
+        if not isinstance(persisted_urls, list) and isinstance(persisted_result, dict):
+            persisted_urls = persisted_result.get("data")
+        restored_urls = [
+            str(url)
+            for url in (persisted_urls if isinstance(persisted_urls, list) else [])
+            if isinstance(url, str) and is_safe_to_log_url(url)
+        ]
+        result_available = bool(
+            isinstance(persisted_result, dict)
+            and persisted_result.get("available")
+            and restored_urls
+        )
+        resume_on_start = bool(recoverable and remote_task_id and status in UNFINISHED_STATUSES)
+        if status == "unknown":
+            status = TASK_STATUS_ERROR
+        if status in UNFINISHED_STATUSES and not remote_task_id:
+            status = TASK_STATUS_ERROR
+        if status == TASK_STATUS_SUCCESS and not result_available:
+            status = TASK_STATUS_ERROR
+        task = {
+            "id": task_id,
+            "owner_id": owner,
+            "status": status,
+            "mode": "edit" if record.get("mode") == "edit" else "generate",
+            "model": _clean(record.get("model"), "gpt-image-2"),
+            "size": _clean(metadata.get("size")),
+            "quality": _clean(metadata.get("quality"), "auto"),
+            "created_at": _clean(metadata.get("created_at"), _now_iso()),
+            "updated_at": _now_iso(),
+            "created_ts": record.get("created_at"),
+            "updated_ts": record.get("updated_at"),
+        }
+        quota_reservation_id = _clean(metadata.get("quota_reservation_id"))
+        if quota_reservation_id:
+            task["quota_reservation_id"] = quota_reservation_id
+            try:
+                task["quota_requested_units"] = max(1, int(metadata.get("quota_requested_units") or 1))
+            except (TypeError, ValueError, OverflowError):
+                task["quota_requested_units"] = 1
+            quota_status = _clean(metadata.get("quota_status"))
+            task["quota_status"] = quota_status or ("committed" if status == TASK_STATUS_SUCCESS else "reserved")
+            try:
+                task["quota_committed_units"] = max(0, int(metadata.get("quota_committed_units") or 0))
+            except (TypeError, ValueError, OverflowError):
+                task["quota_committed_units"] = 0
+        account_ref = _clean(metadata.get("account_ref"))
+        if account_ref:
+            task["account_ref"] = account_ref
+        if remote_task_id:
+            task["conversation_id"] = remote_task_id
+        if result_available:
+            task["data"] = [{"url": url} for url in restored_urls]
+        if record.get("error"):
+            task["error"] = _clean(record.get("error"))
+        if status == TASK_STATUS_ERROR and not task.get("error"):
+            task["error"] = (
+                "服务已重启，未完成的图片任务提交结果未知"
+                if not remote_task_id
+                else "服务重启后任务结果不可恢复"
+            )
+        if resume_on_start:
+            task["_resume_on_start"] = True
+        return task_key, task
 
     def submit_generation(
         self,
@@ -343,6 +352,9 @@ class ImageTaskService:
                 account_ref,
             )
 
+    def shutdown(self, *, wait: bool = False) -> None:
+        self._fallback_executor.shutdown(wait=wait, cancel_futures=not wait)
+
     async def submit_generation_async(
         self,
         identity: dict[str, object],
@@ -378,17 +390,15 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
-        payload = {
-            "prompt": prompt,
-            "images": images or [],
-            "mask": masks or [],
-            "model": model,
-            "n": 1,
-            "size": size,
-            "quality": quality,
-            "response_format": "url",
-            "base_url": base_url,
-        }
+        payload = self._build_edit_payload(
+            prompt=prompt,
+            model=model,
+            size=size,
+            quality=quality,
+            base_url=base_url,
+            images=images,
+            masks=masks,
+        )
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
     async def submit_edit_async(
@@ -404,10 +414,41 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
-        payload = {
+        payload = self._build_edit_payload(
+            prompt=prompt,
+            model=model,
+            size=size,
+            quality=quality,
+            base_url=base_url,
+            images=images,
+            masks=masks,
+        )
+        del images, masks
+        return await self._submit_async(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+
+    def _build_edit_payload(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        size: str | None,
+        quality: str,
+        base_url: str,
+        images: list[tuple[bytes, str, str]] | None,
+        masks: list[tuple[bytes, str, str]] | None,
+    ) -> dict[str, Any]:
+        spooled_images: list[dict[str, str]] = []
+        spooled_masks: list[dict[str, str]] = []
+        try:
+            spooled_images = self._spool_inputs(images or [])
+            spooled_masks = self._spool_inputs(masks or [])
+        except BaseException:
+            self._cleanup_spool_descriptors(spooled_images + spooled_masks)
+            raise
+        return {
             "prompt": prompt,
-            "images": images or [],
-            "mask": masks or [],
+            "images": spooled_images,
+            "mask": spooled_masks,
             "model": model,
             "n": 1,
             "size": size,
@@ -415,7 +456,111 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
-        return await self._submit_async(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+
+    def _spool_inputs(self, inputs: list[tuple[bytes, str, str]]) -> list[dict[str, str]]:
+        if not inputs:
+            return []
+        path: str | None = None
+        self.spool_dir.mkdir(parents=True, exist_ok=True)
+        descriptors: list[dict[str, str]] = []
+        try:
+            for data, filename, mime_type in inputs:
+                current_path: str | None = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        dir=self.spool_dir,
+                        prefix="image-task-",
+                        suffix=".bin",
+                        delete=False,
+                    ) as handle:
+                        current_path = handle.name
+                        handle.write(data)
+                except BaseException:
+                    if current_path:
+                        self._cleanup_spool_descriptors([{SPOOLED_INPUT_PATH_KEY: current_path}])
+                    raise
+                path = current_path
+                assert path is not None
+                descriptors.append(
+                    {
+                        SPOOLED_INPUT_PATH_KEY: path,
+                        "filename": str(filename or "image"),
+                        "mime_type": str(mime_type or "application/octet-stream"),
+                    }
+                )
+        except BaseException:
+            if path:
+                self._cleanup_spool_descriptors([{SPOOLED_INPUT_PATH_KEY: path}])
+            self._cleanup_spool_descriptors(descriptors)
+            raise
+        return descriptors
+
+    @staticmethod
+    def _spool_paths(value: object) -> list[Path]:
+        if not isinstance(value, list):
+            return []
+        paths: list[Path] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            path = item.get(SPOOLED_INPUT_PATH_KEY)
+            if isinstance(path, str) and path:
+                paths.append(Path(path))
+        return paths
+
+    @classmethod
+    def _cleanup_spool_descriptors(cls, descriptors: object) -> None:
+        if not isinstance(descriptors, list):
+            return
+        for path in cls._spool_paths(descriptors):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cleanup_payload_spool(self, payload: dict[str, Any]) -> None:
+        self._cleanup_spool_descriptors(payload.get("images"))
+        self._cleanup_spool_descriptors(payload.get("mask"))
+
+    def _cleanup_spool_dir(self) -> None:
+        try:
+            self.spool_dir.mkdir(parents=True, exist_ok=True)
+            for path in self.spool_dir.glob("image-task-*.bin"):
+                path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(f"image task spool cleanup failed: {self.spool_dir}")
+
+    def _materialize_spooled_inputs(
+        self,
+        value: object,
+    ) -> list[tuple[bytes, str, str]]:
+        if not isinstance(value, list):
+            return []
+        materialized: list[tuple[bytes, str, str]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            path = item.get(SPOOLED_INPUT_PATH_KEY)
+            if not isinstance(path, str) or not path:
+                continue
+            data = Path(path).read_bytes()
+            materialized.append(
+                (
+                    data,
+                    str(item.get("filename") or "image"),
+                    str(item.get("mime_type") or "application/octet-stream"),
+                )
+            )
+        return materialized
+
+    def _materialize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._spool_paths(payload.get("images")) and not self._spool_paths(payload.get("mask")):
+            return payload
+        materialized = dict(payload)
+        materialized["images"] = self._materialize_spooled_inputs(payload.get("images"))
+        materialized["mask"] = self._materialize_spooled_inputs(payload.get("mask"))
+        return materialized
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
@@ -427,16 +572,34 @@ class ImageTaskService:
             missing_ids = []
             for task_id in requested_ids:
                 task = self._tasks.get(_task_key(owner, task_id))
+                if task is None and self.state_store is not None:
+                    record = self.state_store.get_task(_task_key(owner, task_id))
+                    converted = self._task_from_state_record(record) if record is not None else None
+                    task = converted[1] if converted is not None else None
                 if task is None:
                     missing_ids.append(task_id)
                 else:
                     items.append(_public_task(task))
             if not requested_ids:
-                items = [
-                    _public_task(task)
-                    for task in self._tasks.values()
+                task_by_key = {
+                    key: task
+                    for key, task in self._tasks.items()
                     if task.get("owner_id") == owner
-                ]
+                }
+                if self.state_store is not None:
+                    try:
+                        max_rows = max(1, int(config.image_task_max_rows))
+                    except (TypeError, ValueError):
+                        max_rows = IMAGE_TASK_MAX_ROWS
+                    for record in self.state_store.list_tasks(
+                        owner_id=owner,
+                        limit=max_rows,
+                        task_types=("generate", "edit"),
+                    ):
+                        converted = self._task_from_state_record(record)
+                        if converted is not None:
+                            task_by_key.setdefault(converted[0], converted[1])
+                items = [_public_task(task) for task in task_by_key.values()]
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
@@ -583,6 +746,7 @@ class ImageTaskService:
     ) -> dict[str, Any]:
         task_id = _clean(client_task_id)
         if not task_id:
+            self._cleanup_payload_spool(payload)
             raise ValueError("client_task_id is required")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
@@ -616,6 +780,7 @@ class ImageTaskService:
     ) -> dict[str, Any]:
         task_id = _clean(client_task_id)
         if not task_id:
+            self._cleanup_payload_spool(payload)
             raise ValueError("client_task_id is required")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
@@ -624,7 +789,15 @@ class ImageTaskService:
         with self._lock:
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
+            if task is None and self.state_store is not None:
+                record = self.state_store.get_task(key)
+                converted = self._task_from_state_record(record) if record is not None else None
+                if converted is not None:
+                    task = converted[1]
+                    if task.get("status") in UNFINISHED_STATUSES:
+                        self._tasks[key] = task
             if task is not None:
+                self._cleanup_payload_spool(payload)
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
@@ -640,11 +813,16 @@ class ImageTaskService:
                 "updated_at": now,
                 "created_ts": time.time(),
             }
-            self._reserve_task_quota(task, identity, key, mode, payload)
+            try:
+                self._reserve_task_quota(task, identity, key, mode, payload)
+            except BaseException:
+                self._cleanup_payload_spool(payload)
+                raise
             self._tasks[key] = task
             try:
                 self._save_task_locked(task, synchronous=False)
             except BaseException:
+                self._cleanup_payload_spool(payload)
                 self._tasks.pop(key, None)
                 reservation_id = _clean(task.get("quota_reservation_id"))
                 if reservation_id:
@@ -656,13 +834,27 @@ class ImageTaskService:
             should_start = True
 
         if should_start:
-            self._dispatch_task(
-                key,
-                mode,
-                payload,
-                dict(identity),
-                _clean(payload.get("model"), "gpt-image-2"),
-            )
+            try:
+                self._dispatch_task(
+                    key,
+                    mode,
+                    payload,
+                    dict(identity),
+                    _clean(payload.get("model"), "gpt-image-2"),
+                )
+            except BaseException:
+                self._cleanup_payload_spool(payload)
+                self._release_task_quota(key)
+                with self._lock:
+                    self._tasks.pop(key, None)
+                    if self.state_store is not None:
+                        if self.task_writer is not None:
+                            self.task_writer.delete(key)
+                        else:
+                            self.state_store.delete_task(key)
+                    else:
+                        self._save_locked()
+                raise
         return _public_task(task)
 
     def _dispatch_task(
@@ -695,7 +887,7 @@ class ImageTaskService:
                 )
             )
             self._admission_tasks[key] = admission
-            self._watch_admission_task(key, admission)
+            self._watch_admission_task(key, admission, payload)
 
     async def _admit_task(
         self,
@@ -726,10 +918,16 @@ class ImageTaskService:
                 raise_on_error=True,
             ),
         )
-        self._watch_background_future(key, future)
+        self._watch_background_future(key, future, payload)
 
-    def _watch_background_future(self, key: str, future: Any) -> None:
+    def _watch_background_future(
+        self,
+        key: str,
+        future: Any,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         def completed(done: Any) -> None:
+            self._cleanup_payload_spool(payload or {})
             if done.cancelled():
                 error = "scheduler task cancelled"
             else:
@@ -748,7 +946,12 @@ class ImageTaskService:
 
         future.add_done_callback(completed)
 
-    def _watch_admission_task(self, key: str, admission: asyncio.Task[Any]) -> None:
+    def _watch_admission_task(
+        self,
+        key: str,
+        admission: asyncio.Task[Any],
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         def completed(done: asyncio.Task[Any]) -> None:
             if self._admission_tasks.get(key) is done:
                 self._admission_tasks.pop(key, None)
@@ -762,6 +965,7 @@ class ImageTaskService:
                 if exception is None:
                     return
                 error = str(exception) or "scheduler admission task failed"
+            self._cleanup_payload_spool(payload or {})
             with self._lock:
                 task = self._tasks.get(key)
                 if task is None or task.get("status") in TERMINAL_STATUSES:
@@ -806,9 +1010,12 @@ class ImageTaskService:
                 if context is not None and context.lease is not None:
                     updates["account_ref"] = anonymize_token(context.lease.access_token)
             self._update_task(key, **updates)
-        # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+        payload_with_progress: dict[str, Any] | None = None
+        runtime_payload = payload
         try:
+            runtime_payload = self._materialize_payload(payload)
+            # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
+            payload_with_progress = {**runtime_payload, "progress_callback": progress_callback}
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
             if not isinstance(result, dict):
@@ -877,6 +1084,14 @@ class ImageTaskService:
             )
             if raise_on_error:
                 raise
+        finally:
+            self._cleanup_payload_spool(payload)
+            if payload_with_progress is not None:
+                payload_with_progress["images"] = []
+                payload_with_progress["mask"] = []
+            if runtime_payload is not payload:
+                runtime_payload["images"] = []
+                runtime_payload["mask"] = []
 
     def _log_call(
         self,
@@ -1082,12 +1297,40 @@ class ImageTaskService:
             retention_days = max(1, int(self.retention_days_getter()))
         except Exception:
             retention_days = 30
+        try:
+            max_rows = max(100, int(config.image_task_max_rows))
+        except Exception:
+            max_rows = IMAGE_TASK_MAX_ROWS
         cutoff = time.time() - retention_days * 86400
-        removed_keys = [
+        if self.state_store is not None:
+            cleanup = getattr(self.state_store, "cleanup_tasks", None)
+            if callable(cleanup):
+                cleanup(
+                    now=time.time(),
+                    retention_seconds=retention_days * 86400,
+                    max_rows=max_rows,
+                    task_types=("generate", "edit"),
+                )
+
+        removed_keys = {
             key
             for key, task in self._tasks.items()
-            if task.get("status") in TERMINAL_STATUSES and _timestamp(task.get("updated_at")) < cutoff
+            if task.get("status") in TERMINAL_STATUSES
+            and _timestamp(task.get("updated_ts") or task.get("updated_at")) < cutoff
+        }
+        remaining_terminal = [
+            (key, task)
+            for key, task in self._tasks.items()
+            if task.get("status") in TERMINAL_STATUSES and key not in removed_keys
         ]
+        removed_keys.update(
+            key
+            for key, _task in sorted(
+                remaining_terminal,
+                key=lambda item: _timestamp(item[1].get("updated_ts") or item[1].get("updated_at")),
+                reverse=True,
+            )[max_rows:]
+        )
         for key in removed_keys:
             self._tasks.pop(key, None)
         if removed_keys and self.state_store is not None:

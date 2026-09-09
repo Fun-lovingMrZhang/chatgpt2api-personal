@@ -35,6 +35,7 @@ CACHEABLE_TEXT_KEYS = {
 class CacheEntry:
     expires_at: float
     value: Any
+    size_bytes: int = 0
 
 
 @dataclass
@@ -43,6 +44,7 @@ class InflightCall:
     done: bool = False
     value: Any = None
     error: BaseException | None = None
+    cache_bypassed: bool = False
 
 
 def _json_safe(value: Any) -> Any:
@@ -102,22 +104,85 @@ class ChatCompletionCache:
         self._lock = threading.RLock()
         self._entries: dict[str, CacheEntry] = {}
         self._inflight: dict[str, InflightCall] = {}
+        self._current_bytes = 0
+
+    @property
+    def current_bytes(self) -> int:
+        with self._lock:
+            return self._current_bytes
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
-            self._inflight.clear()
+            self._current_bytes = 0
 
     def _settings(self) -> dict[str, object]:
         return config.get_chat_completion_cache_settings()
 
-    def _prune_locked(self, now: float, max_entries: int) -> None:
+    @staticmethod
+    def _estimate_bytes(value: Any) -> int:
+        try:
+            return len(
+                json.dumps(
+                    _json_safe(value),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, OverflowError):
+            return len(repr(value).encode("utf-8", "replace"))
+
+    def _remove_locked(self, key: str) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._current_bytes = max(0, self._current_bytes - entry.size_bytes)
+
+    def _touch_locked(self, key: str) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._entries[key] = entry
+
+    def _prune_locked(self, now: float, max_entries: int, max_bytes: int) -> None:
         expired = [key for key, item in self._entries.items() if item.expires_at <= now]
         for key in expired:
-            self._entries.pop(key, None)
-        while len(self._entries) > max_entries:
-            oldest_key = min(self._entries, key=lambda key: self._entries[key].expires_at)
-            self._entries.pop(oldest_key, None)
+            self._remove_locked(key)
+        while len(self._entries) > max_entries or self._current_bytes > max_bytes:
+            oldest_key = next(iter(self._entries), None)
+            if oldest_key is None:
+                break
+            self._remove_locked(oldest_key)
+
+    def _store_locked(self, key: str, value: Any, *, expires_at: float, max_bytes: int) -> bool:
+        self._remove_locked(key)
+        size_bytes = self._estimate_bytes(value)
+        if size_bytes > max_bytes:
+            return False
+        copied = self._copy(value)
+        self._entries[key] = CacheEntry(
+            expires_at=expires_at,
+            value=copied,
+            size_bytes=size_bytes,
+        )
+        self._current_bytes += size_bytes
+        return True
+
+    def get(self, key: str) -> Any | None:
+        settings = self._settings()
+        if not settings.get("enabled") or int(settings.get("ttl_seconds") or 0) <= 0:
+            return None
+        now = time.time()
+        max_entries = max(1, int(settings.get("max_entries") or 1))
+        max_bytes = max(1, int(settings.get("max_bytes") or 1))
+        with self._lock:
+            self._prune_locked(now, max_entries, max_bytes)
+            entry = self._entries.get(key)
+            if entry is None or entry.expires_at <= now:
+                if entry is not None:
+                    self._remove_locked(key)
+                return None
+            self._touch_locked(key)
+            return self._copy(entry.value)
 
     @staticmethod
     def _copy(value: Any) -> Any:
@@ -130,10 +195,12 @@ class ChatCompletionCache:
 
         now = time.time()
         max_entries = int(settings.get("max_entries") or 1)
+        max_bytes = max(1, int(settings.get("max_bytes") or 1))
         with self._lock:
-            self._prune_locked(now, max_entries)
+            self._prune_locked(now, max_entries, max_bytes)
             entry = self._entries.get(key)
             if entry and entry.expires_at > now:
+                self._touch_locked(key)
                 return self._copy(entry.value)
             inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
             if inflight is None:
@@ -165,8 +232,8 @@ class ChatCompletionCache:
 
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
-            self._prune_locked(time.time(), max_entries)
+            self._store_locked(key, value, expires_at=expires_at, max_bytes=max_bytes)
+            self._prune_locked(time.time(), max_entries, max_bytes)
             self._inflight.pop(key, None)
         with inflight.condition:
             inflight.value = self._copy(value)
@@ -186,10 +253,12 @@ class ChatCompletionCache:
 
         now = time.time()
         max_entries = int(settings.get("max_entries") or 1)
+        max_bytes = max(1, int(settings.get("max_bytes") or 1))
         with self._lock:
-            self._prune_locked(now, max_entries)
+            self._prune_locked(now, max_entries, max_bytes)
             entry = self._entries.get(key)
             if entry and entry.expires_at > now:
+                self._touch_locked(key)
                 yield from self._copy(entry.value)
                 return
             inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
@@ -207,15 +276,30 @@ class ChatCompletionCache:
                     inflight.condition.wait()
                 if inflight.error:
                     raise inflight.error
+                if inflight.cache_bypassed:
+                    yield from compute()
+                    return
                 yield from self._copy(inflight.value)
                 return
 
         chunks: list[dict[str, Any]] = []
+        accumulated_bytes = 0
+        cacheable = True
         try:
             for chunk in compute():
-                chunks.append(self._copy(chunk))
+                if cacheable:
+                    copied = self._copy(chunk)
+                    chunk_size = self._estimate_bytes(copied)
+                    if accumulated_bytes + chunk_size <= max_bytes:
+                        chunks.append(copied)
+                        accumulated_bytes += chunk_size
+                    else:
+                        chunks.clear()
+                        accumulated_bytes = 0
+                        cacheable = False
                 yield chunk
         except BaseException as exc:
+            chunks.clear()
             with self._lock:
                 self._inflight.pop(key, None)
             with inflight.condition:
@@ -226,11 +310,15 @@ class ChatCompletionCache:
 
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
-            self._prune_locked(time.time(), max_entries)
+            if cacheable:
+                self._store_locked(key, chunks, expires_at=expires_at, max_bytes=max_bytes)
+                self._prune_locked(time.time(), max_entries, max_bytes)
             self._inflight.pop(key, None)
+        replay = self._copy(chunks) if cacheable else None
+        chunks.clear()
         with inflight.condition:
-            inflight.value = self._copy(chunks)
+            inflight.value = replay
+            inflight.cache_bypassed = not cacheable
             inflight.done = True
             inflight.condition.notify_all()
 

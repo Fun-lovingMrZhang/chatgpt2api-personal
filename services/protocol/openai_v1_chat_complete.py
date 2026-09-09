@@ -231,6 +231,9 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 def build_image_request(body: dict[str, Any]) -> ConversationRequest:
     model, prompt, n, images = chat_image_args(body)
+    body["_image_model"] = model
+    body["_image_prompt"] = prompt
+    body["_image_input_tokens"] = count_image_inputs_tokens(images, model)
     return ConversationRequest(
         prompt=prompt,
         model=model,
@@ -244,14 +247,20 @@ def format_image_outputs(
     outputs: Iterable[ImageOutput],
     body: dict[str, Any],
 ) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    model, prompt, _n, images = chat_image_args(body)
+    if "_image_prompt" in body:
+        model = str(body.get("_image_model") or body.get("model") or "gpt-image-2")
+        prompt = str(body.get("_image_prompt") or "")
+        input_image_tokens = int(body.get("_image_input_tokens") or 0)
+    else:
+        model, prompt, _n, images = chat_image_args(body)
+        input_image_tokens = count_image_inputs_tokens(images, model)
     if body.get("stream"):
         return stream_image_chat_completion(outputs, model)
     result = collect_image_outputs(outputs)
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
-        input_image_tokens=count_image_inputs_tokens(images, model),
+        input_image_tokens=input_image_tokens,
         output_tokens=count_image_output_items_tokens(result.get("data")),
     )
     response["usage"] = chat_usage_from_image_usage(usage)

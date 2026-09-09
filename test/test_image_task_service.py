@@ -63,6 +63,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
             quota_service_instance=quota_service,
             state_store=state_store,
+            spool_dir=path.parent / "image-task-spool",
         )
 
     def test_user_image_task_reserves_and_commits_successful_output(self):
@@ -105,6 +106,29 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, USER_OWNER, "quota-failure", "error")
             self.assertEqual(quota.commits, [])
             self.assertEqual(quota.releases, ["image-reservation-1"])
+
+    def test_dispatch_failure_removes_task_and_releases_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            quota = FakeQuotaService()
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", quota_service=quota)
+
+            def fail_dispatch(*_args, **_kwargs):
+                raise RuntimeError("executor is closed")
+
+            service._dispatch_task = fail_dispatch
+            try:
+                with self.assertRaisesRegex(RuntimeError, "executor is closed"):
+                    service.submit_generation(
+                        USER_OWNER,
+                        client_task_id="dispatch-failure",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+                self.assertEqual(service._tasks, {})
+                self.assertEqual(quota.releases, ["image-reservation-1"])
+            finally:
+                service.shutdown(wait=False)
 
     def test_quota_exhaustion_rejects_image_task_before_persistence(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -213,6 +237,66 @@ class ImageTaskServiceTests(unittest.TestCase):
             )
             self.assertEqual(store.list_tasks("owner-1", task_types=("editable_ppt",)), [])
 
+    def test_shared_task_cleanup_uses_persisted_numeric_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            store = SchedulerStateStore(root / "app.db")
+            old_ts = time.time() - 31 * 24 * 60 * 60
+            store.save_task({
+                "task_key": "owner-1:old-image",
+                "owner_id": "owner-1",
+                "task_id": "old-image",
+                "mode": "generate",
+                "status": "success",
+                "model": "gpt-image-2",
+                "result": {"urls": ["https://files.example.test/old.png"], "count": 1, "available": True},
+                "created_at": old_ts,
+                "updated_at": old_ts,
+            })
+
+            service = self.make_service(
+                root / "image_tasks.json",
+                state_store=store,
+                handler=lambda _payload: {"data": [{"url": "https://example.test/new.png"}]},
+            )
+
+            assert service.list_tasks(OWNER, ["old-image"])["items"] == []
+            assert store.get_task("owner-1:old-image") is None
+            service.shutdown(wait=False)
+
+    def test_shared_task_cleanup_reaches_rows_outside_loaded_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            store = SchedulerStateStore(root / "app.db")
+            old_ts = time.time() - 31 * 24 * 60 * 60
+            now = time.time()
+            records = [{
+                "task_key": "owner-1:old-image",
+                "owner_id": "owner-1",
+                "task_id": "old-image",
+                "mode": "generate",
+                "status": "success",
+                "model": "gpt-image-2",
+                "updated_at": old_ts,
+            }]
+            records.extend({
+                "task_key": f"owner-1:current-{index}",
+                "owner_id": "owner-1",
+                "task_id": f"current-{index}",
+                "mode": "generate",
+                "status": "success",
+                "model": "gpt-image-2",
+                "created_at": now,
+                "updated_at": now,
+            } for index in range(1000))
+            store.save_task_batch(records)
+
+            service = self.make_service(root / "image_tasks.json", state_store=store)
+
+            assert store.get_task("owner-1:old-image") is None
+            assert len(store.list_tasks(task_types=("generate", "edit"), limit=2000)) == 1000
+            service.shutdown(wait=False)
+
     def test_admin_image_task_does_not_create_quota_row(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             quota = QuotaService(AuthQuotaStore(Path(tmp_dir) / "auth_quota.db"))
@@ -263,6 +347,78 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
+
+    def test_edit_inputs_are_spooled_until_worker_execution_then_removed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            observed = {}
+
+            def handler(payload):
+                observed["images"] = payload["images"]
+                observed["masks"] = payload["mask"]
+                observed["spool_files_during_run"] = list(
+                    (root / "image-task-spool").glob("image-task-*.bin")
+                )
+                return {"data": [{"url": "http://example.test/edited.png"}]}
+
+            service = self.make_service(root / "image_tasks.json", handler)
+            service.submit_edit(
+                OWNER,
+                client_task_id="spooled-edit",
+                prompt="remove the background",
+                model="gpt-image-2",
+                size=None,
+                images=[(b"source-image", "source.png", "image/png")],
+                masks=[(b"source-mask", "mask.png", "image/png")],
+            )
+
+            task = wait_for_task(service, OWNER, "spooled-edit", "success")
+            self.assertEqual(task["data"][0]["url"], "http://example.test/edited.png")
+            self.assertEqual(observed["images"], [(b"source-image", "source.png", "image/png")])
+            self.assertEqual(observed["masks"], [(b"source-mask", "mask.png", "image/png")])
+            self.assertEqual(len(observed["spool_files_during_run"]), 2)
+            self.assertEqual(list((root / "image-task-spool").glob("image-task-*.bin")), [])
+            service.shutdown(wait=True)
+
+    def test_edit_spool_is_removed_when_handler_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            def handler(_payload):
+                raise RuntimeError("edit failed")
+
+            service = self.make_service(root / "image_tasks.json", handler)
+            service.submit_edit(
+                OWNER,
+                client_task_id="spooled-failure",
+                prompt="edit",
+                model="gpt-image-2",
+                size=None,
+                images=[(b"source-image", "source.png", "image/png")],
+            )
+
+            task = wait_for_task(service, OWNER, "spooled-failure", "error")
+            self.assertIn("edit failed", task["error"])
+            self.assertEqual(list((root / "image-task-spool").glob("image-task-*.bin")), [])
+            service.shutdown(wait=True)
+
+    def test_invalid_edit_task_id_does_not_leave_spooled_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            service = self.make_service(root / "image_tasks.json")
+
+            with self.assertRaises(ValueError):
+                service.submit_edit(
+                    OWNER,
+                    client_task_id="",
+                    prompt="edit",
+                    model="gpt-image-2",
+                    size=None,
+                    images=[(b"source-image", "source.png", "image/png")],
+                )
+
+            self.assertEqual(list((root / "image-task-spool").glob("image-task-*.bin")), [])
+            service.shutdown(wait=True)
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

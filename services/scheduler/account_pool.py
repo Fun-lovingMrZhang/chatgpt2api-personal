@@ -99,6 +99,23 @@ class AccountPool:
         with self._lock:
             return set(self._accounts)
 
+    def account_count(self) -> int:
+        with self._lock:
+            return len(self._accounts)
+
+    def debug_heap_entry_count(self) -> int:
+        with self._lock:
+            return sum(len(heap) for heap in self._heaps.values())
+
+    def debug_stale_heap_entry_count(self) -> int:
+        with self._lock:
+            return sum(
+                1
+                for heap_key, heap in self._heaps.items()
+                for _score, _sequence, account_key, revision in heap
+                if not self._heap_entry_is_current_locked(heap_key, account_key, revision)
+            )
+
     def inflight(self, account_key: str, lane: Lane) -> int:
         with self._lock:
             account = self._accounts.get(account_key)
@@ -542,6 +559,37 @@ class AccountPool:
                     account.revision,
                 ),
             )
+            self._maybe_rebuild_heap_locked(key)
+
+    def _heap_entry_is_current_locked(
+        self,
+        key: tuple[object, ...],
+        account_key: str,
+        revision: int,
+    ) -> bool:
+        account = self._accounts.get(account_key)
+        return bool(
+            account is not None
+            and account.revision == revision
+            and account_key in self._capability_accounts.get(key, set())
+        )
+
+    def _maybe_rebuild_heap_locked(self, key: tuple[object, ...]) -> None:
+        heap = self._heaps.get(key)
+        if not heap:
+            return
+        live_count = len(self._capability_accounts.get(key, set()))
+        stale_count = max(0, len(heap) - live_count)
+        threshold = max(1, min(16, live_count))
+        if stale_count < threshold:
+            return
+        rebuilt = [
+            entry
+            for entry in heap
+            if self._heap_entry_is_current_locked(key, entry[2], entry[3])
+        ]
+        heap[:] = rebuilt
+        heapq.heapify(heap)
 
     def _unpublish_account_locked(self, account_key: str) -> None:
         for lane in Lane:
@@ -559,7 +607,10 @@ class AccountPool:
                 self._capability_accounts.pop(key, None)
                 self._capability_states.pop(key, None)
                 self._capability_cooldowns.pop(key, None)
+                self._heaps.pop(key, None)
                 self._capability_keys.discard(key)
+            else:
+                self._maybe_rebuild_heap_locked(key)
 
     def _account_for_ref_locked(self, account_ref: str) -> _AccountRuntime | None:
         account_key = self._account_refs.get(str(account_ref or "").strip())

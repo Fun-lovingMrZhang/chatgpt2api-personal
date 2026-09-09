@@ -151,6 +151,7 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
+                account_service.cleanup_runtime_metadata()
                 limited_tokens = account_service.list_limited_tokens()
                 normal_tokens = account_service.list_normal_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()

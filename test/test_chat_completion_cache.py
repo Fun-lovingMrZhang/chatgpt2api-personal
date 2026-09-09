@@ -5,6 +5,7 @@ from unittest import mock
 import json
 import base64
 
+from fastapi import HTTPException
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
@@ -25,6 +26,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
             "enabled": True,
             "ttl_seconds": 60,
             "max_entries": 32,
+            "max_bytes": 64 * 1024,
             "dedupe_inflight": True,
             "stream_cache": True,
             "normalize_messages": True,
@@ -32,6 +34,80 @@ class ChatCompletionCacheTests(unittest.TestCase):
             "drop_assistant_history": False,
         }
         chat_completion_cache.clear()
+
+    def test_cache_evicts_old_response_when_byte_budget_is_exceeded(self) -> None:
+        config.data["chat_completion_cache"]["max_bytes"] = 1024
+        chat_completion_cache.clear()
+        calls = 0
+
+        def compute():
+            nonlocal calls
+            calls += 1
+            return {"text": "x" * 700}
+
+        first = chat_completion_cache.get_or_compute_response("a", compute)
+        second = chat_completion_cache.get_or_compute_response("b", compute)
+
+        self.assertEqual(first["text"], second["text"])
+        self.assertEqual(calls, 2)
+        self.assertLessEqual(chat_completion_cache.current_bytes, 1024)
+        self.assertIsNone(chat_completion_cache.get("a"))
+        self.assertIsNotNone(chat_completion_cache.get("b"))
+
+    def test_large_response_is_not_retained(self) -> None:
+        config.data["chat_completion_cache"]["max_bytes"] = 1024
+        chat_completion_cache.clear()
+        calls = 0
+
+        def compute():
+            nonlocal calls
+            calls += 1
+            return {"text": "z" * 4096}
+
+        chat_completion_cache.get_or_compute_response("large", compute)
+        chat_completion_cache.get_or_compute_response("large", compute)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(chat_completion_cache.current_bytes, 0)
+
+    def test_large_stream_is_not_accumulated_or_retained(self) -> None:
+        config.data["chat_completion_cache"]["max_bytes"] = 1024
+        chat_completion_cache.clear()
+        calls = 0
+
+        def compute():
+            nonlocal calls
+            calls += 1
+            yield {"text": "x" * 700}
+            yield {"text": "y" * 700}
+
+        first = list(chat_completion_cache.get_or_compute_stream("large-stream", compute))
+        second = list(chat_completion_cache.get_or_compute_stream("large-stream", compute))
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(second, first)
+        self.assertEqual(calls, 2)
+        self.assertEqual(chat_completion_cache.current_bytes, 0)
+
+    def test_response_compute_error_is_preserved(self) -> None:
+        chat_completion_cache.clear()
+
+        def compute():
+            raise RuntimeError("response failed")
+
+        with self.assertRaisesRegex(RuntimeError, "response failed"):
+            chat_completion_cache.get_or_compute_response("response-error", compute)
+
+    def test_stream_compute_error_is_preserved_and_releases_chunks(self) -> None:
+        chat_completion_cache.clear()
+
+        def compute():
+            yield {"text": "partial"}
+            raise RuntimeError("stream failed")
+
+        with self.assertRaisesRegex(RuntimeError, "stream failed"):
+            list(chat_completion_cache.get_or_compute_stream("stream-error", compute))
+        self.assertEqual(chat_completion_cache.current_bytes, 0)
 
     def tearDown(self) -> None:
         if self.old_cache_settings is None:
@@ -550,7 +626,11 @@ class ChatCompletionCacheTests(unittest.TestCase):
             headers = {"content-type": "image/png", "content-length": str(len(PNG_1X1))}
             content = PNG_1X1
 
-        with mock.patch("utils.helper.requests.get", return_value=FakeImageResponse()) as request_get:
+            def close(self):
+                self.closed = True
+
+        response = FakeImageResponse()
+        with mock.patch("utils.helper.requests.get", return_value=response) as request_get:
             model, messages = openai_v1_chat_complete.text_chat_parts({
                 "model": "auto",
                 "messages": [{
@@ -569,6 +649,60 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(content[1]["type"], "image")
         self.assertEqual(content[1]["data"], PNG_1X1)
         self.assertEqual(content[1]["mime"], "image/png")
+        self.assertTrue(response.closed)
+
+    def test_remote_vision_image_is_read_incrementally(self) -> None:
+        class FakeImageResponse:
+            status_code = 200
+            headers = {"content-type": "image/png"}
+
+            def __init__(self) -> None:
+                self.closed = False
+                self.chunk_size = None
+
+            def iter_content(self, *, chunk_size):
+                self.chunk_size = chunk_size
+                yield PNG_1X1[:2]
+                yield PNG_1X1[2:]
+
+            def close(self):
+                self.closed = True
+
+        response = FakeImageResponse()
+        with mock.patch("utils.helper.requests.get", return_value=response) as request_get:
+            _model, messages = openai_v1_chat_complete.text_chat_parts({
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}],
+                }],
+            })
+
+        self.assertTrue(request_get.call_args.kwargs["stream"])
+        self.assertEqual(response.chunk_size, 1024 * 1024)
+        self.assertTrue(response.closed)
+        self.assertEqual(messages[0]["content"][0]["data"], PNG_1X1)
+
+    def test_text_vision_images_share_an_aggregate_byte_budget(self) -> None:
+        with mock.patch.object(
+            type(config),
+            "image_input_max_bytes",
+            new_callable=mock.PropertyMock,
+            return_value=len(PNG_1X1),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                openai_v1_chat_complete.text_chat_parts({
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": PNG_1X1_DATA_URL},
+                            {"type": "image_url", "image_url": PNG_1X1_DATA_URL},
+                        ],
+                    }],
+                })
+
+        self.assertEqual(raised.exception.status_code, 413)
 
     def test_responses_text_request_preserves_input_image(self) -> None:
         captured = {}
@@ -624,6 +758,18 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(content[1]["type"], "image")
         self.assertEqual(content[1]["data"], PNG_1X1)
         self.assertEqual(content[1]["mime"], "image/png")
+
+    def test_response_lane_image_detection_does_not_download_input(self) -> None:
+        with mock.patch("utils.helper.requests.get") as request_get:
+            self.assertTrue(openai_v1_response.response_input_has_image({
+                "type": "message",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": {"url": "https://example.test/image.png"},
+                }],
+            }))
+
+        request_get.assert_not_called()
 
     def test_image_extractor_supports_extra_image_object_shapes(self) -> None:
         encoded = base64.b64encode(PNG_1X1).decode("ascii")

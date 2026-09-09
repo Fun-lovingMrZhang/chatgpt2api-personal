@@ -7,9 +7,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import ImageInputBudget, parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url, run_with_quota
 from services.content_filter import check_request, request_shape, request_text
+from services.config import config
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
 from services.model_service import model_catalog_service
@@ -150,9 +151,14 @@ def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
         if lane == Lane.IMAGE_GENERATION
         else scheduler_service.classify_image_edit(scheduler_payload)
     )
+    fallback_body = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"messages", "input", "images", "mask"}
+    }
 
     async def runner(handler, *args, streaming: bool = False):
-        body = args[0] if args and isinstance(args[0], dict) else payload
+        body = args[0] if args and isinstance(args[0], dict) else fallback_body
         adapter = _image_protocol_adapter(handler, body)
         if adapter is None:
             # Keep compatibility with tests and extension handlers that wrap
@@ -162,6 +168,8 @@ def _image_scheduler_runner(model: str, payload: dict[str, object], lane: Lane):
 
         build_request, format_outputs = adapter
         request = await run_in_threadpool(build_request, body)
+        body = _compact_image_scheduler_body(handler, body)
+        del args
         if streaming:
             futures = await scheduler_service.submit_image_units(
                 requirement,
@@ -227,6 +235,29 @@ def _image_protocol_adapter(handler, body: dict[str, object]):
     return adapters.get(module_name)
 
 
+def _compact_image_scheduler_body(handler, body: dict[str, object]) -> dict[str, object]:
+    """Drop raw image-bearing input after the upstream request is built."""
+    module_name = getattr(handler, "__module__", "")
+    if module_name == openai_v1_chat_complete.__name__:
+        keys = ("model", "stream", "_image_model", "_image_prompt", "_image_input_tokens")
+    elif module_name == openai_v1_response.__name__:
+        keys = (
+            "model",
+            "stream",
+            "_image_model",
+            "_image_prompt",
+            "_image_input_tokens",
+            "_image_size",
+            "_image_quality",
+        )
+    else:
+        return body
+    compact = {key: body[key] for key in keys if key in body}
+    body.clear()
+    body.update(compact)
+    return body
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -268,13 +299,16 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        budget = payload.pop("_image_input_budget", None)
+        if not isinstance(budget, ImageInputBudget):
+            budget = ImageInputBudget(config.image_input_max_bytes)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
         await filter_or_log(call, prompt)
-        payload["images"] = await read_image_sources(image_sources)
+        payload["images"] = await read_image_sources(image_sources, budget=budget)
         if mask_sources:
-            payload["mask"] = await read_image_sources(mask_sources)
+            payload["mask"] = await read_image_sources(mask_sources, budget=budget)
         payload["base_url"] = resolve_image_base_url(request)
         return await run_with_quota(
             call,
@@ -344,7 +378,7 @@ def create_router() -> APIRouter:
             _image_scheduler_runner(
                 model,
                 payload,
-                Lane.IMAGE_EDIT if openai_v1_response.extract_response_image(payload.get("input")) else Lane.IMAGE_GENERATION,
+                Lane.IMAGE_EDIT if openai_v1_response.response_input_has_image(payload.get("input")) else Lane.IMAGE_GENERATION,
             )
             if is_image_request
             else _text_scheduler_runner(model)

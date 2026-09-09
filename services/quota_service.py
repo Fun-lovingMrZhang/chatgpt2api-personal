@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 
-from services.config import DATA_DIR
+from services.config import config
 from utils.log import logger
 
 QuotaType = Literal["text", "image"]
-QUOTA_DB_PATH = DATA_DIR / "app.db"
+QUOTA_DB_PATH = config.app_db_path
 DEFAULT_RESERVATION_TTL_SECONDS = 900.0
+QUOTA_CACHE_SIZE_KIB = -1024
 
 
 class QuotaError(Exception):
@@ -167,6 +168,8 @@ class AuthQuotaStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._initialize_lock = threading.RLock()
+        self._write_lock = threading.RLock()
+        self._connections: set[sqlite3.Connection] = set()
         self._initialized = False
 
     def _connection(self) -> sqlite3.Connection:
@@ -175,27 +178,33 @@ class AuthQuotaStore:
             connection = sqlite3.connect(
                 str(self.db_path),
                 timeout=5.0,
+                check_same_thread=False,
                 isolation_level=None,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(f"PRAGMA cache_size={QUOTA_CACHE_SIZE_KIB}")
+            connection.execute("PRAGMA wal_autocheckpoint=1000")
             connection.execute("PRAGMA foreign_keys=ON")
+            with self._initialize_lock:
+                self._connections.add(connection)
             self._local.connection = connection
         return connection
 
     @contextmanager
     def _transaction(self):
         connection = self._connection()
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield connection
-        except BaseException:
-            connection.execute("ROLLBACK")
-            raise
-        else:
-            connection.execute("COMMIT")
+        with self._write_lock:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
 
     def initialize(self) -> None:
         if self._initialized:
@@ -664,15 +673,20 @@ class AuthQuotaStore:
             destination.close()
 
     def close(self) -> None:
-        connection = getattr(self._local, "connection", None)
-        if connection is not None:
-            connection.close()
+        with self._initialize_lock:
+            connections = list(self._connections)
+            self._connections.clear()
             self._local.connection = None
+            for connection in connections:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
 
 
 class QuotaService:
     def __init__(self, store: AuthQuotaStore | None = None):
-        self.store = store or AuthQuotaStore(QUOTA_DB_PATH)
+        self.store = store or AuthQuotaStore(config.app_db_path)
 
     def initialize(self) -> None:
         self.store.initialize()
@@ -760,6 +774,9 @@ class QuotaService:
 
     def snapshot_bytes(self) -> bytes:
         return self.store.snapshot_bytes()
+
+    def close(self) -> None:
+        self.store.close()
 
     def start_watchdog(self, stop_event: threading.Event, interval_seconds: float = 5.0) -> threading.Thread:
         def run() -> None:

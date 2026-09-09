@@ -105,6 +105,19 @@ def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
     return None
 
 
+def response_input_has_image(input_value: object) -> bool:
+    """Detect image input shapes without downloading or decoding their payloads."""
+    if isinstance(input_value, dict):
+        if str(input_value.get("type") or "").strip() in {"input_image", "image", "image_url"}:
+            return True
+        if "image_url" in input_value or "url" in input_value:
+            return True
+        return response_input_has_image(input_value.get("content"))
+    if isinstance(input_value, list):
+        return any(response_input_has_image(item) for item in input_value)
+    return False
+
+
 def _input_image_parts(input_value: object) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     if isinstance(input_value, dict):
@@ -457,6 +470,11 @@ def build_image_request(body: dict[str, Any]) -> ConversationRequest:
             status_code=400,
             detail={"error": f"n must be between 1 and {MAX_IMAGE_OUTPUTS}"},
         )
+    body["_image_model"] = model
+    body["_image_prompt"] = prompt
+    body["_image_input_tokens"] = count_image_content_tokens(_input_image_parts(body.get("input")), model)
+    body["_image_size"] = tool.get("size")
+    body["_image_quality"] = str(tool.get("quality") or "auto")
     return ConversationRequest(
         prompt=prompt,
         model=model,
@@ -472,14 +490,26 @@ def format_image_outputs(
     outputs: Iterable[ImageOutput],
     body: dict[str, Any],
 ) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    request = build_image_request(body)
+    if "_image_prompt" in body:
+        prompt = str(body.get("_image_prompt") or "")
+        model = str(body.get("_image_model") or body.get("model") or "gpt-image-2")
+        input_image_tokens = int(body.get("_image_input_tokens") or 0)
+        size = body.get("_image_size")
+        quality = str(body.get("_image_quality") or "auto")
+    else:
+        request = build_image_request(body)
+        prompt = request.prompt
+        model = request.model
+        input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), request.model)
+        size = request.size
+        quality = request.quality
     events = stream_image_response(
         outputs,
-        request.prompt,
-        request.model,
-        count_image_content_tokens(_input_image_parts(body.get("input")), request.model),
-        request.size,
-        request.quality,
+        prompt,
+        model,
+        input_image_tokens,
+        size,
+        quality,
     )
     if body.get("stream"):
         return events

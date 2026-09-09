@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,7 @@ from typing import Any
 from urllib.parse import quote
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
@@ -23,9 +24,11 @@ TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, "completed", "failed", "cancelled"}
 EDITABLE_FILE_PLAN_TYPES = ("Plus", "Team", "Pro", "Enterprise")
 EDITABLE_FILE_ROOT = DATA_DIR / "files"
 EDITABLE_FILE_TASKS_PATH = DATA_DIR / "editable_file_tasks.json"
+EDITABLE_FILE_SPOOL_DIR = DATA_DIR / ".editable_file_task_spool"
 
 
 def _now_iso() -> str:
@@ -92,8 +95,9 @@ class EditableFileTaskService:
         path: Path = EDITABLE_FILE_TASKS_PATH,
         *,
         state_store: Any | None = None,
-        max_workers: int = 4,
-        queue_max_items: int = 64,
+        max_workers: int | None = None,
+        queue_max_items: int | None = None,
+        spool_dir: Path | None = None,
     ) -> None:
         self.path = path
         self.state_store = state_store
@@ -104,17 +108,23 @@ class EditableFileTaskService:
                 self.state_store = scheduler_service.state_store
             except Exception:
                 self.state_store = None
+        worker_count = max(1, int(max_workers if max_workers is not None else config.file_task_max_workers))
+        queue_size = max(0, int(queue_max_items if queue_max_items is not None else config.file_task_queue_max_items))
+        self.spool_dir = Path(spool_dir) if spool_dir is not None else EDITABLE_FILE_SPOOL_DIR
+        self.spool_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_spool_files()
         self._executor = ThreadPoolExecutor(
-            max_workers=max(1, int(max_workers)),
+            max_workers=worker_count,
             thread_name_prefix="editable-file-task",
         )
-        self._admission = BoundedSemaphore(max(1, int(max_workers)) + max(0, int(queue_max_items)))
+        self._admission = BoundedSemaphore(worker_count + queue_size)
         self._admitted: set[str] = set()
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_state_store_locked() if self.state_store is not None else self._load_locked()
+            self._cleanup_tasks_locked()
             if self._recover_unfinished_locked():
                 self._save_locked()
 
@@ -128,10 +138,41 @@ class EditableFileTaskService:
         owner = _owner_id(identity)
         requested = [_clean(item) for item in task_ids if _clean(item)]
         with self._lock:
+            self._cleanup_tasks_locked()
             if requested:
-                items = [task for task_id in requested if (task := self._tasks.get(_task_key(owner, task_id)))]
-                return {"items": [_public_task(item) for item in items], "missing_ids": [task_id for task_id in requested if _task_key(owner, task_id) not in self._tasks]}
-            items = [task for task in self._tasks.values() if task.get("owner_id") == owner]
+                items = []
+                for task_id in requested:
+                    task = self._tasks.get(_task_key(owner, task_id))
+                    if task is None and self.state_store is not None:
+                        record = self.state_store.get_task(f"file:{owner}:{task_id}")
+                        converted = self._task_from_state_record(record) if record is not None else None
+                        task = converted[1] if converted is not None else None
+                    if task is not None:
+                        items.append(task)
+                found_ids = {str(item.get("id") or "") for item in items}
+                return {
+                    "items": [_public_task(item) for item in items],
+                    "missing_ids": [task_id for task_id in requested if task_id not in found_ids],
+                }
+            task_by_key = {
+                key: task
+                for key, task in self._tasks.items()
+                if task.get("owner_id") == owner
+            }
+            if self.state_store is not None:
+                try:
+                    max_rows = max(1, int(config.file_task_max_rows))
+                except (TypeError, ValueError):
+                    max_rows = 10000
+                for record in self.state_store.list_tasks(
+                    owner_id=owner,
+                    limit=max_rows,
+                    task_types=("editable_ppt", "editable_psd"),
+                ):
+                    converted = self._task_from_state_record(record)
+                    if converted is not None:
+                        task_by_key.setdefault(converted[0], converted[1])
+            items = list(task_by_key.values())
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return {"items": [_public_task(item) for item in items], "missing_ids": []}
 
@@ -146,24 +187,42 @@ class EditableFileTaskService:
         with self._lock:
             if key in self._tasks:
                 return _public_task(self._tasks[key])
+            if self.state_store is not None:
+                record = self.state_store.get_task(f"file:{owner}:{task_id}")
+                converted = self._task_from_state_record(record) if record is not None else None
+                if converted is not None:
+                    existing_task = converted[1]
+                    if existing_task.get("status") in UNFINISHED_STATUSES:
+                        self._tasks[key] = existing_task
+                    return _public_task(existing_task)
             if not self._admission.acquire(blocking=False):
                 raise QueueFullError("editable file task queue is full")
             ts = time.time()
             self._tasks[key] = {"id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED, "kind": kind, "model": EDITABLE_FILE_MODEL, "created_at": now, "updated_at": now, "created_ts": ts, "updated_ts": ts}
             task = dict(self._tasks[key])
             self._admitted.add(key)
+            spool_paths: list[Path] = []
             try:
+                spool_paths = self._spool_inputs(base64_images)
                 self._save_task_locked(task)
-                self._executor.submit(
+                future = self._executor.submit(
                     self._run_task,
                     key,
                     kind,
                     prompt,
-                    base64_images,
+                    tuple(spool_paths),
                     dict(identity),
                     base_url,
                 )
+                future.add_done_callback(
+                    lambda completed, task_key=key, paths=tuple(spool_paths): self._on_future_done(
+                        task_key,
+                        paths,
+                        completed,
+                    )
+                )
             except Exception:
+                self._release_spooled_inputs(spool_paths)
                 self._admitted.discard(key)
                 self._admission.release()
                 self._tasks.pop(key, None)
@@ -171,13 +230,23 @@ class EditableFileTaskService:
                 raise
         return _public_task(task)
 
-    def _run_task(self, key: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
+    def _run_task(
+        self,
+        key: str,
+        kind: str,
+        prompt: str,
+        spool_paths: tuple[Path, ...],
+        identity: dict[str, object],
+        base_url: str,
+    ) -> None:
         started = time.time()
         token = ""
         account_email = ""
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
+        base64_images: list[str] = []
         backend = None
         try:
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
+            base64_images = [path.read_text(encoding="utf-8") for path in spool_paths]
             if kind == "psd" and not base64_images:
                 raise ValueError("base64_images is empty")
             token = _editable_access_token()
@@ -197,10 +266,127 @@ class EditableFileTaskService:
         finally:
             if backend is not None:
                 backend.close()
-            with self._lock:
-                if key in self._admitted:
-                    self._admitted.remove(key)
-                    self._admission.release()
+            base64_images.clear()
+            self._release_spooled_inputs(spool_paths)
+            self._release_admission(key)
+
+    def _on_future_done(self, key: str, spool_paths: tuple[Path, ...], future: Any) -> None:
+        try:
+            if future.cancelled():
+                self._mark_future_failure(key, "任务已取消")
+            else:
+                exception = future.exception()
+                if exception is not None:
+                    self._mark_future_failure(key, f"任务执行失败: {exception}")
+        except Exception:
+            # Cleanup must not make a completed Future callback fail noisily.
+            pass
+        finally:
+            self._release_spooled_inputs(spool_paths)
+            self._release_admission(key)
+
+    def _mark_future_failure(self, key: str, error: str) -> None:
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None or task.get("status") in TERMINAL_STATUSES:
+                return
+        self._update_task(
+            key,
+            status=TASK_STATUS_ERROR,
+            error=error,
+            ended_ts=time.time(),
+        )
+
+    def _release_admission(self, key: str) -> None:
+        with self._lock:
+            if key not in self._admitted:
+                return
+            self._admitted.remove(key)
+            self._admission.release()
+
+    def _spool_inputs(self, base64_images: list[str]) -> list[Path]:
+        paths: list[Path] = []
+        try:
+            for image in base64_images:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.spool_dir,
+                    prefix="task-",
+                    suffix=".b64",
+                    delete=False,
+                ) as handle:
+                    handle.write(str(image))
+                    paths.append(Path(handle.name))
+            return paths
+        except Exception:
+            self._release_spooled_inputs(paths)
+            raise
+
+    @staticmethod
+    def _release_spooled_inputs(paths: Any) -> None:
+        for path in paths or ():
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cleanup_spool_files(self) -> None:
+        for path in self.spool_dir.glob("task-*.b64"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cleanup_tasks_locked(self) -> None:
+        retention_seconds = config.file_task_retention_days * 24 * 60 * 60
+        max_rows = config.file_task_max_rows
+        task_types = ("editable_ppt", "editable_psd")
+        now = time.time()
+        cutoff = now - retention_seconds
+        if self.state_store is not None:
+            cleanup = getattr(self.state_store, "cleanup_tasks", None)
+            if callable(cleanup):
+                cleanup(
+                    now=now,
+                    retention_seconds=retention_seconds,
+                    max_rows=max_rows,
+                    task_types=task_types,
+                )
+            self._prune_local_terminal_tasks_locked(cutoff, max_rows)
+            return
+
+        changed = self._prune_local_terminal_tasks_locked(cutoff, max_rows)
+        if changed:
+            self._save_locked()
+
+    def _prune_local_terminal_tasks_locked(self, cutoff: float, max_rows: int) -> bool:
+        changed = False
+        terminal = [
+            (key, task)
+            for key, task in self._tasks.items()
+            if task.get("status") in TERMINAL_STATUSES
+        ]
+        for key, task in terminal:
+            updated_ts = float(task.get("updated_ts") or 0)
+            if updated_ts < cutoff:
+                self._tasks.pop(key, None)
+                changed = True
+        remaining_terminal = [
+            (key, task)
+            for key, task in self._tasks.items()
+            if task.get("status") in TERMINAL_STATUSES
+        ]
+        for key, _task in sorted(
+            remaining_terminal,
+            key=lambda item: float(item[1].get("updated_ts") or 0),
+            reverse=True,
+        )[max_rows:]:
+            self._tasks.pop(key, None)
+            changed = True
+        if changed:
+            return True
+        return False
 
     def public_file_path(self, relative_path: str) -> Path:
         raw = str(relative_path or "").replace("\\", "/").lstrip("/")
@@ -226,32 +412,43 @@ class EditableFileTaskService:
         if self.path.exists() and (not callable(has_migration_marker) or not has_migration_marker()):
             self._import_legacy_file_tasks_locked()
         tasks: dict[str, dict[str, Any]] = {}
-        for record in self.state_store.list_tasks(
+        for record in self.state_store.load_recoverable_tasks(
             task_types=("editable_ppt", "editable_psd"),
         ):
-            task_id = _clean(record.get("task_id"))
-            owner = _clean(record.get("owner_id"))
-            if not task_id or not owner:
-                continue
-            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-            task = {
-                "id": task_id,
-                "owner_id": owner,
-                "status": _clean(record.get("status"), TASK_STATUS_ERROR),
-                "kind": "psd" if record.get("mode") == "editable_psd" else "ppt",
-                "model": _clean(record.get("model"), EDITABLE_FILE_MODEL),
-                "created_at": _clean(metadata.get("created_at"), _now_iso()),
-                "updated_at": _clean(metadata.get("updated_at"), _now_iso()),
-                "created_ts": float(record.get("created_at") or 0),
-                "updated_ts": float(record.get("updated_at") or 0),
-            }
-            result = record.get("result")
-            if isinstance(result, dict):
-                task["result"] = result
-            if record.get("error"):
-                task["error"] = _clean(record.get("error"))
-            tasks[_task_key(owner, task_id)] = task
+            converted = self._task_from_state_record(record)
+            if converted is not None:
+                tasks[converted[0]] = converted[1]
         return tasks
+
+    @staticmethod
+    def _task_from_state_record(record: dict[str, object]) -> tuple[str, dict[str, Any]] | None:
+        task_id = _clean(record.get("task_id"))
+        owner = _clean(record.get("owner_id"))
+        if not task_id or not owner:
+            return None
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        status = _clean(record.get("status"), TASK_STATUS_ERROR)
+        if status == "unknown":
+            status = TASK_STATUS_ERROR
+        task = {
+            "id": task_id,
+            "owner_id": owner,
+            "status": status,
+            "kind": "psd" if record.get("mode") == "editable_psd" else "ppt",
+            "model": _clean(record.get("model"), EDITABLE_FILE_MODEL),
+            "created_at": _clean(metadata.get("created_at"), _now_iso()),
+            "updated_at": _clean(metadata.get("updated_at"), _now_iso()),
+            "created_ts": float(record.get("created_at") or 0),
+            "updated_ts": float(record.get("updated_at") or 0),
+        }
+        result = record.get("result")
+        if isinstance(result, dict):
+            task["result"] = result
+        if record.get("error"):
+            task["error"] = _clean(record.get("error"))
+        elif status == TASK_STATUS_ERROR:
+            task["error"] = "服务已重启，未完成的任务已中断"
+        return _task_key(owner, task_id), task
 
     def _import_legacy_file_tasks_locked(self) -> None:
         for item in self._load_locked().values():

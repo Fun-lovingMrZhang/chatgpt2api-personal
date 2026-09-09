@@ -1,16 +1,19 @@
 import base64
+import binascii
 import hashlib
 import json
 import mimetypes
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
+from services.config import config
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
@@ -30,6 +33,27 @@ MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+_CHAT_IMAGE_CACHE_KEY = "_chat_image_inputs"
+
+
+@dataclass
+class MessageImageBudget:
+    max_bytes: int
+    used_bytes: int = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, self.max_bytes - self.used_bytes)
+
+    def consume(self, payload: bytes) -> bytes:
+        next_total = self.used_bytes + len(payload)
+        if next_total > self.max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={"error": "total image input size exceeds limit"},
+            )
+        self.used_bytes = next_total
+        return payload
 
 
 def _image_extension(mime_type: str) -> str:
@@ -54,6 +78,9 @@ def _decode_json_image_string(value: str, index: int, filename: str | None = Non
         resolved_mime = "image/jpeg"
     if resolved_mime not in SUPPORTED_JSON_IMAGE_MIME_TYPES:
         raise HTTPException(status_code=400, detail={"error": "unsupported image mime type"})
+    max_encoded = ((MAX_JSON_IMAGE_BYTES + 2) // 3) * 4
+    if len(encoded) > max_encoded:
+        raise HTTPException(status_code=400, detail={"error": "image file is too large"})
     try:
         image_data = base64.b64decode(encoded, validate=True)
     except Exception as exc:
@@ -326,12 +353,34 @@ def _message_image_url(value: object) -> str:
     return str(value or "").strip()
 
 
-def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
+def _decode_message_image_url(
+    value: object,
+    budget: MessageImageBudget | None = None,
+) -> tuple[bytes, str] | None:
     source = _message_image_url(value)
     if source.startswith("data:"):
         header, _, data = source.partition(",")
         mime = header.split(";")[0].removeprefix("data:") or "image/png"
-        return base64.b64decode(data), mime
+        max_encoded = ((MAX_JSON_IMAGE_BYTES + 2) // 3) * 4
+        if len(data) > max_encoded:
+            raise HTTPException(status_code=400, detail={"error": "image file is too large"})
+        if budget is not None:
+            padding = len(data) - len(data.rstrip("="))
+            estimated_size = max(0, (len(data) // 4) * 3 - padding)
+            if estimated_size > budget.remaining_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"error": "total image input size exceeds limit"},
+                )
+        try:
+            image_data = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
+        if not image_data:
+            raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+        if len(image_data) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image file is too large"})
+        return image_data, mime
     if not source.startswith(("http://", "https://")):
         return None
     parsed = urlparse(source)
@@ -344,37 +393,112 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
             timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
             allow_redirects=True,
+            stream=True,
             **proxy_settings.build_session_kwargs(),
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
-    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
-    if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if not mime.startswith("image/") and guessed_mime.startswith("image/"):
-        mime = guessed_mime
-    if not mime.startswith("image/"):
-        mime = "image/png"
-    return image_data, mime
+    try:
+        if not 200 <= response.status_code < 300:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+        content_length = str(response.headers.get("content-length") or "").strip()
+        if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+        if budget is not None and content_length.isdigit() and int(content_length) > budget.remaining_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={"error": "total image input size exceeds limit"},
+            )
+        iterator = getattr(response, "iter_content", None)
+        if callable(iterator):
+            buffer = bytearray()
+            total = 0
+            for chunk in iterator(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                total += len(chunk)
+                if total > MAX_JSON_IMAGE_BYTES:
+                    raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+                if budget is not None and total > budget.remaining_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail={"error": "total image input size exceeds limit"},
+                    )
+                buffer.extend(chunk)
+            image_data = bytes(buffer)
+            del buffer
+        else:
+            raw = getattr(response, "raw", None)
+            read = getattr(raw, "read", None)
+            if callable(read):
+                buffer = bytearray()
+                total = 0
+                while True:
+                    remaining = MAX_JSON_IMAGE_BYTES - total
+                    if budget is not None:
+                        remaining = min(remaining, budget.remaining_bytes - total)
+                    if remaining <= 0:
+                        chunk = read(1)
+                        if not chunk:
+                            break
+                        raise HTTPException(
+                            status_code=413 if budget is not None else 400,
+                            detail={
+                                "error": (
+                                    "total image input size exceeds limit"
+                                    if budget is not None
+                                    else "image_url exceeds 10MB limit"
+                                )
+                            },
+                        )
+                    chunk = read(min(1024 * 1024, remaining + 1))
+                    if not chunk:
+                        break
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    total += len(chunk)
+                    if total > MAX_JSON_IMAGE_BYTES:
+                        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+                    if budget is not None and total > budget.remaining_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail={"error": "total image input size exceeds limit"},
+                        )
+                    buffer.extend(chunk)
+                image_data = bytes(buffer)
+                del buffer
+            else:
+                image_data = response.content
+        if not image_data:
+            raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+        if len(image_data) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+        mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
+        guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
+        if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
+            raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+        if not mime.startswith("image/") and guessed_mime.startswith("image/"):
+            mime = guessed_mime
+        if not mime.startswith("image/"):
+            mime = "image/png"
+        return image_data, mime
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 
-def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] | None:
+def _decode_message_image_object(
+    item: dict[str, object],
+    budget: MessageImageBudget | None = None,
+) -> tuple[bytes, str] | None:
     data = item.get("data")
     if isinstance(data, (bytes, bytearray)):
         return bytes(data), str(item.get("mime") or item.get("mime_type") or "image/png")
     for key in ("image_url", "url"):
-        image = _decode_message_image_url(item.get(key))
+        image = _decode_message_image_url(item.get(key), budget)
         if image:
             return image
     value = item.get("b64_json") or item.get("base64")
@@ -394,7 +518,11 @@ def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] |
     return None
 
 
-def extract_image_from_message_content(content: object) -> list[tuple[bytes, str]]:
+def extract_image_from_message_content(
+    content: object,
+    *,
+    budget: MessageImageBudget | None = None,
+) -> list[tuple[bytes, str]]:
     if not isinstance(content, list):
         return []
     images = []
@@ -403,28 +531,48 @@ def extract_image_from_message_content(content: object) -> list[tuple[bytes, str
             continue
         item_type = str(item.get("type") or "").strip()
         if item_type == "image_url":
-            image = _decode_message_image_url(item.get("image_url") or item.get("url") or item)
+            image = _decode_message_image_url(
+                item.get("image_url") or item.get("url") or item,
+                budget,
+            )
             if image:
+                if budget is not None:
+                    image = (budget.consume(image[0]), image[1])
                 images.append(image)
         elif item_type in {"input_image", "image"}:
-            image = _decode_message_image_object(item)
+            image = _decode_message_image_object(item, budget)
             if image:
+                if budget is not None:
+                    image = (budget.consume(image[0]), image[1])
                 images.append(image)
     return images
 
 
 def extract_chat_image(body: dict[str, object]) -> list[tuple[bytes, str]]:
+    cached = body.get(_CHAT_IMAGE_CACHE_KEY)
+    if isinstance(cached, list) and all(
+        isinstance(item, tuple)
+        and len(item) == 2
+        and isinstance(item[0], bytes)
+        and isinstance(item[1], str)
+        for item in cached
+    ):
+        return cached
     messages = body.get("messages")
     if not isinstance(messages, list):
+        body[_CHAT_IMAGE_CACHE_KEY] = []
         return []
+    budget = MessageImageBudget(max(1, int(config.image_input_max_bytes)))
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
         if str(message.get("role") or "").strip().lower() != "user":
             continue
-        images = extract_image_from_message_content(message.get("content"))
+        images = extract_image_from_message_content(message.get("content"), budget=budget)
         if images:
+            body[_CHAT_IMAGE_CACHE_KEY] = images
             return images
+    body[_CHAT_IMAGE_CACHE_KEY] = []
     return []
 
 

@@ -105,6 +105,11 @@ FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
 REAL_IMAGE_FILE_ID_RE = re.compile(r"\bfile_00000000[a-f0-9]{24}\b")
 SEDIMENT_ID_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
 IMAGE_POLL_SETTLE_SECS = 2.0
+CODEX_RESPONSE_DEBUG_LIMIT_BYTES = 4 * 1024 * 1024
+# Image results are returned as data URLs in one SSE event. Keep the debug
+# response cap small, but allow a complete upstream image event through.
+CODEX_SSE_BUFFER_LIMIT_BYTES = 64 * 1024 * 1024
+CODEX_JSON_RESPONSE_LIMIT_BYTES = CODEX_SSE_BUFFER_LIMIT_BYTES
 CODEX_RESPONSES_INSTRUCTIONS = (
     "Use the image_generation tool to create exactly one image for the user's request. "
     "Return the generated image result."
@@ -226,6 +231,29 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
 
+    @staticmethod
+    def _close_response(response: Any) -> None:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _read_json_response(self, response: Any, context: str) -> Any:
+        try:
+            ensure_ok(response, context)
+            return response.json()
+        finally:
+            self._close_response(response)
+
+    def _read_text_response(self, response: Any, context: str) -> str:
+        try:
+            ensure_ok(response, context)
+            return str(response.text or "")
+        finally:
+            self._close_response(response)
+
     def __del__(self):
         self.close()
 
@@ -289,9 +317,12 @@ class OpenAIBackendAPI:
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
         response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        return response.json()
+        try:
+            if response.status_code != 200:
+                self._raise_on_error(response, path)
+            return response.json()
+        finally:
+            self._close_response(response)
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
@@ -306,17 +337,23 @@ class OpenAIBackendAPI:
             },
             timeout=20,
         )
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        return response.json()
+        try:
+            if response.status_code != 200:
+                self._raise_on_error(response, path)
+            return response.json()
+        finally:
+            self._close_response(response)
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
                                     timeout=20)
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        payload = response.json()
+        try:
+            if response.status_code != 200:
+                self._raise_on_error(response, path)
+            payload = response.json()
+        finally:
+            self._close_response(response)
         default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
         logger.debug({
             "event": "backend_user_info_account_payload",
@@ -717,60 +754,184 @@ class OpenAIBackendAPI:
     @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
         status_code = getattr(raw, "status", None)
-        parse_errors: list[str] = []
-        events: list[Dict[str, Any]] = []
         if "application/json" in content_type:
             try:
+                body_bytes = raw.read(CODEX_JSON_RESPONSE_LIMIT_BYTES + 1)
+            except TypeError:
+                body_bytes = raw.read()
+            if not isinstance(body_bytes, bytes):
+                body_bytes = str(body_bytes).encode("utf-8", "replace")
+            body_truncated = len(body_bytes) > CODEX_JSON_RESPONSE_LIMIT_BYTES
+            text = body_bytes[:CODEX_JSON_RESPONSE_LIMIT_BYTES].decode("utf-8", "replace")
+            parse_errors: list[str] = []
+            event_types: Dict[str, int] = {}
+            image_result_lengths: list[int] = []
+            summaries: list[Dict[str, Any]] = []
+            try:
+                if body_truncated:
+                    raise ValueError("response body exceeded JSON response limit")
                 data = json.loads(text)
                 if isinstance(data, dict):
-                    events.append(data)
+                    event_types[str(data.get("type") or "<missing>")] = 1
+                    image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(data)[:10])
+                    summaries.append(OpenAIBackendAPI._codex_event_summary(data))
+                    yield data
             except Exception as exc:
                 parse_errors.append(str(exc))
-        else:
-            lines: list[str] = []
-            for line in text.splitlines() + [""]:
-                if not line:
-                    if lines:
-                        payload_text = "\n".join(lines).strip()
-                        if payload_text and payload_text != "[DONE]":
-                            try:
-                                data = json.loads(payload_text)
-                            except Exception as exc:
-                                parse_errors.append(str(exc))
-                                data = None
-                            if isinstance(data, dict):
-                                events.append(data)
-                        lines = []
-                elif line.startswith("data:"):
-                    lines.append(line[5:].lstrip())
+            logger.info({
+                "event": "codex_responses_response_debug",
+                "status_code": status_code,
+                "content_type": content_type,
+                "response_text_len": len(body_bytes),
+                "event_count": sum(event_types.values()),
+                "event_types": event_types,
+                "image_result_lengths": image_result_lengths[:10],
+                "parse_error_count": len(parse_errors),
+                "parse_errors": parse_errors[:5],
+                "event_summaries": summaries[:30],
+                "event_previews": [],
+                "body_preview": "" if event_types else text[:1000],
+            })
+            return
 
+        parse_errors: list[str] = []
         event_types: Dict[str, int] = {}
         image_result_lengths: list[int] = []
-        for event in events:
-            event_type = str(event.get("type") or "<missing>")
+        summaries: list[Dict[str, Any]] = []
+        response_text_len = 0
+        event_count = 0
+        data_lines: list[str] = []
+        data_bytes = 0
+
+        def record_parse_error(error: object) -> None:
+            if len(parse_errors) < 5:
+                parse_errors.append(str(error))
+
+        def record_image_result_lengths(data: Dict[str, Any]) -> None:
+            remaining = 10 - len(image_result_lengths)
+            if remaining > 0:
+                image_result_lengths.extend(
+                    OpenAIBackendAPI._codex_event_image_result_lengths(data)[:remaining]
+                )
+
+        def parse_event(payload_text: str) -> Dict[str, Any] | None:
+            nonlocal event_count
+            payload_text = payload_text.strip()
+            if not payload_text or payload_text == "[DONE]":
+                return None
+            try:
+                data = json.loads(payload_text)
+            except Exception as exc:
+                record_parse_error(exc)
+                return None
+            if not isinstance(data, dict):
+                return None
+            event_count += 1
+            event_type = str(data.get("type") or "<missing>")
             event_types[event_type] = event_types.get(event_type, 0) + 1
-            image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(event))
+            record_image_result_lengths(data)
+            if len(summaries) < 30:
+                summaries.append(OpenAIBackendAPI._codex_event_summary(data))
+            return data
+
+        def raw_chunks() -> Iterator[Any]:
+            try:
+                iterator = iter(raw)
+            except TypeError:
+                readline = getattr(raw, "readline", None)
+                if callable(readline):
+                    while True:
+                        chunk = readline()
+                        if not chunk:
+                            break
+                        yield chunk
+                else:
+                    yield raw.read()
+            else:
+                yield from iterator
+
+        line_parts: list[str] = []
+        line_bytes = 0
+        line_discarded = False
+
+        def reset_line() -> None:
+            nonlocal line_bytes, line_discarded
+            line_parts.clear()
+            line_bytes = 0
+            line_discarded = False
+
+        def consume_line(line: str) -> Iterator[Dict[str, Any]]:
+            nonlocal data_bytes
+            line = line.rstrip("\r")
+            if line == "":
+                event = parse_event("\n".join(data_lines))
+                data_lines.clear()
+                data_bytes = 0
+                if event is not None:
+                    yield event
+            elif line.startswith("data:"):
+                value = line[5:].lstrip()
+                value_size = len(value.encode("utf-8", "replace"))
+                if data_bytes + value_size > CODEX_SSE_BUFFER_LIMIT_BYTES:
+                    data_lines.clear()
+                    data_bytes = 0
+                    record_parse_error("SSE event exceeded debug parse limit")
+                else:
+                    data_lines.append(value)
+                    data_bytes += value_size
+
+        for chunk in raw_chunks():
+            if not chunk:
+                continue
+            if isinstance(chunk, bytes):
+                response_text_len += len(chunk)
+                text_chunk = chunk.decode("utf-8", "replace")
+            else:
+                text_chunk = str(chunk)
+                response_text_len += len(text_chunk.encode("utf-8", "replace"))
+            parts = text_chunk.split("\n")
+            last_part_index = len(parts) - 1
+            for part_index, part in enumerate(parts):
+                complete = part_index < last_part_index
+                part_size = len(part.encode("utf-8", "replace"))
+                if not line_discarded:
+                    line_bytes += part_size
+                    if line_bytes > CODEX_SSE_BUFFER_LIMIT_BYTES:
+                        line_parts.clear()
+                        line_discarded = True
+                        record_parse_error("SSE line exceeded debug parse limit")
+                    else:
+                        line_parts.append(part)
+                if complete:
+                    if line_discarded:
+                        data_lines.clear()
+                        data_bytes = 0
+                    else:
+                        yield from consume_line("".join(line_parts))
+                    reset_line()
+        if line_discarded:
+            data_lines.clear()
+            data_bytes = 0
+        elif line_parts:
+            yield from consume_line("".join(line_parts))
+        event = parse_event("\n".join(data_lines))
+        if event is not None:
+            yield event
         logger.info({
             "event": "codex_responses_response_debug",
             "status_code": status_code,
             "content_type": content_type,
-            "response_text_len": len(text),
-            "event_count": len(events),
+            "response_text_len": response_text_len,
+            "event_count": event_count,
             "event_types": event_types,
             "image_result_lengths": image_result_lengths[:10],
             "parse_error_count": len(parse_errors),
             "parse_errors": parse_errors[:5],
-            "event_summaries": [OpenAIBackendAPI._codex_event_summary(event) for event in events[:30]],
-            "event_previews": [
-                OpenAIBackendAPI._codex_body_preview(event, 1500)
-                for event in events[:10]
-            ] if not image_result_lengths else [],
-            "body_preview": text[:1000] if not events else "",
+            "event_summaries": summaries,
+            "event_previews": [],
+            "body_preview": "" if event_count else "no valid SSE events",
         })
-        for event in events:
-            yield event
 
     def iter_codex_image_response_events(
             self,
@@ -850,7 +1011,10 @@ class OpenAIBackendAPI:
             with urllib.request.urlopen(request, timeout=1200) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
+            error_body = error.read(CODEX_RESPONSE_DEBUG_LIMIT_BYTES + 1)
+            if not isinstance(error_body, bytes):
+                error_body = str(error_body).encode("utf-8", "replace")
+            body_text = error_body[:CODEX_RESPONSE_DEBUG_LIMIT_BYTES].decode("utf-8", "replace")
             body: Any = body_text
             try:
                 body = json.loads(body_text)
@@ -892,8 +1056,8 @@ class OpenAIBackendAPI:
             json=payload,
             timeout=60,
         )
-        ensure_ok(response, path)
-        return response.json().get("conduit_token", "")
+        payload = self._read_json_response(response, path)
+        return payload.get("conduit_token", "")
 
     def _decode_image_base64(self, image: str) -> bytes:
         """把 base64 图片字符串或本地路径解码成二进制。"""
@@ -923,9 +1087,10 @@ class OpenAIBackendAPI:
             candidate_path = Path(os.path.expanduser(image))
             if candidate_path.exists() and candidate_path.is_file():
                 file_name = candidate_path.name
-        image = Image.open(BytesIO(data))
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, "image/png")
+        with BytesIO(data) as image_buffer:
+            with Image.open(image_buffer) as image:
+                width, height = image.size
+                mime_type = Image.MIME.get(image.format, "image/png")
         path = "/backend-api/files"
         response = self.session.post(
             self.base_url + path,
@@ -934,8 +1099,7 @@ class OpenAIBackendAPI:
                   "height": height},
             timeout=60,
         )
-        ensure_ok(response, path)
-        upload_meta = response.json()
+        upload_meta = self._read_json_response(response, path)
         response = self.session.put(
             upload_meta["upload_url"],
             headers={
@@ -951,7 +1115,10 @@ class OpenAIBackendAPI:
             data=data,
             timeout=120,
         )
-        ensure_ok(response, "image_upload")
+        try:
+            ensure_ok(response, "image_upload")
+        finally:
+            self._close_response(response)
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         response = self.session.post(
             self.base_url + path,
@@ -959,7 +1126,10 @@ class OpenAIBackendAPI:
             data="{}",
             timeout=60,
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        finally:
+            self._close_response(response)
         return {
             "file_id": upload_meta["file_id"],
             "file_name": file_name,
@@ -1042,16 +1212,19 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
-        return response
+        try:
+            ensure_ok(response, path)
+            return response
+        except BaseException:
+            self._close_response(response)
+            raise
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
-        ensure_ok(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """删除本地对话记录。"""
@@ -1068,8 +1241,7 @@ class OpenAIBackendAPI:
             json={"is_visible": False},
             timeout=60,
         )
-        ensure_ok(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
     def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
@@ -1084,8 +1256,7 @@ class OpenAIBackendAPI:
                 headers=self._headers(path, {"Accept": "application/json"}),
                 timeout=timeout_secs,
             )
-            ensure_ok(response, path)
-            data = response.json()
+            data = self._read_json_response(response, path)
             return data.get("items") or data.get("conversations") or []
         except Exception as exc:
             logger.debug({"event": "list_conversations_failed", "error": str(exc)})
@@ -1277,8 +1448,7 @@ class OpenAIBackendAPI:
             },
             timeout=60,
         )
-        ensure_ok(response, path)
-        payload = response.json()
+        payload = self._read_json_response(response, path)
         upload_url = str(payload.get("upload_url") or "")
         file_id = str(payload.get("file_id") or "")
         if not upload_url or not file_id:
@@ -1298,7 +1468,10 @@ class OpenAIBackendAPI:
             data=data,
             timeout=120,
         )
-        ensure_ok(response, "image_upload")
+        try:
+            ensure_ok(response, "image_upload")
+        finally:
+            self._close_response(response)
         path = f"/backend-api/files/{file_id}/uploaded"
         response = self.session.post(
             self.base_url + path,
@@ -1306,7 +1479,10 @@ class OpenAIBackendAPI:
             data="{}",
             timeout=60,
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        finally:
+            self._close_response(response)
         return {
             "file_id": file_id,
             "library_file_id": str(payload.get("library_file_id") or ""),
@@ -1328,10 +1504,11 @@ class OpenAIBackendAPI:
             mime_type = str(match.group(1) or "").strip().lower()
             payload = str(match.group(2) or "").strip()
         data = base64.b64decode(payload)
-        image = Image.open(BytesIO(data))
-        image.load()
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, mime_type or "image/png")
+        with BytesIO(data) as image_buffer:
+            with Image.open(image_buffer) as image:
+                image.load()
+                width, height = image.size
+                mime_type = Image.MIME.get(image.format, mime_type or "image/png")
         extension = mimetypes.guess_extension(mime_type) or ".png"
         return data, f"image_{index}{extension}", mime_type, width, height
 
@@ -1361,10 +1538,10 @@ class OpenAIBackendAPI:
             json=payload,
             timeout=60,
         )
-        ensure_ok(response, path)
-        conduit_token = str(response.json().get("conduit_token") or "")
+        payload = self._read_json_response(response, path)
+        conduit_token = str(payload.get("conduit_token") or "")
         if not conduit_token:
-            raise RuntimeError(f"missing conduit_token: {response.text}")
+            raise RuntimeError(f"missing conduit_token: {payload}")
         return conduit_token
 
     def _run_editable_conversation(self, prompt: str, uploaded: list[Dict[str, Any]], conduit_token: str) -> str:
@@ -1435,15 +1612,15 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
-        conversation_id = ""
         try:
+            ensure_ok(response, path)
+            conversation_id = ""
             for payload in iter_sse_payloads(response):
                 if payload == "[DONE]":
                     break
                 conversation_id = conversation_id or self._find_editable_value(payload, "conversation_id")
         finally:
-            response.close()
+            self._close_response(response)
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -1482,8 +1659,7 @@ class OpenAIBackendAPI:
     def _get_editable_conversation_detail(self, conversation_id: str) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._editable_conversation_document_headers(path, conversation_id), timeout=60)
-        ensure_ok(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
     def _editable_browser_headers(self, path: str, conversation_id: str) -> Dict[str, str]:
         headers = self._headers(path, {"Accept": "*/*"})
@@ -1591,12 +1767,15 @@ class OpenAIBackendAPI:
         if not download_url:
             raise RuntimeError(f"download url not found for artifact: {artifact}")
         response = self.session.get(download_url, timeout=300)
-        ensure_ok(response, "artifact_download")
-        content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
-        file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
-        target_path = self._unique_editable_path(output_dir / file_name)
-        target_path.write_bytes(response.content)
-        return target_path
+        try:
+            ensure_ok(response, "artifact_download")
+            content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
+            file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
+            target_path = self._unique_editable_path(output_dir / file_name)
+            target_path.write_bytes(response.content)
+            return target_path
+        finally:
+            self._close_response(response)
 
     def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact) -> str:
         ids: list[str] = []
@@ -1611,10 +1790,13 @@ class OpenAIBackendAPI:
                 params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
                 timeout=60,
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            try:
+                if 200 <= response.status_code < 300:
+                    url = self._download_url_from_response(response)
+                    if url:
+                        return url
+            finally:
+                self._close_response(response)
         for attachment_id in ids:
             path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
             response = self.session.get(
@@ -1622,10 +1804,13 @@ class OpenAIBackendAPI:
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"),
                 timeout=60,
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            try:
+                if 200 <= response.status_code < 300:
+                    url = self._download_url_from_response(response)
+                    if url:
+                        return url
+            finally:
+                self._close_response(response)
         for file_id in ids:
             path = f"/backend-api/files/download/{file_id}"
             response = self.session.get(
@@ -1634,10 +1819,13 @@ class OpenAIBackendAPI:
                 params={"post_id": "", "inline": "false"},
                 timeout=60,
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            try:
+                if 200 <= response.status_code < 300:
+                    url = self._download_url_from_response(response)
+                    if url:
+                        return url
+            finally:
+                self._close_response(response)
         for file_id in ids:
             path = f"/backend-api/files/{file_id}/download"
             response = self.session.get(
@@ -1645,10 +1833,13 @@ class OpenAIBackendAPI:
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
                 timeout=60,
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            try:
+                if 200 <= response.status_code < 300:
+                    url = self._download_url_from_response(response)
+                    if url:
+                        return url
+            finally:
+                self._close_response(response)
         return ""
 
     def _editable_download_headers(self, path: str, conversation_id: str, route: str) -> Dict[str, str]:
@@ -1852,8 +2043,8 @@ class OpenAIBackendAPI:
             },
             timeout=60,
         )
-        ensure_ok(response, path)
-        token = str(response.json().get("conduit_token") or "")
+        payload = self._read_json_response(response, path)
+        token = str(payload.get("conduit_token") or "")
         if not token:
             raise RuntimeError("missing conduit_token")
         return token
@@ -1898,15 +2089,15 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
-        conversation_id = ""
         try:
+            ensure_ok(response, path)
+            conversation_id = ""
             for payload in iter_sse_payloads(response):
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
         finally:
-            response.close()
+            self._close_response(response)
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -1941,8 +2132,7 @@ class OpenAIBackendAPI:
         headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
         headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=headers, timeout=60)
-        ensure_ok(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
     def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
         messages = []
@@ -2321,8 +2511,7 @@ class OpenAIBackendAPI:
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
-        ensure_ok(response, path)
-        data = response.json()
+        data = self._read_json_response(response, path)
         return data.get("download_url") or data.get("url") or ""
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
@@ -2330,8 +2519,7 @@ class OpenAIBackendAPI:
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
-        ensure_ok(response, path)
-        data = response.json()
+        data = self._read_json_response(response, path)
         return data.get("download_url") or data.get("url") or ""
 
     def _query_backend_tasks(
@@ -2356,8 +2544,7 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Accept": "application/json"}),
             timeout=timeout_secs,
         )
-        ensure_ok(response, path)
-        data = response.json()
+        data = self._read_json_response(response, path)
         tasks = data.get("tasks", [])
         if not isinstance(tasks, list):
             return []
@@ -2550,9 +2737,15 @@ class OpenAIBackendAPI:
         images = []
         for url in urls:
             response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            try:
+                ensure_ok(response, "image_download")
+                content = response.content
+                if content not in images:
+                    images.append(content)
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
         return images
 
     def stream_conversation(
@@ -2581,11 +2774,11 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
         try:
+            ensure_ok(response, path)
             yield from iter_sse_payloads(response)
         finally:
-            response.close()
+            self._close_response(response)
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -2626,7 +2819,7 @@ class OpenAIBackendAPI:
         """
         deadline = time.monotonic() + hard_cap_secs
         # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
-        watchdog = threading.Timer(hard_cap_secs, response.close)
+        watchdog = threading.Timer(hard_cap_secs, lambda: self._close_response(response))
         watchdog.daemon = True
         watchdog.start()
         timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
@@ -2644,10 +2837,7 @@ class OpenAIBackendAPI:
             raise
         finally:
             watchdog.cancel()
-            try:
-                response.close()
-            except Exception:
-                pass
+            self._close_response(response)
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
@@ -2656,8 +2846,8 @@ class OpenAIBackendAPI:
             headers=self._bootstrap_headers(),
             timeout=30,
         )
-        ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        text = self._read_text_response(response, "bootstrap")
+        self.pow_script_sources, self.pow_data_build = parse_pow_resources(text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
@@ -2673,8 +2863,7 @@ class OpenAIBackendAPI:
             json={"p": p_token},
             timeout=30,
         )
-        ensure_ok(response, "chat_requirements_prepare")
-        prepare_data = response.json()
+        prepare_data = self._read_json_response(response, "chat_requirements_prepare")
 
         if (prepare_data.get("arkose") or {}).get("required"):
             raise RuntimeError("chat requirements requires arkose token, which is not implemented")
@@ -2706,8 +2895,7 @@ class OpenAIBackendAPI:
             },
             timeout=30,
         )
-        ensure_ok(response, "chat_requirements_finalize")
-        data = response.json()
+        data = self._read_json_response(response, "chat_requirements_finalize")
 
         token = data.get("token", "")
         if not token:
@@ -2740,10 +2928,10 @@ class OpenAIBackendAPI:
             headers=self._headers(route),
             timeout=30,
         )
-        ensure_ok(response, context)
+        response_data = self._read_json_response(response, context)
         data = []
         seen = set()
-        for item in response.json().get("models", []):
+        for item in response_data.get("models", []):
             if not isinstance(item, dict):
                 continue
             slug = str(item.get("slug", "")).strip()

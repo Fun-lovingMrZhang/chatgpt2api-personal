@@ -21,6 +21,7 @@ DEFAULT_BACKUP_INCLUDE = {
     "cpa": True,
     "sub2api": True,
     "logs": True,
+    "state_db": True,
     "image_tasks": True,
     "accounts_snapshot": True,
     "auth_keys_snapshot": True,
@@ -41,6 +42,7 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
     "ttl_seconds": 60,
     "max_entries": 256,
+    "max_bytes": 32 * 1024 * 1024,
     "dedupe_inflight": True,
     "stream_cache": True,
     "normalize_messages": True,
@@ -210,6 +212,11 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
             source.get("max_entries"),
             int(DEFAULT_CHAT_COMPLETION_CACHE["max_entries"]),
             1,
+        ),
+        "max_bytes": _normalize_positive_int(
+            source.get("max_bytes"),
+            int(DEFAULT_CHAT_COMPLETION_CACHE["max_bytes"]),
+            1024,
         ),
         "dedupe_inflight": _normalize_bool(
             source.get("dedupe_inflight"),
@@ -504,6 +511,12 @@ class ConfigStore:
         return DATA_DIR / "accounts.json"
 
     @property
+    def app_db_path(self) -> Path:
+        """Return the one normalized SQLite path shared by stateful services."""
+        configured = os.getenv("STATE_DB_PATH", "").strip()
+        return Path(configured) if configured else DATA_DIR / "app.db"
+
+    @property
     def refresh_account_interval_minute(self) -> int:
         try:
             return int(self.data.get("refresh_account_interval_minute", 5))
@@ -621,6 +634,42 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def progress_ttl_seconds(self) -> int:
+        return _normalize_positive_int(self.data.get("progress_ttl_seconds"), 900, 60)
+
+    @property
+    def token_alias_ttl_seconds(self) -> int:
+        return _normalize_positive_int(self.data.get("token_alias_ttl_seconds"), 86400, 60)
+
+    @property
+    def token_alias_max_per_account(self) -> int:
+        return _normalize_positive_int(self.data.get("token_alias_max_per_account"), 4, 1)
+
+    @property
+    def image_input_max_bytes(self) -> int:
+        return _normalize_positive_int(self.data.get("image_input_max_bytes"), 128 * 1024 * 1024, 1024 * 1024)
+
+    @property
+    def file_task_max_workers(self) -> int:
+        return _normalize_positive_int(self.data.get("file_task_max_workers"), 4, 1)
+
+    @property
+    def file_task_queue_max_items(self) -> int:
+        return _normalize_positive_int(self.data.get("file_task_queue_max_items"), 64, 1)
+
+    @property
+    def file_task_retention_days(self) -> int:
+        return _normalize_positive_int(self.data.get("file_task_retention_days"), 7, 1)
+
+    @property
+    def file_task_max_rows(self) -> int:
+        return _normalize_positive_int(self.data.get("file_task_max_rows"), 10000, 100)
+
+    @property
+    def image_task_max_rows(self) -> int:
+        return _normalize_positive_int(self.data.get("image_task_max_rows"), 10000, 100)
+
+    @property
     def log_levels(self) -> list[str]:
         levels = self.data.get("log_levels")
         if not isinstance(levels, list):
@@ -708,6 +757,15 @@ class ConfigStore:
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
+        data["progress_ttl_seconds"] = self.progress_ttl_seconds
+        data["token_alias_ttl_seconds"] = self.token_alias_ttl_seconds
+        data["token_alias_max_per_account"] = self.token_alias_max_per_account
+        data["image_input_max_bytes"] = self.image_input_max_bytes
+        data["file_task_max_workers"] = self.file_task_max_workers
+        data["file_task_queue_max_items"] = self.file_task_queue_max_items
+        data["file_task_retention_days"] = self.file_task_retention_days
+        data["file_task_max_rows"] = self.file_task_max_rows
+        data["image_task_max_rows"] = self.image_task_max_rows
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review

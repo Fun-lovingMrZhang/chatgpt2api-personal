@@ -45,6 +45,16 @@ class SQLiteLogStoreTests(unittest.TestCase):
         foreign_keys = self.store._connection().execute("PRAGMA foreign_keys").fetchone()[0]
         self.assertEqual(foreign_keys, 1)
 
+    def test_close_releases_connection(self):
+        self.store.initialize()
+        self.store.add("info", "ok", {})
+        connection = self.store._connection()
+
+        self.store.close()
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
     def test_add_round_trips_public_shape_and_detail(self):
         self.store.initialize()
 
@@ -55,6 +65,45 @@ class SQLiteLogStoreTests(unittest.TestCase):
         self.assertEqual(item["type"], "call")
         self.assertEqual(item["summary"], "调用完成")
         self.assertEqual(item["detail"], {"status": 200})
+
+    def test_detail_is_sanitized_recursively_and_bounded(self):
+        self.store.initialize()
+
+        item = self.store.add(
+            "call",
+            "bounded",
+            {
+                "status": 200,
+                "nested": {
+                    "response": "sensitive response",
+                    "safe": "x" * 10000,
+                },
+            },
+        )
+
+        self.assertNotIn("response", item["detail"]["nested"])
+        self.assertEqual(len(item["detail"]["nested"]["safe"]), 4096)
+        stored_size = self._raw_value("SELECT length(detail_json) FROM logs WHERE id = ?", item["id"])
+        self.assertLessEqual(stored_size, 64 * 1024)
+
+    def test_legacy_migration_drops_nested_payload_fields(self):
+        self.legacy_path.write_text(
+            json.dumps({
+                "type": "call",
+                "summary": "legacy",
+                "detail": {
+                    "request": {"body": "x" * 100000},
+                    "safe": {"status": 200},
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        self.store.initialize()
+
+        item = self.store.query(page=1, page_size=100)["items"][0]
+        self.assertNotIn("request", item["detail"])
+        self.assertEqual(item["detail"]["safe"], {"status": 200})
 
     def test_query_returns_newest_first_and_has_total_and_has_more(self):
         self.store.initialize()

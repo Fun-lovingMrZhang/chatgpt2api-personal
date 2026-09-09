@@ -20,7 +20,9 @@ class SQLiteStateStore(StorageBackend):
     complete accounts snapshot to JSON.
     """
 
-    CACHE_SIZE_KIB = -4096
+    # Application state is metadata-heavy rather than scan-heavy. A smaller
+    # per-thread page cache prevents request workers from reserving 4 MiB each.
+    CACHE_SIZE_KIB = -1024
 
     _ACCOUNT_COLUMNS = {
         "access_token",
@@ -639,6 +641,33 @@ class SQLiteStateStore(StorageBackend):
                 (current,),
             )
             return int(cursor.rowcount or 0)
+
+    def load_token_aliases(self, now: float | None = None) -> list[dict[str, object]]:
+        self._ensure_initialized()
+        current = time.time() if now is None else float(now)
+        rows = self._connection().execute(
+            """SELECT alias_token, current_token, expires_at, last_used_at
+               FROM account_token_aliases
+               WHERE expires_at > ?
+               ORDER BY expires_at DESC""",
+            (current,),
+        ).fetchall()
+        return [
+            {
+                "alias_token": row["alias_token"],
+                "current_token": row["current_token"],
+                "expires_at": float(row["expires_at"]),
+                "last_used_at": row["last_used_at"],
+            }
+            for row in rows
+        ]
+
+    def delete_token_alias(self, alias_token: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "DELETE FROM account_token_aliases WHERE alias_token = ?",
+                (str(alias_token),),
+            )
 
     def health_check(self) -> dict[str, Any]:
         try:

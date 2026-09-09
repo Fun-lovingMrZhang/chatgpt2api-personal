@@ -56,6 +56,9 @@ class AccountService:
         self._scheduler_state_generation = 0
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
+        self._token_alias_expiry: dict[str, float] = {}
+        self._token_alias_created_at: dict[str, float] = {}
+        self._load_token_aliases()
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -138,6 +141,77 @@ class AccountService:
             self._scheduler_state_generation += 1
             return
         self._save_accounts()
+
+    def _delete_account(self, access_token: str) -> None:
+        """Delete one account without rebuilding the complete SQLite snapshot."""
+        deleter = getattr(self.storage, "delete_account", None)
+        if callable(deleter):
+            deleter(access_token)
+            self._scheduler_state_generation += 1
+            return
+        self._save_accounts()
+
+    def _load_token_aliases(self) -> None:
+        loader = getattr(self.storage, "load_token_aliases", None)
+        if not callable(loader):
+            return
+        try:
+            aliases = loader()
+        except Exception:
+            return
+        now = time.time()
+        for item in aliases if isinstance(aliases, list) else []:
+            if not isinstance(item, dict):
+                continue
+            alias = str(item.get("alias_token") or "").strip()
+            current = str(item.get("current_token") or "").strip()
+            try:
+                expires_at = float(item.get("expires_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if alias and current and expires_at > now:
+                self._token_aliases[alias] = current
+                self._token_alias_expiry[alias] = expires_at
+                self._token_alias_created_at[alias] = float(item.get("last_used_at") or now)
+
+    def _remember_token_alias_locked(self, old_token: str, new_token: str, now: float) -> None:
+        self._token_aliases[old_token] = new_token
+        self._token_alias_expiry[old_token] = now + max(60, int(config.token_alias_ttl_seconds))
+        self._token_alias_created_at[old_token] = now
+        loader = getattr(self.storage, "save_token_alias", None)
+        if callable(loader):
+            try:
+                loader(
+                    old_token,
+                    new_token,
+                    expires_at=self._token_alias_expiry[old_token],
+                    last_used_at=now,
+                )
+            except Exception:
+                pass
+        self._prune_token_aliases_locked(new_token)
+
+    def _prune_token_aliases_locked(self, current_token: str | None = None) -> None:
+        max_aliases = max(1, int(config.token_alias_max_per_account))
+        candidates = []
+        for alias, _target in list(self._token_aliases.items()):
+            if current_token is not None:
+                try:
+                    if self._resolve_access_token_locked(alias) != current_token:
+                        continue
+                except Exception:
+                    continue
+            candidates.append((self._token_alias_created_at.get(alias, 0.0), alias))
+        for _created_at, alias in sorted(candidates, reverse=True)[max_aliases:]:
+            self._token_aliases.pop(alias, None)
+            self._token_alias_expiry.pop(alias, None)
+            self._token_alias_created_at.pop(alias, None)
+            deleter = getattr(self.storage, "delete_token_alias", None)
+            if callable(deleter):
+                try:
+                    deleter(alias)
+                except Exception:
+                    pass
 
     def scheduler_state_generation(self) -> int:
         with self._lock:
@@ -303,7 +377,13 @@ class AccountService:
     def _resolve_access_token_locked(self, access_token: str) -> str:
         token = str(access_token or "").strip()
         seen: set[str] = set()
+        now = time.time()
         while token and token not in self._accounts and token in self._token_aliases and token not in seen:
+            if self._token_alias_expiry.get(token, 0.0) <= now:
+                self._token_aliases.pop(token, None)
+                self._token_alias_expiry.pop(token, None)
+                self._token_alias_created_at.pop(token, None)
+                break
             seen.add(token)
             token = self._token_aliases.get(token, token)
         return token
@@ -333,7 +413,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[resolved] = account
-                self._save_accounts()
+                self._save_account(account)
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
@@ -439,12 +519,13 @@ class AccountService:
             rotated = new_token != old_token
             if rotated:
                 self._accounts.pop(old_token, None)
-                self._token_aliases[old_token] = new_token
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
             self._accounts[new_token] = account
             self._save_accounts()
+            if rotated:
+                self._remember_token_alias_locked(old_token, new_token, time.time())
             self._image_slot_condition.notify_all()
 
         log_service.add(
@@ -1223,6 +1304,10 @@ class AccountService:
                 for old, new in self._token_aliases.items()
                 if old not in target_set and new not in target_set
             }
+            for alias in list(self._token_alias_expiry):
+                if alias not in self._token_aliases:
+                    self._token_alias_expiry.pop(alias, None)
+                    self._token_alias_created_at.pop(alias, None)
             if removed:
                 if self._accounts:
                     self._index %= len(self._accounts)
@@ -1246,7 +1331,7 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._delete_account(access_token)
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
@@ -1308,7 +1393,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
-                self._save_accounts()
+                self._save_account(account)
             if should_defer:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
@@ -1351,7 +1436,7 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._delete_account(access_token)
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
@@ -1411,6 +1496,52 @@ class AccountService:
 
     # ---- 刷新进度追踪 ----
 
+    @staticmethod
+    def _compact_progress_result(result: dict | None) -> dict | None:
+        if not isinstance(result, dict):
+            return result
+        compact = {}
+        for key, value in result.items():
+            if key == "items":
+                if isinstance(value, list):
+                    compact["account_count"] = len(value)
+                continue
+            if key == "errors" and isinstance(value, list):
+                compact["errors"] = value[:100]
+                if len(value) > 100:
+                    compact["error_count"] = len(value)
+                continue
+            compact[key] = value
+        return compact
+
+    def cleanup_runtime_metadata(self, now: float | None = None) -> None:
+        current = time.time() if now is None else float(now)
+        ttl = max(60, int(config.progress_ttl_seconds))
+        with self._refresh_progress_lock:
+            for key, value in list(self._refresh_progress.items()):
+                if current - float(value.get("updated_ts") or current) > ttl:
+                    self._refresh_progress.pop(key, None)
+        with self._relogin_progress_lock:
+            for key, value in list(self._relogin_progress.items()):
+                if current - float(value.get("updated_ts") or current) > ttl:
+                    self._relogin_progress.pop(key, None)
+        with self._lock:
+            expired = [
+                alias
+                for alias, expires_at in self._token_alias_expiry.items()
+                if expires_at <= current
+            ]
+            for alias in expired:
+                self._token_aliases.pop(alias, None)
+                self._token_alias_expiry.pop(alias, None)
+                self._token_alias_created_at.pop(alias, None)
+            cleaner = getattr(self.storage, "cleanup_token_aliases", None)
+            if callable(cleaner):
+                try:
+                    cleaner(current)
+                except Exception:
+                    pass
+
     def init_refresh_progress(self, progress_id: str, total: int) -> None:
         """初始化刷新进度记录。"""
         with self._refresh_progress_lock:
@@ -1421,6 +1552,8 @@ class AccountService:
                 "error": None,
                 "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
                 "total_quota": 0,
+                "created_ts": time.time(),
+                "updated_ts": time.time(),
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
@@ -1436,6 +1569,7 @@ class AccountService:
             progress["processed"] += 1
             progress["status_counts"][status] = progress["status_counts"].get(status, 0) + 1
             progress["total_quota"] += quota
+            progress["updated_ts"] = time.time()
 
     def finish_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记刷新完成。"""
@@ -1444,15 +1578,23 @@ class AccountService:
             if progress is None:
                 return
             progress["done"] = True
-            progress["result"] = result
+            progress["result"] = self._compact_progress_result(result)
+            progress["updated_ts"] = time.time()
             if error:
                 progress["error"] = error
 
     def get_refresh_progress(self, progress_id: str) -> dict | None:
         """查询刷新进度。"""
+        self.cleanup_runtime_metadata()
         with self._refresh_progress_lock:
             progress = self._refresh_progress.get(progress_id)
-            return dict(progress) if progress else None
+            if not progress:
+                return None
+            result = dict(progress)
+        if result.get("done") and isinstance(result.get("result"), dict):
+            result["result"] = dict(result["result"])
+            result["result"].setdefault("items", self.list_accounts())
+        return result
 
     def clean_refresh_progress(self, progress_id: str) -> None:
         """清理过期进度记录。"""
@@ -1470,6 +1612,8 @@ class AccountService:
                 "done": False,
                 "error": None,
                 "results": [],
+                "created_ts": time.time(),
+                "updated_ts": time.time(),
             }
 
     def update_relogin_progress(self, progress_id: str, token: str, status: str, error: str | None = None) -> None:
@@ -1484,6 +1628,9 @@ class AccountService:
                 "status": status,
                 "error": error,
             })
+            if len(progress["results"]) > 1000:
+                del progress["results"][:-1000]
+            progress["updated_ts"] = time.time()
             if progress["processed"] >= progress["total"]:
                 progress["done"] = True
 
@@ -1494,15 +1641,23 @@ class AccountService:
             if progress is None:
                 return
             progress["done"] = True
-            progress["result"] = result
+            progress["result"] = self._compact_progress_result(result)
+            progress["updated_ts"] = time.time()
             if error:
                 progress["error"] = error
 
     def get_relogin_progress(self, progress_id: str) -> dict | None:
         """查询重新登录进度。"""
+        self.cleanup_runtime_metadata()
         with self._relogin_progress_lock:
             progress = self._relogin_progress.get(progress_id)
-            return dict(progress) if progress else None
+            if not progress:
+                return None
+            result = dict(progress)
+        if result.get("done") and isinstance(result.get("result"), dict):
+            result["result"] = dict(result["result"])
+            result["result"].setdefault("items", self.list_accounts())
+        return result
 
     def clean_relogin_progress(self, progress_id: str) -> None:
         """清理过期进度记录。"""

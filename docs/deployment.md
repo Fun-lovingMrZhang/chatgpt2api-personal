@@ -154,18 +154,18 @@ bun run dev
 
 ## 存储后端
 
-默认使用本地 JSON 文件：
+默认使用规范化 SQLite：
 
 ```text
-STORAGE_BACKEND=json
+STORAGE_BACKEND=sqlite
 ```
 
 可选值：
 
 | 值 | 说明 |
 | --- | --- |
-| `json` | 本地 JSON 文件，默认方式 |
-| `sqlite` | 本地 SQLite，通常存放在 `data/accounts.db` |
+| `json` | 本地 JSON 文件，保留为显式回滚方式 |
+| `sqlite` | 规范化本地 SQLite，默认存放在 `data/app.db` |
 | `postgres` | 外部 PostgreSQL |
 | `git` | Git 私有仓库存储账号数据 |
 
@@ -182,8 +182,21 @@ SQLite 示例：
 ```yaml
 environment:
   - STORAGE_BACKEND=sqlite
-  - DATABASE_URL=sqlite:////app/data/accounts.db
+  - STATE_DB_PATH=/app/data/app.db
 ```
+
+### 统一 SQLite 状态库迁移
+
+新版默认把账号、用户密钥、图片/文件任务、额度、额度预约和调度健康状态写入 `data/app.db`。业务日志继续单独写入 `data/logs.db`。图片任务和文件任务只保留状态、元数据及可恢复的远程 URL，不把请求图片或 Base64 写入数据库。
+
+首次迁移前停止旧容器并备份整个 `data/` 目录，然后在项目目录执行：
+
+```bash
+python3 scripts/migrate_to_sqlite.py --data-dir data --db data/app.db
+python3 scripts/migrate_to_sqlite.py --data-dir data --db data/app.db --verify
+```
+
+迁移成功后旧的 `accounts.json`、`auth_keys.json`、`scheduler.db`、`auth_quota.db`、`image_tasks.json` 和 `editable_file_tasks.json` 会原样保留，作为回滚和核对副本，不会被删除或覆盖。迁移是幂等的，重复执行不会重复导入；服务运行时保持 `STORAGE_BACKEND=sqlite`，管理员密钥仍从 `config.json` 或 `CHATGPT2API_AUTH_KEY` 读取。
 
 ## 业务日志存储
 

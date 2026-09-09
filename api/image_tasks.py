@@ -4,9 +4,10 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import ImageInputBudget, parse_image_edit_request, read_image_sources
 from api.support import _quota_exhausted_response, require_identity, resolve_image_base_url
 from services.content_filter import check_request
+from services.config import config
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
 from services.quota_service import QuotaExceededError, QuotaSettlementError
@@ -81,14 +82,17 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        budget = payload.pop("_image_input_budget", None)
+        if not isinstance(budget, ImageInputBudget):
+            budget = ImageInputBudget(config.image_input_max_bytes)
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
             raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
-        images = await read_image_sources(image_sources)
-        masks = await read_image_sources(mask_sources) if mask_sources else None
+        images = await read_image_sources(image_sources, budget=budget)
+        masks = await read_image_sources(mask_sources, budget=budget) if mask_sources else None
         try:
             return await image_task_service.submit_edit_async(
                 identity,
@@ -108,6 +112,10 @@ def create_router() -> APIRouter:
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
+        finally:
+            del images
+            if masks is not None:
+                del masks
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(

@@ -68,6 +68,7 @@ const includeLabels: Array<{ key: keyof BackupInclude; label: string }> = [
   { key: "cpa", label: "CPA 配置" },
   { key: "sub2api", label: "Sub2API 配置" },
   { key: "logs", label: "调度与调用日志" },
+  { key: "state_db", label: "SQLite 核心状态库" },
   { key: "image_tasks", label: "图片任务记录" },
   { key: "accounts_snapshot", label: "账号快照" },
   { key: "auth_keys_snapshot", label: "用户密钥快照" },

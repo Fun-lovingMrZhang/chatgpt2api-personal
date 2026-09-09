@@ -22,6 +22,7 @@ from utils.helper import (
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
+    MessageImageBudget,
     split_image_model,
 )
 from utils.image_tokens import count_image_content_tokens
@@ -166,6 +167,7 @@ def message_text(content: Any) -> str:
 
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
     normalized = []
+    image_budget = MessageImageBudget(max(1, int(config.image_input_max_bytes)))
     if config.global_system_prompt:
         normalized.append({"role": "system", "content": config.global_system_prompt})
     system_text = message_text(system)
@@ -180,14 +182,14 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
             text = message_text(content)
             images: list[tuple[bytes, str]] = []
             if role == "user":
-                images.extend(extract_image_from_message_content(content))
+                images.extend(extract_image_from_message_content(content, budget=image_budget))
                 if isinstance(content, list):
                     for part in content:
                         if not isinstance(part, dict) or part.get("type") != "image":
                             continue
                         data = part.get("data")
                         if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
-                            images.append((bytes(data), str(part.get("mime") or "image/png")))
+                            images.append((image_budget.consume(bytes(data)), str(part.get("mime") or "image/png")))
             if images:
                 parts: list[Any] = []
                 if text:
@@ -1305,12 +1307,16 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    images = _codex_response_images(list(backend.iter_codex_image_response_events(
+    images: list[str] = []
+    for event in backend.iter_codex_image_response_events(
         prompt=request.prompt,
         images=request.images or [],
         size=request.size,
         quality=request.quality,
-    )))
+    ):
+        for image in _codex_response_images(event):
+            if image not in images:
+                images.append(image)
     if not images:
         raise ImageGenerationError("No image result found in response")
     data = format_image_result(

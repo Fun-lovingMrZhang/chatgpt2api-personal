@@ -7,7 +7,7 @@ from threading import Event, Thread
 from typing import Any, Callable
 
 from services.account_service import AccountService, account_service
-from services.config import DATA_DIR, config
+from services.config import config
 from services.scheduler.account_pool import AccountPool
 from services.scheduler.context import ExecutionContext
 from services.scheduler.errors import QueueFullError
@@ -34,7 +34,7 @@ class SchedulerService:
         self.settings = settings or config.get_scheduler_settings()
         self._clock = clock
         self._stop_event = Event()
-        self.state_store = state_store or SchedulerStateStore(DATA_DIR / "app.db")
+        self.state_store = state_store or SchedulerStateStore(config.app_db_path)
         self.account_pool = AccountPool(
             self.account_service.scheduler_snapshot(),
             self.settings,

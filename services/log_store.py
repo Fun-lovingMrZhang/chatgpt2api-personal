@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,27 +16,57 @@ class SQLiteLogStore:
     _DELETE_CHUNK_SIZE = 900
     _MIGRATION_BATCH_SIZE = 500
     _MIGRATION_METADATA_KEY = "legacy_jsonl_migration"
+    _MAX_DETAIL_DEPTH = 6
+    _MAX_DETAIL_ITEMS = 100
+    _MAX_DETAIL_STRING_LENGTH = 4096
+    _MAX_DETAIL_JSON_BYTES = 64 * 1024
+    _MAX_LEGACY_LINE_CHARS = 2 * 1024 * 1024
+    _BLOCKED_DETAIL_KEYS = {
+        "body",
+        "data",
+        "image",
+        "images",
+        "mask",
+        "prompt",
+        "request",
+        "request_body",
+        "request_text",
+        "response",
+        "response_body",
+        "response_data",
+        "base64",
+        "b64_json",
+        "image_bytes",
+    }
 
     def __init__(self, db_path: Path, legacy_path: Path):
         self.db_path = Path(db_path)
         self.legacy_path = Path(legacy_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.legacy_path.parent.mkdir(parents=True, exist_ok=True)
-        self._local = threading.local()
         self._initialize_lock = threading.RLock()
+        self._connection_lock = threading.RLock()
+        self._connection_obj: sqlite3.Connection | None = None
         self._initialized = False
 
     def _connection(self) -> sqlite3.Connection:
-        connection = getattr(self._local, "connection", None)
-        if connection is None:
-            connection = sqlite3.connect(str(self.db_path), timeout=5.0)
+        with self._connection_lock:
+            connection = self._connection_obj
+            if connection is None:
+                connection = sqlite3.connect(
+                    str(self.db_path),
+                    timeout=5.0,
+                    check_same_thread=False,
+                )
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("PRAGMA cache_size=-2048")
+                connection.execute("PRAGMA wal_autocheckpoint=1000")
+                connection.execute("PRAGMA foreign_keys=ON")
+                self._connection_obj = connection
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute("PRAGMA foreign_keys=ON")
-            self._local.connection = connection
-        return connection
+            return connection
 
     def initialize(self) -> None:
         if self._initialized:
@@ -106,6 +137,48 @@ class SQLiteLogStore:
             "detail": detail,
         }
 
+    @classmethod
+    def _sanitize_detail_value(cls, value: object, depth: int = 0) -> object:
+        if depth >= cls._MAX_DETAIL_DEPTH:
+            return "[truncated]"
+        if isinstance(value, dict):
+            result: dict[str, object] = {}
+            for key, item in islice(value.items(), cls._MAX_DETAIL_ITEMS):
+                normalized_key = str(key)[: cls._MAX_DETAIL_STRING_LENGTH]
+                if normalized_key.lower() in cls._BLOCKED_DETAIL_KEYS:
+                    continue
+                result[normalized_key] = cls._sanitize_detail_value(item, depth + 1)
+            if len(value) > cls._MAX_DETAIL_ITEMS:
+                result["_truncated_fields"] = len(value) - cls._MAX_DETAIL_ITEMS
+            return result
+        if isinstance(value, (list, tuple)):
+            result = [
+                cls._sanitize_detail_value(item, depth + 1)
+                for item in value[: cls._MAX_DETAIL_ITEMS]
+            ]
+            if len(value) > cls._MAX_DETAIL_ITEMS:
+                result.append(f"[truncated {len(value) - cls._MAX_DETAIL_ITEMS} items]")
+            return result
+        if isinstance(value, str):
+            return value[: cls._MAX_DETAIL_STRING_LENGTH]
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        return str(value)[: cls._MAX_DETAIL_STRING_LENGTH]
+
+    @classmethod
+    def _sanitize_detail(cls, detail: object) -> dict[str, Any]:
+        value = cls._sanitize_detail_value(detail)
+        if not isinstance(value, dict):
+            value = {}
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            value = {}
+            encoded = "{}"
+        if len(encoded.encode("utf-8")) > cls._MAX_DETAIL_JSON_BYTES:
+            return {"_truncated": True}
+        return value
+
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
         payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
@@ -141,7 +214,8 @@ class SQLiteLogStore:
 
     def migration_metadata(self) -> dict[str, Any]:
         self._ensure_initialized()
-        return self._metadata(self._connection())
+        with self._connection_lock:
+            return self._metadata(self._connection())
 
     def _migration_backup_path(self) -> Path:
         candidate = self.legacy_path.with_name(self.legacy_path.name + ".migrated")
@@ -196,6 +270,9 @@ class SQLiteLogStore:
 
         with self.legacy_path.open("r", encoding="utf-8") as file:
             for line_number, raw_line in enumerate(file, start=1):
+                if len(raw_line) > self._MAX_LEGACY_LINE_CHARS:
+                    invalid_lines += 1
+                    continue
                 try:
                     payload = json.loads(raw_line)
                 except json.JSONDecodeError:
@@ -213,6 +290,7 @@ class SQLiteLogStore:
                 detail = payload.get("detail")
                 if not isinstance(detail, dict):
                     detail = {}
+                detail = self._sanitize_detail(detail)
                 batch.append(
                     (
                         record_id,
@@ -263,17 +341,18 @@ class SQLiteLogStore:
         self._ensure_initialized()
         time_text, timestamp = self._record_time(recorded_at, created_ts)
         item_id = str(record_id or uuid4().hex)
-        payload = detail if isinstance(detail, dict) else {}
+        payload = self._sanitize_detail(detail if isinstance(detail, dict) else {})
         detail_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        connection = self._connection()
-        with connection:
-            connection.execute(
-                """
-                INSERT INTO logs (id, time, created_ts, type, summary, detail_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (item_id, time_text, timestamp, str(log_type), str(summary), detail_json),
-            )
+        with self._connection_lock:
+            connection = self._connection()
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO logs (id, time, created_ts, type, summary, detail_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (item_id, time_text, timestamp, str(log_type), str(summary), detail_json),
+                )
         return {
             "id": item_id,
             "time": time_text,
@@ -313,29 +392,30 @@ class SQLiteLogStore:
 
         where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         offset = (page - 1) * page_size
-        connection = self._connection()
-        connection.execute("BEGIN")
-        try:
-            total = int(
-                connection.execute(
-                    f"SELECT COUNT(*) FROM logs{where_sql}",
-                    parameters,
-                ).fetchone()[0]
-            )
-            rows = connection.execute(
-                f"""
-                SELECT id, time, type, summary, detail_json
-                FROM logs
-                {where_sql}
-                ORDER BY created_ts DESC, sequence DESC
-                LIMIT ? OFFSET ?
-                """,
-                [*parameters, page_size, offset],
-            ).fetchall()
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        with self._connection_lock:
+            connection = self._connection()
+            connection.execute("BEGIN")
+            try:
+                total = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM logs{where_sql}",
+                        parameters,
+                    ).fetchone()[0]
+                )
+                rows = connection.execute(
+                    f"""
+                    SELECT id, time, type, summary, detail_json
+                    FROM logs
+                    {where_sql}
+                    ORDER BY created_ts DESC, sequence DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    [*parameters, page_size, offset],
+                ).fetchall()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
         items = [self._decode_row(row) for row in rows]
         return {
@@ -351,22 +431,23 @@ class SQLiteLogStore:
         if not target_ids:
             return 0
         self._ensure_initialized()
-        connection = self._connection()
-        removed = 0
-        connection.execute("BEGIN")
-        try:
-            for offset in range(0, len(target_ids), self._DELETE_CHUNK_SIZE):
-                chunk = target_ids[offset : offset + self._DELETE_CHUNK_SIZE]
-                placeholders = ", ".join("?" for _ in chunk)
-                cursor = connection.execute(
-                    f"DELETE FROM logs WHERE id IN ({placeholders})",
-                    chunk,
-                )
-                removed += max(cursor.rowcount, 0)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        with self._connection_lock:
+            connection = self._connection()
+            removed = 0
+            connection.execute("BEGIN")
+            try:
+                for offset in range(0, len(target_ids), self._DELETE_CHUNK_SIZE):
+                    chunk = target_ids[offset : offset + self._DELETE_CHUNK_SIZE]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    cursor = connection.execute(
+                        f"DELETE FROM logs WHERE id IN ({placeholders})",
+                        chunk,
+                    )
+                    removed += max(cursor.rowcount, 0)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return removed
 
     def cleanup_expired(self, retention_days: int) -> int:
@@ -374,7 +455,15 @@ class SQLiteLogStore:
             raise ValueError("retention_days must be positive")
         self._ensure_initialized()
         cutoff = time.time() - retention_days * 86400
-        connection = self._connection()
-        with connection:
-            cursor = connection.execute("DELETE FROM logs WHERE created_ts < ?", (cutoff,))
-            return max(cursor.rowcount, 0)
+        with self._connection_lock:
+            connection = self._connection()
+            with connection:
+                cursor = connection.execute("DELETE FROM logs WHERE created_ts < ?", (cutoff,))
+                return max(cursor.rowcount, 0)
+
+    def close(self) -> None:
+        with self._connection_lock:
+            connection = self._connection_obj
+            self._connection_obj = None
+            if connection is not None:
+                connection.close()

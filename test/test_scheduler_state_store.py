@@ -62,6 +62,25 @@ class SchedulerStateStoreTests(unittest.TestCase):
 
             self.assertEqual(len(store.list_health()), 1)
 
+    def test_close_releases_connections_created_by_worker_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SchedulerStateStore(Path(tmp_dir) / "scheduler.db")
+            store.initialize()
+
+            threads = [threading.Thread(target=store.list_health) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            connections = list(store._connections)
+
+            store.close()
+
+            self.assertEqual(store._connections, set())
+            for connection in connections:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+
     def test_snapshot_writer_coalesces_and_preserves_failed_batch(self) -> None:
         store = Mock()
         store.upsert_health_batch.side_effect = OSError("busy")

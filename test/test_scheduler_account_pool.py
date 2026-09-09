@@ -172,6 +172,7 @@ class AccountPoolTests(unittest.TestCase):
         }])
 
         self.assertEqual(pool.provider_status(self.text_requirement), ("missing", None))
+        self.assertEqual(pool.debug_heap_entry_count(), 0)
 
     def test_account_ref_pins_selection_to_the_original_account(self) -> None:
         pool = AccountPool(make_accounts("one", "two"), self.settings, model_router=fake_router)
@@ -230,6 +231,17 @@ class AccountPoolTests(unittest.TestCase):
         self.assertIsNotNone(
             pool.try_acquire(self.text_requirement, deadline=current_time[0] + 5)
         )
+
+    def test_repeated_lease_release_rebuilds_stale_capability_heaps(self) -> None:
+        pool = AccountPool(make_accounts("one", "two"), self.settings, model_router=fake_router)
+
+        for _ in range(5000):
+            lease = pool.try_acquire(self.text_requirement, deadline=pool.clock() + 5)
+            self.assertIsNotNone(lease)
+            pool.release(lease, outcome=Outcome.SUCCESS, latency_ms=1)
+
+        self.assertLessEqual(pool.debug_heap_entry_count(), pool.account_count() * 10)
+        self.assertLessEqual(pool.debug_stale_heap_entry_count(), pool.account_count())
 
 
 if __name__ == "__main__":

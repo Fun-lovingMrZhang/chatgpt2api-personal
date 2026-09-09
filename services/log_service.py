@@ -122,6 +122,11 @@ class LogService:
         self._ensure_initialized()
         return self.store.cleanup_expired(retention_days)
 
+    def close(self) -> None:
+        with self._initialize_lock:
+            self.store.close()
+            self._initialized = False
+
     def start_retention_scheduler(
         self,
         stop_event: threading.Event,

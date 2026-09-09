@@ -32,19 +32,32 @@ def _composite_mask(
     result: list[tuple[bytes, str, str]] = []
     for i, (data, filename, mime_type) in enumerate(images):
         mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
-        img = Image.open(BytesIO(data)).convert("RGBA")
-        mask_img = Image.open(BytesIO(mask_data))
-        if mask_img.mode == "RGBA":
-            alpha = mask_img.split()[3]
-        elif mask_img.mode == "L":
-            alpha = mask_img
-        else:
-            alpha = mask_img.convert("L")
-        alpha = alpha.resize(img.size, Image.LANCZOS)
-        img.putalpha(alpha)
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        result.append((buf.getvalue(), filename, "image/png"))
+        with (
+            BytesIO(data) as source_buffer,
+            BytesIO(mask_data) as mask_buffer,
+            Image.open(source_buffer) as source_image,
+            Image.open(mask_buffer) as mask_img,
+        ):
+            img = source_image.convert("RGBA")
+            try:
+                if mask_img.mode == "RGBA":
+                    alpha = mask_img.getchannel("A")
+                elif mask_img.mode == "L":
+                    alpha = mask_img.copy()
+                else:
+                    alpha = mask_img.convert("L")
+                resized_alpha = alpha.resize(img.size, Image.LANCZOS)
+                alpha.close()
+                img.putalpha(resized_alpha)
+                resized_alpha.close()
+                buf = BytesIO()
+                try:
+                    img.save(buf, format="PNG")
+                    result.append((buf.getvalue(), filename, "image/png"))
+                finally:
+                    buf.close()
+            finally:
+                img.close()
     return result
 
 
@@ -60,6 +73,10 @@ def build_request(body: dict[str, Any]) -> ConversationRequest:
     response_format = str(body.get("response_format") or "b64_json")
     progress_callback = body.get("progress_callback")
     encoded_images = encode_images(images)
+    input_image_tokens = count_image_inputs_tokens(images, model)
+    body["_input_image_tokens"] = input_image_tokens
+    body["images"] = []
+    body["mask"] = []
     if not encoded_images:
         raise ImageGenerationError("image is required")
     return ConversationRequest(
@@ -81,15 +98,17 @@ def format_outputs(
 ) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     model = str(body.get("model") or "gpt-image-2")
-    images = _composite_mask(body.get("images") or [], body.get("mask") or [])
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
     if body.get("stream"):
         return stream_image_chunks(outputs)
     result = collect_image_outputs(outputs)
+    input_image_tokens = body.get("_input_image_tokens")
+    if input_image_tokens is None:
+        input_image_tokens = count_image_inputs_tokens(body.get("images") or [], model)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
-        input_image_tokens=count_image_inputs_tokens(images, model),
+        input_image_tokens=int(input_image_tokens or 0),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
     return result

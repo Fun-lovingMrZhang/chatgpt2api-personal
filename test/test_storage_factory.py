@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import patch
-
 from services.config import config
 from services.quota_service import QuotaService
 from services.scheduler.service import SchedulerService
@@ -34,17 +32,31 @@ def test_json_backend_remains_an_explicit_rollback_option(monkeypatch, tmp_path)
 
 
 def test_scheduler_default_path_uses_app_db(monkeypatch, tmp_path):
-    with patch("services.scheduler.service.DATA_DIR", tmp_path):
-        service = SchedulerService(
-            account_service_instance=EmptyAccountService(),
-            settings=config.get_scheduler_settings(),
-        )
+    monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "app.db"))
+    service = SchedulerService(
+        account_service_instance=EmptyAccountService(),
+        settings=config.get_scheduler_settings(),
+    )
 
     assert service.state_store.db_path == tmp_path / "app.db"
 
 
 def test_quota_default_path_uses_app_db(monkeypatch, tmp_path):
-    with patch("services.quota_service.QUOTA_DB_PATH", tmp_path / "app.db"):
-        service = QuotaService()
+    monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "app.db"))
+    service = QuotaService()
 
     assert service.store.db_path == tmp_path / "app.db"
+
+
+def test_scheduler_and_quota_follow_custom_state_db_path(monkeypatch, tmp_path):
+    db_path = tmp_path / "custom-state.db"
+    monkeypatch.setenv("STATE_DB_PATH", str(db_path))
+
+    scheduler = SchedulerService(
+        account_service_instance=EmptyAccountService(),
+        settings=config.get_scheduler_settings(),
+    )
+    quota = QuotaService()
+
+    assert scheduler.state_store.db_path == db_path
+    assert quota.store.db_path == db_path

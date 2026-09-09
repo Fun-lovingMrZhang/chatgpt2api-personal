@@ -6,8 +6,10 @@ import io
 import json
 import os
 import random
+import sqlite3
 import subprocess
 import tarfile
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -74,6 +76,38 @@ def _openssl_encrypt(data: bytes, passphrase: str) -> bytes:
         detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
         raise BackupError(f"加密备份失败：{detail or 'openssl 执行失败'}") from exc
     return result.stdout
+
+
+def _openssl_encrypt_stream(source, destination, passphrase: str) -> None:
+    env = dict(os.environ)
+    env["CHATGPT2API_BACKUP_PASSPHRASE"] = passphrase
+    source.seek(0)
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "enc",
+                "-aes-256-cbc",
+                "-pbkdf2",
+                "-salt",
+                "-md",
+                "sha256",
+                "-pass",
+                "env:CHATGPT2API_BACKUP_PASSPHRASE",
+            ],
+            stdin=source,
+            stdout=destination,
+            stderr=subprocess.PIPE,
+            check=True,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise BackupError("当前环境缺少 openssl，无法执行加密备份") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise BackupError(f"加密备份失败：{detail or 'openssl 执行失败'}") from exc
+    destination.flush()
+    destination.seek(0)
 
 
 def _openssl_decrypt(data: bytes, passphrase: str) -> bytes:
@@ -167,13 +201,14 @@ class CloudflareR2Client:
         *,
         query: dict[str, str] | None = None,
         body: bytes = b"",
+        payload_hash: str | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[str, dict[str, str]]:
         now = _utc_now()
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
         encoded_query = urlencode(sorted((query or {}).items()))
-        payload_hash = _sha256_hex(body)
+        payload_hash = payload_hash or _sha256_hex(body)
         host = f"{self.account_id}.r2.cloudflarestorage.com"
         headers = {
             "host": host,
@@ -222,14 +257,22 @@ class CloudflareR2Client:
         key: str = "",
         *,
         query: dict[str, str] | None = None,
-        body: bytes = b"",
+        body: object = b"",
+        payload_hash: str | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: float = 60.0,
     ):
         object_path = f"/{self.bucket}"
         if key:
             object_path += f"/{quote(key.lstrip('/'), safe='/')}"
-        encoded_query, headers = self._aws_v4_headers(method, object_path, query=query, body=body, extra_headers=extra_headers)
+        encoded_query, headers = self._aws_v4_headers(
+            method,
+            object_path,
+            query=query,
+            body=body if isinstance(body, bytes) else b"",
+            payload_hash=payload_hash,
+            extra_headers=extra_headers,
+        )
         url = f"{self.endpoint}{object_path}"
         if encoded_query:
             url += f"?{encoded_query}"
@@ -239,9 +282,12 @@ class CloudflareR2Client:
     def test_connection(self) -> dict[str, object]:
         self.validate()
         response = self._request("GET", query={"list-type": "2", "max-keys": "1"}, timeout=30.0)
-        if response.status_code >= 400:
-            raise BackupError(f"连接 R2 失败：HTTP {response.status_code}")
-        return {"ok": True, "status": int(response.status_code)}
+        try:
+            if response.status_code >= 400:
+                raise BackupError(f"连接 R2 失败：HTTP {response.status_code}")
+            return {"ok": True, "status": int(response.status_code)}
+        finally:
+            response.close()
 
     def upload_bytes(self, key: str, payload: bytes, *, content_type: str, metadata: dict[str, str] | None = None) -> dict[str, object]:
         headers = {"content-type": content_type}
@@ -249,20 +295,64 @@ class CloudflareR2Client:
             for item_key, item_value in metadata.items():
                 headers[f"x-amz-meta-{item_key}"] = str(item_value)
         response = self._request("PUT", key, body=payload, extra_headers=headers)
-        if response.status_code >= 400:
-            raise BackupError(f"上传备份失败：HTTP {response.status_code}")
-        return {"key": key, "etag": str(response.headers.get("etag") or "").strip('"')}
+        try:
+            if response.status_code >= 400:
+                raise BackupError(f"上传备份失败：HTTP {response.status_code}")
+            return {"key": key, "etag": str(response.headers.get("etag") or "").strip('"')}
+        finally:
+            response.close()
+
+    def upload_file(self, key: str, source, *, content_type: str, metadata: dict[str, str] | None = None) -> dict[str, object]:
+        headers = {"content-type": content_type}
+        if metadata:
+            for item_key, item_value in metadata.items():
+                headers[f"x-amz-meta-{item_key}"] = str(item_value)
+        original_position = source.tell()
+        size = 0
+        digest = hashlib.sha256()
+        try:
+            source.seek(0)
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+            source.seek(0)
+            headers["content-length"] = str(size)
+            response = self._request(
+                "PUT",
+                key,
+                body=source,
+                payload_hash=digest.hexdigest(),
+                extra_headers=headers,
+            )
+            try:
+                if response.status_code >= 400:
+                    raise BackupError(f"上传备份失败：HTTP {response.status_code}")
+                return {
+                    "key": key,
+                    "etag": str(response.headers.get("etag") or "").strip('"'),
+                    "size": size,
+                }
+            finally:
+                response.close()
+        finally:
+            source.seek(original_position)
 
     def delete_object(self, key: str) -> None:
         response = self._request("DELETE", key, timeout=30.0)
-        if response.status_code >= 400 and response.status_code != 404:
-            raise BackupError(f"删除备份失败：HTTP {response.status_code}")
+        try:
+            if response.status_code >= 400 and response.status_code != 404:
+                raise BackupError(f"删除备份失败：HTTP {response.status_code}")
+        finally:
+            response.close()
 
     def download_bytes(self, key: str) -> bytes:
         response = self._request("GET", key, timeout=60.0)
-        if response.status_code >= 400:
-            raise BackupError(f"读取备份失败：HTTP {response.status_code}")
-        return bytes(response.content or b"")
+        try:
+            if response.status_code >= 400:
+                raise BackupError(f"读取备份失败：HTTP {response.status_code}")
+            return bytes(response.content or b"")
+        finally:
+            response.close()
 
     def list_objects(self) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
@@ -272,9 +362,12 @@ class CloudflareR2Client:
             if continuation:
                 query["continuation-token"] = continuation
             response = self._request("GET", query=query, timeout=30.0)
-            if response.status_code >= 400:
-                raise BackupError(f"获取备份列表失败：HTTP {response.status_code}")
-            text = response.text
+            try:
+                if response.status_code >= 400:
+                    raise BackupError(f"获取备份列表失败：HTTP {response.status_code}")
+                text = response.text
+            finally:
+                response.close()
             for block in text.split("<Contents>")[1:]:
                 key = _clean(block.split("<Key>", 1)[1].split("</Key>", 1)[0]) if "<Key>" in block else ""
                 if not key:
@@ -506,35 +599,43 @@ class BackupService:
     def _run_backup_once(self, *, trigger: str) -> dict[str, object]:
         settings = config.get_backup_settings()
         client = CloudflareR2Client(settings)
-        client.validate()
-        payload_raw = self._build_backup_archive(settings, trigger=trigger)
-        encrypted = bool(settings.get("encrypt"))
-        if encrypted:
-            passphrase = _clean(settings.get("passphrase"))
-            if not passphrase:
-                raise BackupError("已启用备份加密，但未设置加密口令")
-            payload = _openssl_encrypt(payload_raw, passphrase)
-            suffix = ".tar.gz.enc"
-        else:
-            payload = payload_raw
-            suffix = ".tar.gz"
-        timestamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
-        random_tag = f"{random.randint(0, 0xFFFF):04x}"
-        object_key = f"{client.prefix.rstrip('/')}/backup-{timestamp}-{random_tag}{suffix}"
-        metadata = {
-            "created-at": _iso_now(),
-            "encrypted": "true" if encrypted else "false",
-            "trigger": trigger,
-        }
+        archive_file = None
+        encrypted_file = None
         try:
-            result = client.upload_bytes(object_key, payload, content_type="application/octet-stream", metadata=metadata)
+            client.validate()
+            archive_file = self._build_backup_archive_file(settings, trigger=trigger)
+            encrypted = bool(settings.get("encrypt"))
+            if encrypted:
+                passphrase = _clean(settings.get("passphrase"))
+                if not passphrase:
+                    raise BackupError("已启用备份加密，但未设置加密口令")
+                encrypted_file = tempfile.TemporaryFile(mode="w+b", prefix="chatgpt2api-backup-", dir=DATA_DIR)
+                _openssl_encrypt_stream(archive_file, encrypted_file, passphrase)
+                upload_source = encrypted_file
+                suffix = ".tar.gz.enc"
+            else:
+                upload_source = archive_file
+                suffix = ".tar.gz"
+            timestamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+            random_tag = f"{random.randint(0, 0xFFFF):04x}"
+            object_key = f"{client.prefix.rstrip('/')}/backup-{timestamp}-{random_tag}{suffix}"
+            metadata = {
+                "created-at": _iso_now(),
+                "encrypted": "true" if encrypted else "false",
+                "trigger": trigger,
+            }
+            result = client.upload_file(object_key, upload_source, content_type="application/octet-stream", metadata=metadata)
             self._apply_rotation(client, int(settings.get("rotation_keep") or 0))
             return {
                 "key": result["key"],
-                "size": len(payload),
+                "size": int(result.get("size") or 0),
                 "encrypted": encrypted,
             }
         finally:
+            if encrypted_file is not None:
+                encrypted_file.close()
+            if archive_file is not None:
+                archive_file.close()
             client.close()
 
     def _decode_backup_payload(self, key: str, payload: bytes) -> dict[str, object]:
@@ -610,7 +711,7 @@ class BackupService:
             "snapshots": snapshots,
         }
 
-    def _build_backup_archive(self, settings: dict[str, object], *, trigger: str) -> bytes:
+    def _build_backup_archive_file(self, settings: dict[str, object], *, trigger: str):
         include = settings.get("include") if isinstance(settings.get("include"), dict) else {}
         metadata = {
             "version": 2,
@@ -619,41 +720,54 @@ class BackupService:
             "app_version": config.app_version,
             "storage_backend": config.get_storage_backend().get_backend_info(),
         }
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-            self._add_bytes_to_archive(archive, "backup-metadata.json", _json_bytes(metadata))
-            if include.get("config"):
-                self._add_file_to_archive(archive, CONFIG_FILE, "config.json")
-            if include.get("cpa"):
-                self._add_file_to_archive(archive, DATA_DIR / "cpa_config.json", "data/cpa_config.json")
-            if include.get("sub2api"):
-                self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
-            if include.get("logs"):
-                self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
-            if include.get("image_tasks"):
-                self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
-                self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
-            if include.get("accounts_snapshot"):
-                self._add_bytes_to_archive(
-                    archive,
-                    "snapshots/accounts.json",
-                    _json_bytes(config.get_storage_backend().load_accounts()),
-                )
-            if include.get("auth_keys_snapshot"):
-                self._add_bytes_to_archive(
-                    archive,
-                    "snapshots/auth_keys.json",
-                    _json_bytes(config.get_storage_backend().load_auth_keys()),
-                )
-                self._add_bytes_to_archive(
-                    archive,
-                    "data/auth_quota.db",
-                    self.quota_service.snapshot_bytes(),
-                )
-            if include.get("images"):
-                self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
-                self._add_directory_to_archive(archive, config.images_dir, "data/images")
-        return buffer.getvalue()
+        archive_file = tempfile.TemporaryFile(mode="w+b", prefix="chatgpt2api-backup-", dir=DATA_DIR)
+        try:
+            with tarfile.open(fileobj=archive_file, mode="w:gz") as archive:
+                self._add_bytes_to_archive(archive, "backup-metadata.json", _json_bytes(metadata))
+                if include.get("config"):
+                    self._add_file_to_archive(archive, CONFIG_FILE, "config.json")
+                if include.get("cpa"):
+                    self._add_file_to_archive(archive, DATA_DIR / "cpa_config.json", "data/cpa_config.json")
+                if include.get("sub2api"):
+                    self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
+                if include.get("logs"):
+                    self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
+                    self._add_sqlite_snapshot_to_archive(archive, DATA_DIR / "logs.db", "data/logs.db")
+                if include.get("state_db"):
+                    state_db = config.app_db_path
+                    self._add_sqlite_snapshot_to_archive(archive, state_db, "data/app.db")
+                if include.get("image_tasks"):
+                    self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
+                    self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
+                if include.get("accounts_snapshot"):
+                    self._add_bytes_to_archive(
+                        archive,
+                        "snapshots/accounts.json",
+                        _json_bytes(config.get_storage_backend().load_accounts()),
+                    )
+                if include.get("auth_keys_snapshot"):
+                    self._add_bytes_to_archive(
+                        archive,
+                        "snapshots/auth_keys.json",
+                        _json_bytes(config.get_storage_backend().load_auth_keys()),
+                    )
+                    self._add_bytes_to_archive(
+                        archive,
+                        "data/auth_quota.db",
+                        self.quota_service.snapshot_bytes(),
+                    )
+                if include.get("images"):
+                    self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
+                    self._add_directory_to_archive(archive, config.images_dir, "data/images")
+            archive_file.seek(0)
+            return archive_file
+        except Exception:
+            archive_file.close()
+            raise
+
+    def _build_backup_archive(self, settings: dict[str, object], *, trigger: str) -> bytes:
+        with self._build_backup_archive_file(settings, trigger=trigger) as archive_file:
+            return archive_file.read()
 
     def _add_bytes_to_archive(self, archive: tarfile.TarFile, name: str, payload: bytes) -> None:
         info = tarfile.TarInfo(name=name)
@@ -665,6 +779,35 @@ class BackupService:
         if not source.exists() or not source.is_file():
             return
         archive.add(source, arcname=arcname)
+
+    def _add_sqlite_snapshot_to_archive(self, archive: tarfile.TarFile, source: Path, arcname: str) -> None:
+        """Archive a consistent SQLite snapshot without materializing the DB in memory."""
+        if not source.exists() or not source.is_file():
+            return
+        snapshot_path: Path | None = None
+        source_connection = None
+        destination_connection = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b",
+                prefix="chatgpt2api-sqlite-snapshot-",
+                suffix=".db",
+                dir=DATA_DIR,
+                delete=False,
+            ) as handle:
+                snapshot_path = Path(handle.name)
+            source_connection = sqlite3.connect(str(source), timeout=30.0)
+            destination_connection = sqlite3.connect(str(snapshot_path), timeout=30.0)
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+            self._add_file_to_archive(archive, snapshot_path, arcname)
+        finally:
+            if source_connection is not None:
+                source_connection.close()
+            if destination_connection is not None:
+                destination_connection.close()
+            if snapshot_path is not None:
+                snapshot_path.unlink(missing_ok=True)
 
     def _add_directory_to_archive(self, archive: tarfile.TarFile, source_dir: Path, arcname_root: str) -> None:
         if not source_dir.exists() or not source_dir.is_dir():

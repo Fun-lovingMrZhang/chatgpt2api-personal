@@ -323,17 +323,19 @@ def _load_json(value: object) -> object:
 
 def _source_count(sources: dict[str, Path], name: str) -> int:
     if name == "accounts":
-        return sum(
-            bool(str(item.get("access_token") or item.get("accessToken") or "").strip())
+        return len({
+            str(item.get("access_token") or item.get("accessToken") or "").strip()
             for item in _read_json_list(sources["accounts"])
-        )
+            if str(item.get("access_token") or item.get("accessToken") or "").strip()
+        })
     if name == "auth_keys":
-        return sum(
-            bool(str(item.get("id") or "").strip())
+        return len({
+            str(item.get("id") or "").strip()
+            for item in _read_json_list(sources["auth_keys"], wrapped=True)
+            if str(item.get("id") or "").strip()
             and str(item.get("key_hash") or "").strip()
             and str(item.get("role") or "user").strip().lower() != "admin"
-            for item in _read_json_list(sources["auth_keys"], wrapped=True)
-        )
+        })
     if name == "tasks":
         scheduler = {
             str(row["task_key"] or "").strip()
@@ -346,22 +348,116 @@ def _source_count(sources: dict[str, Path], name: str) -> int:
             if str(item.get("id") or item.get("task_id") or "").strip()
             and str(item.get("owner_id") or "").strip()
         }
-        editable = sum(
-            bool(str(item.get("id") or "").strip()) and bool(str(item.get("owner_id") or "").strip())
+        editable = {
+            f"file:{str(item.get('owner_id') or '').strip()}:{str(item.get('id') or '').strip()}"
             for item in _read_json_list(sources["editable_tasks"])
-        )
-        return len(scheduler | image) + editable
+            if str(item.get("id") or "").strip() and str(item.get("owner_id") or "").strip()
+        }
+        return len(scheduler | image | editable)
     if name == "scheduler_health":
-        return len(_source_rows(sources["scheduler"], "scheduler_account_health"))
+        return len({
+            (str(row["account_key"] or "").strip(), str(row["lane"] or "").strip())
+            for row in _source_rows(sources["scheduler"], "scheduler_account_health")
+            if str(row["account_key"] or "").strip() and str(row["lane"] or "").strip()
+        })
     if name == "key_quotas":
-        return len(_source_rows(sources["quota"], "key_quotas"))
+        return len({
+            str(row["key_id"] or "").strip()
+            for row in _source_rows(sources["quota"], "key_quotas")
+            if str(row["key_id"] or "").strip()
+        })
     if name == "quota_reservations":
-        return len(_source_rows(sources["quota"], "quota_reservations"))
+        return len({
+            str(row["reservation_id"] or "").strip()
+            for row in _source_rows(sources["quota"], "quota_reservations")
+            if str(row["reservation_id"] or "").strip()
+        })
     return 0
+
+
+def _source_identity_sets(sources: dict[str, Path]) -> dict[str, set[object]]:
+    scheduler_task_keys = {
+        str(row["task_key"] or "").strip()
+        for row in _source_rows(sources["scheduler"], "scheduler_tasks")
+        if str(row["task_key"] or "").strip()
+    }
+    image_task_keys = {
+        f"{str(item.get('owner_id') or '').strip()}:{str(item.get('id') or item.get('task_id') or '').strip()}"
+        for item in _read_json_list(sources["image_tasks"])
+        if str(item.get("id") or item.get("task_id") or "").strip()
+        and str(item.get("owner_id") or "").strip()
+    }
+    editable_task_keys = {
+        f"file:{str(item.get('owner_id') or '').strip()}:{str(item.get('id') or '').strip()}"
+        for item in _read_json_list(sources["editable_tasks"])
+        if str(item.get("id") or "").strip() and str(item.get("owner_id") or "").strip()
+    }
+    return {
+        "accounts": {
+            str(item.get("access_token") or item.get("accessToken") or "").strip()
+            for item in _read_json_list(sources["accounts"])
+            if str(item.get("access_token") or item.get("accessToken") or "").strip()
+        },
+        "auth_keys": {
+            str(item.get("id") or "").strip()
+            for item in _read_json_list(sources["auth_keys"], wrapped=True)
+            if str(item.get("id") or "").strip()
+            and str(item.get("key_hash") or "").strip()
+            and str(item.get("role") or "user").strip().lower() != "admin"
+        },
+        "tasks": scheduler_task_keys | image_task_keys | editable_task_keys,
+        "scheduler_health": {
+            (str(row["account_key"] or "").strip(), str(row["lane"] or "").strip())
+            for row in _source_rows(sources["scheduler"], "scheduler_account_health")
+            if str(row["account_key"] or "").strip() and str(row["lane"] or "").strip()
+        },
+        "key_quotas": {
+            str(row["key_id"] or "").strip()
+            for row in _source_rows(sources["quota"], "key_quotas")
+            if str(row["key_id"] or "").strip()
+        },
+        "quota_reservations": {
+            str(row["reservation_id"] or "").strip()
+            for row in _source_rows(sources["quota"], "quota_reservations")
+            if str(row["reservation_id"] or "").strip()
+        },
+    }
 
 
 def _count_rows(connection: sqlite3.Connection, table: str) -> int:
     return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def _destination_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    return {
+        name: _count_rows(connection, table)
+        for name, table in (
+            ("accounts", "accounts"),
+            ("auth_keys", "auth_keys"),
+            ("tasks", "tasks"),
+            ("scheduler_health", "scheduler_account_health"),
+            ("key_quotas", "key_quotas"),
+            ("quota_reservations", "quota_reservations"),
+        )
+    }
+
+
+def _destination_identity_sets(connection: sqlite3.Connection) -> dict[str, set[object]]:
+    return {
+        "accounts": {row[0] for row in connection.execute("SELECT access_token FROM accounts")},
+        "auth_keys": {row[0] for row in connection.execute("SELECT key_id FROM auth_keys")},
+        "tasks": {row[0] for row in connection.execute("SELECT task_key FROM tasks")},
+        "scheduler_health": {
+            (row[0], row[1])
+            for row in connection.execute(
+                "SELECT account_key, lane FROM scheduler_account_health"
+            )
+        },
+        "key_quotas": {row[0] for row in connection.execute("SELECT key_id FROM key_quotas")},
+        "quota_reservations": {
+            row[0] for row in connection.execute("SELECT reservation_id FROM quota_reservations")
+        },
+    }
 
 
 def _validate_imported_counts(
@@ -377,24 +473,24 @@ def _validate_imported_counts(
         "key_quotas": _source_count(sources, "key_quotas"),
         "quota_reservations": _source_count(sources, "quota_reservations"),
     }
-    actual = {
-        name: _count_rows(connection, table)
-        for name, table in (
-            ("accounts", "accounts"),
-            ("auth_keys", "auth_keys"),
-            ("tasks", "tasks"),
-            ("scheduler_health", "scheduler_account_health"),
-            ("key_quotas", "key_quotas"),
-            ("quota_reservations", "quota_reservations"),
-        )
-    }
+    actual = _destination_counts(connection)
+    expected_identities = _source_identity_sets(sources)
+    actual_identities = _destination_identity_sets(connection)
     mismatches = {
         name: {"expected": expected[name], "actual": actual[name]}
         for name in expected
-        if expected[name] != actual[name]
+        if actual[name] < expected[name]
+    }
+    missing_identities = {
+        name: sorted(expected_identities[name] - actual_identities[name], key=str)[:10]
+        for name in expected_identities
+        if expected_identities[name] - actual_identities[name]
     }
     if mismatches:
         raise ValueError(f"legacy state count mismatch: {mismatches}")
+    if missing_identities:
+        raise ValueError(f"legacy state identity mismatch: {missing_identities}")
+    imported.update(actual)
     imported["verified"] = 1
 
 

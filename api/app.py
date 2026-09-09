@@ -14,7 +14,9 @@ from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.auth_service import auth_service
 from services.config import config
+from services.editable_file_task_service import editable_file_task_service
 from services.image_service import start_image_cleanup_scheduler
+from services.image_task_service import image_task_service
 from services.log_service import log_service
 from services.quota_service import quota_service
 from services.scheduler.service import scheduler_service
@@ -49,11 +51,20 @@ def create_app() -> FastAPI:
             stop_event.set()
             sub2api_auto_sync_service.stop(timeout=2)
             await scheduler_service.stop()
+            image_task_service.shutdown(wait=False)
+            editable_file_task_service.shutdown(wait=False)
             quota_watchdog.join(timeout=1)
             log_cleanup_thread.join(timeout=1)
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             backup_service.stop()
+            quota_service.close()
+            log_service.close()
+            storage = getattr(config, "_storage_backend", None)
+            if storage is not None:
+                close_storage = getattr(storage, "close", None)
+                if callable(close_storage):
+                    close_storage()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

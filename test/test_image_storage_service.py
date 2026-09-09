@@ -19,9 +19,10 @@ def png_bytes() -> bytes:
 class FakeWebDAVClient:
     uploaded: dict[str, bytes] = {}
     deleted: list[str] = []
+    closed = False
 
     def __init__(self, _settings):
-        pass
+        self.closed = False
 
     def put(self, rel: str, payload: bytes) -> str:
         self.uploaded[rel] = payload
@@ -39,6 +40,9 @@ class FakeWebDAVClient:
         self.put(".chatgpt2api_webdav_test.txt", b"chatgpt2api webdav test\n")
         self.delete(".chatgpt2api_webdav_test.txt")
         return {"ok": True, "status": 200, "error": None}
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class ImageStorageServiceTests(unittest.TestCase):
@@ -65,6 +69,7 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
         FakeWebDAVClient.uploaded = {}
         FakeWebDAVClient.deleted = []
+        FakeWebDAVClient.closed = False
 
     def service(self) -> ImageStorageService:
         return ImageStorageService(self.data_dir / "image_index.json")
@@ -133,6 +138,19 @@ class ImageStorageServiceTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
+
+    def test_webdav_operation_closes_client(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "webdav",
+            "webdav_url": "https://dav.example.test",
+            "webdav_password": "secret",
+        })
+        client = FakeWebDAVClient(self.settings)
+        with mock.patch("services.image_storage_service.WebDAVClient", lambda *_: client):
+            self.service().save(b"data", "http://app.test")
+
+        self.assertTrue(client.closed)
 
 
 if __name__ == "__main__":

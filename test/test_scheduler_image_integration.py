@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import api.ai as ai_module
+from services.protocol import openai_v1_chat_complete
 from services.protocol import openai_v1_image_generations
 from services.protocol.conversation import ImageOutput
 from services.config import ConfigStore
@@ -80,6 +81,34 @@ async def wait_for(predicate, timeout: float = 2.0) -> None:
 
 
 class SchedulerImageIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_image_scheduler_body_drops_raw_inputs_after_build(self) -> None:
+        body = {
+            "model": "gpt-image-2",
+            "stream": False,
+            "messages": [{"role": "user", "content": "x" * 100_000}],
+            "images": ["encoded-image-data"],
+            "_image_model": "gpt-image-2",
+            "_image_prompt": "draw a cat",
+            "_image_input_tokens": 12,
+        }
+
+        compact = ai_module._compact_image_scheduler_body(
+            openai_v1_chat_complete.handle,
+            body,
+        )
+
+        self.assertIs(compact, body)
+        self.assertEqual(
+            body,
+            {
+                "model": "gpt-image-2",
+                "stream": False,
+                "_image_model": "gpt-image-2",
+                "_image_prompt": "draw a cat",
+                "_image_input_tokens": 12,
+            },
+        )
+
     async def test_generation_route_adapter_submits_each_output_unit(self) -> None:
         class FakeImageScheduler:
             def __init__(self) -> None:

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from services.storage.sqlite_migration import migrate_legacy_state
+from services.storage.sqlite_state import SQLiteStateStore
 
 
 def write_json(path, value):
@@ -226,3 +227,33 @@ def test_migration_cli_verify_reports_valid_state(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["valid"] is True
     assert payload["counts"]["accounts"] == 1
+
+
+def test_migration_preserves_rows_already_present_in_shared_database(tmp_path):
+    write_json(tmp_path / "accounts.json", [{"access_token": "token-new"}])
+    existing_store = SQLiteStateStore(tmp_path / "app.db", auto_migrate=False)
+    existing_store.initialize()
+    existing_store.save_account({"access_token": "token-existing", "email": "existing@example.com"})
+    existing_store.close()
+
+    result = migrate_legacy_state(tmp_path, tmp_path / "app.db")
+
+    assert result["verified"] == 1
+    assert result["accounts"] == 2
+    assert count_rows(tmp_path / "app.db", "accounts") == 2
+
+
+def test_migration_rejects_same_count_when_source_identity_is_missing(tmp_path, monkeypatch):
+    write_json(tmp_path / "accounts.json", [{"access_token": "token-source"}])
+    existing_store = SQLiteStateStore(tmp_path / "app.db", auto_migrate=False)
+    existing_store.initialize()
+    existing_store.save_account({"access_token": "token-unrelated"})
+    existing_store.close()
+
+    monkeypatch.setattr(
+        "services.storage.sqlite_migration._import_json_sources",
+        lambda *args, **kwargs: {},
+    )
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        migrate_legacy_state(tmp_path, tmp_path / "app.db")

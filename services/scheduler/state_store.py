@@ -13,6 +13,9 @@ class SchedulerStateStore:
     """SQLite persistence for scheduler health snapshots and task metadata."""
 
     _MIGRATION_BATCH_SIZE = 500
+    # Scheduler state is small metadata; avoid reserving several MiB per
+    # request-thread connection while retaining SQLite's indexed hot paths.
+    CACHE_SIZE_KIB = -1024
     _TASK_TABLE = "tasks"
     _SAFE_METADATA_KEYS = {
         "size",
@@ -47,6 +50,7 @@ class SchedulerStateStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._connections: set[sqlite3.Connection] = set()
         self._initialize_lock = threading.RLock()
         self._initialized = False
 
@@ -58,8 +62,10 @@ class SchedulerStateStore:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute("PRAGMA cache_size=-4096")
+            connection.execute(f"PRAGMA cache_size={self.CACHE_SIZE_KIB}")
             connection.execute("PRAGMA foreign_keys=ON")
+            with self._initialize_lock:
+                self._connections.add(connection)
             self._local.connection = connection
         return connection
 
@@ -452,10 +458,28 @@ class SchedulerStateStore:
         return {"imported": imported, "skipped": skipped, "path": str(migrated)}
 
     def close(self) -> None:
-        connection = getattr(self._local, "connection", None)
-        if connection is not None:
-            connection.close()
+        with self._initialize_lock:
+            connections = list(self._connections)
+            self._connections.clear()
             self._local.connection = None
+            for connection in connections:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+
+    def close_current_thread(self) -> None:
+        """Release only the connection owned by the calling writer thread."""
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            return
+        with self._initialize_lock:
+            self._connections.discard(connection)
+            self._local.connection = None
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
 
     def has_migration_marker(self, version: int = 1) -> bool:
         self._ensure_initialized()
@@ -748,7 +772,11 @@ class SnapshotWriter:
             except Exception:
                 pass
         finally:
-            self.store.close()
+            close_current_thread = getattr(self.store, "close_current_thread", None)
+            if callable(close_current_thread):
+                close_current_thread()
+            else:
+                self.store.close()
 
 
 class TaskStateWriter:
@@ -871,4 +899,8 @@ class TaskStateWriter:
                 except Exception:
                     continue
         finally:
-            self.store.close()
+            close_current_thread = getattr(self.store, "close_current_thread", None)
+            if callable(close_current_thread):
+                close_current_thread()
+            else:
+                self.store.close()

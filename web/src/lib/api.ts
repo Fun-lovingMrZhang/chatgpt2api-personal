@@ -193,6 +193,7 @@ export type BackupInclude = {
   cpa: boolean;
   sub2api: boolean;
   logs: boolean;
+  state_db: boolean;
   image_tasks: boolean;
   accounts_snapshot: boolean;
   auth_keys_snapshot: boolean;
