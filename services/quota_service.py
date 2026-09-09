@@ -13,7 +13,7 @@ from services.config import DATA_DIR
 from utils.log import logger
 
 QuotaType = Literal["text", "image"]
-QUOTA_DB_PATH = DATA_DIR / "auth_quota.db"
+QUOTA_DB_PATH = DATA_DIR / "app.db"
 DEFAULT_RESERVATION_TTL_SECONDS = 900.0
 
 

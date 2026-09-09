@@ -34,7 +34,7 @@ class SchedulerService:
         self.settings = settings or config.get_scheduler_settings()
         self._clock = clock
         self._stop_event = Event()
-        self.state_store = state_store or SchedulerStateStore(DATA_DIR / "scheduler.db")
+        self.state_store = state_store or SchedulerStateStore(DATA_DIR / "app.db")
         self.account_pool = AccountPool(
             self.account_service.scheduler_snapshot(),
             self.settings,

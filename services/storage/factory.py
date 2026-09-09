@@ -4,9 +4,6 @@ import os
 from pathlib import Path
 
 from services.storage.base import StorageBackend
-from services.storage.database_storage import DatabaseStorageBackend
-from services.storage.git_storage import GitStorageBackend
-from services.storage.json_storage import JSONStorageBackend
 
 
 def create_storage_backend(data_dir: Path) -> StorageBackend:
@@ -14,25 +11,38 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
     根据环境变量创建存储后端
     
     环境变量：
-    - STORAGE_BACKEND: json|sqlite|postgres|git (默认 json)
-    - DATABASE_URL: 数据库连接字符串 (用于 sqlite/postgres)
+    - STORAGE_BACKEND: json|sqlite|postgres|git (默认 sqlite)
+    - STATE_DB_PATH: 规范化 SQLite 状态库路径 (默认 data/app.db)
+    - DATABASE_URL: 兼容旧 database 后端的数据库连接字符串
     - GIT_REPO_URL: Git 仓库地址 (用于 git)
     - GIT_TOKEN: Git 访问令牌 (用于 git)
     - GIT_BRANCH: Git 分支 (默认 main)
     - GIT_FILE_PATH: Git 仓库中的文件路径 (默认 accounts.json)
     """
-    backend_type = os.getenv("STORAGE_BACKEND", "json").lower().strip()
+    backend_type = os.getenv("STORAGE_BACKEND", "sqlite").lower().strip()
     
     print(f"[storage] Initializing storage backend: {backend_type}")
     
     if backend_type == "json":
+        from services.storage.json_storage import JSONStorageBackend
+
         # 本地 JSON 文件存储
         file_path = data_dir / "accounts.json"
         auth_keys_path = data_dir / "auth_keys.json"
         print(f"[storage] Using JSON storage: {file_path}")
         return JSONStorageBackend(file_path, auth_keys_path)
-    
-    elif backend_type in ("sqlite", "postgres", "postgresql", "mysql", "database"):
+
+    elif backend_type == "sqlite":
+        from services.storage.sqlite_state import SQLiteStateStore
+
+        configured_path = os.getenv("STATE_DB_PATH", "").strip()
+        db_path = Path(configured_path) if configured_path else data_dir / "app.db"
+        print(f"[storage] Using normalized SQLite storage: {db_path}")
+        return SQLiteStateStore(db_path, legacy_data_dir=data_dir)
+
+    elif backend_type in ("postgres", "postgresql", "mysql", "database"):
+        from services.storage.database_storage import DatabaseStorageBackend
+
         # 数据库存储
         database_url = os.getenv("DATABASE_URL", "").strip()
         
@@ -46,6 +56,8 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         return DatabaseStorageBackend(database_url)
     
     elif backend_type == "git":
+        from services.storage.git_storage import GitStorageBackend
+
         # Git 仓库存储
         repo_url = os.getenv("GIT_REPO_URL", "").strip()
         token = os.getenv("GIT_TOKEN", "").strip()
