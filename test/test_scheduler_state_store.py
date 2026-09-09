@@ -118,6 +118,68 @@ class SchedulerStateStoreTests(unittest.TestCase):
             self.assertEqual(restored[0]["status"], "unknown")
             self.assertEqual(store.get_task("owner:queued-task")["status"], "unknown")
 
+    def test_tasks_are_stored_in_normalized_tasks_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SchedulerStateStore(Path(tmp_dir) / "app.db")
+            store.save_task({
+                "task_key": "owner:task",
+                "owner_id": "owner",
+                "task_id": "task",
+                "mode": "image_generation",
+                "status": "completed",
+                "updated_at": 10,
+            })
+
+            normalized_count = store._connection().execute(
+                "SELECT COUNT(*) FROM tasks"
+            ).fetchone()[0]
+            legacy_count = store._connection().execute(
+                "SELECT COUNT(*) FROM scheduler_tasks"
+            ).fetchone()[0] if store._table_exists("scheduler_tasks") else 0
+
+            self.assertEqual(normalized_count, 1)
+            self.assertEqual(legacy_count, 0)
+
+    def test_task_type_filter_keeps_image_and_file_tasks_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SchedulerStateStore(Path(tmp_dir) / "app.db")
+            store.save_task({
+                "task_key": "owner:image",
+                "owner_id": "owner",
+                "task_id": "image",
+                "mode": "generate",
+                "status": "success",
+            })
+            store.save_task({
+                "task_key": "owner:file",
+                "owner_id": "owner",
+                "task_id": "file",
+                "mode": "editable_ppt",
+                "status": "success",
+            })
+
+            image_tasks = store.list_tasks("owner", task_types=("generate", "edit"))
+            file_tasks = store.list_tasks("owner", task_types=("editable_ppt", "editable_psd"))
+
+            self.assertEqual([item["task_id"] for item in image_tasks], ["image"])
+            self.assertEqual([item["task_id"] for item in file_tasks], ["file"])
+
+    def test_cleanup_tasks_removes_old_terminal_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SchedulerStateStore(Path(tmp_dir) / "app.db")
+            store.save_task({
+                "task_key": "owner:old",
+                "owner_id": "owner",
+                "task_id": "old",
+                "status": "completed",
+                "updated_at": 1,
+            })
+
+            removed = store.cleanup_tasks(now=100, retention_seconds=10, max_rows=100)
+
+            self.assertEqual(removed, 1)
+            self.assertIsNone(store.get_task("owner:old"))
+
     def test_snapshot_writer_wakes_on_pending_threshold(self) -> None:
         store = Mock()
         writer = SnapshotWriter(store, interval_seconds=60, pending_threshold=1)

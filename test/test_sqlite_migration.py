@@ -147,6 +147,15 @@ def test_migration_imports_json_and_legacy_sqlite_once(tmp_path):
     ]})
     create_legacy_scheduler_db(tmp_path / "scheduler.db", task_key="task-1")
     create_legacy_quota_db(tmp_path / "auth_quota.db", key_id="user-1")
+    write_json(tmp_path / "image_tasks.json", {"tasks": [{
+        "id": "image-1",
+        "owner_id": "user-1",
+        "status": "success",
+        "mode": "generate",
+        "model": "gpt-image-2",
+        "data": [{"url": "https://files.example.test/image.png"}],
+        "prompt": "must not be persisted",
+    }]})
 
     first = migrate_legacy_state(tmp_path, tmp_path / "app.db")
     second = migrate_legacy_state(tmp_path, tmp_path / "app.db")
@@ -156,7 +165,7 @@ def test_migration_imports_json_and_legacy_sqlite_once(tmp_path):
     assert second["already_migrated"] is True
     assert count_rows(tmp_path / "app.db", "accounts") == 1
     assert count_rows(tmp_path / "app.db", "auth_keys") == 1
-    assert count_rows(tmp_path / "app.db", "tasks") == 1
+    assert count_rows(tmp_path / "app.db", "tasks") == 2
     assert count_rows(tmp_path / "app.db", "key_quotas") == 1
     assert count_rows(tmp_path / "app.db", "quota_reservations") == 1
     assert count_rows(tmp_path / "app.db", "scheduler_account_health") == 1
@@ -164,6 +173,18 @@ def test_migration_imports_json_and_legacy_sqlite_once(tmp_path):
     assert (tmp_path / "auth_keys.json").exists()
     assert (tmp_path / "scheduler.db").exists()
     assert (tmp_path / "auth_quota.db").exists()
+    assert (tmp_path / "image_tasks.json").exists()
+
+    connection = sqlite3.connect(tmp_path / "app.db")
+    try:
+        result_json = connection.execute(
+            "SELECT result_json FROM tasks WHERE task_id = 'image-1'"
+        ).fetchone()[0]
+        assert "must not be persisted" not in (result_json or "")
+        assert "b64_json" not in (result_json or "")
+        assert "https://files.example.test/image.png" in (result_json or "")
+    finally:
+        connection.close()
 
 
 def test_migration_rolls_back_when_source_validation_fails(tmp_path, monkeypatch):

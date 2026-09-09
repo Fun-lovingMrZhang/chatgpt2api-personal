@@ -11,6 +11,7 @@ from unittest import mock
 from services.image_task_service import ImageTaskService, _collect_image_urls
 from services.quota_service import AuthQuotaStore, QuotaExceededError, QuotaReservation, QuotaService
 from services.scheduler.state_store import SchedulerStateStore
+from services.storage.sqlite_migration import migrate_legacy_state
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -190,6 +191,27 @@ class ImageTaskServiceTests(unittest.TestCase):
             record = store.get_task("user-1:quota-persisted")
             self.assertEqual(record["metadata"]["quota_reservation_id"], "image-reservation-1")
             self.assertEqual(record["metadata"]["quota_requested_units"], 1)
+
+    def test_shared_migration_keeps_legacy_image_task_file_and_loads_only_image_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "image_tasks.json").write_text(
+                '{"tasks":[{"id":"legacy-image","owner_id":"owner-1",'
+                '"status":"success","mode":"generate","model":"gpt-image-2",'
+                '"data":[{"url":"https://files.example.test/image.png"}]}]}',
+                encoding="utf-8",
+            )
+            migrate_legacy_state(root, root / "app.db")
+            store = SchedulerStateStore(root / "app.db")
+
+            service = ImageTaskService(root / "image_tasks.json", state_store=store)
+
+            self.assertTrue((root / "image_tasks.json").exists())
+            self.assertEqual(
+                service.list_tasks(OWNER, ["legacy-image"])["items"][0]["status"],
+                "success",
+            )
+            self.assertEqual(store.list_tasks("owner-1", task_types=("editable_ppt",)), [])
 
     def test_admin_image_task_does_not_create_quota_row(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

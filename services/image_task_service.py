@@ -175,14 +175,17 @@ class ImageTaskService:
     def _load_state_store_locked(self) -> dict[str, dict[str, Any]]:
         try:
             self.state_store.initialize()
-            if self.path.exists():
+            has_migration_marker = getattr(self.state_store, "has_migration_marker", None)
+            if self.path.exists() and (not callable(has_migration_marker) or not has_migration_marker()):
                 self.state_store.import_legacy_tasks(self.path)
             recoverable = {
                 str(item.get("task_key")): item
-                for item in self.state_store.load_recoverable_tasks()
+                for item in self.state_store.load_recoverable_tasks(
+                    task_types=("generate", "edit"),
+                )
             }
             tasks: dict[str, dict[str, Any]] = {}
-            for record in self.state_store.list_tasks():
+            for record in self.state_store.list_tasks(task_types=("generate", "edit")):
                 metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
                 task_id = _clean(record.get("task_id"))
                 owner = _clean(record.get("owner_id"))

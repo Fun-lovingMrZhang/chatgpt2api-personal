@@ -5,6 +5,7 @@ import json
 import sqlite3
 import time
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,6 +34,7 @@ def _discover_sources(data_dir: Path) -> dict[str, Path]:
         "auth_keys": root / "auth_keys.json",
         "scheduler": root / "scheduler.db",
         "quota": root / "auth_quota.db",
+        "image_tasks": root / "image_tasks.json",
         "editable_tasks": root / "editable_file_tasks.json",
     }
 
@@ -89,6 +91,33 @@ def _safe_json_text(value: object, default: str = "{}") -> str:
         return default
 
 
+def _timestamp(value: object, default: float | None = None) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value or "").strip()
+    if raw:
+        for candidate in (raw, raw.replace("Z", "+00:00")):
+            try:
+                return datetime.fromisoformat(candidate).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return time.time() if default is None else float(default)
+
+
+def _image_result_metadata(value: object) -> dict[str, object] | None:
+    if not isinstance(value, list):
+        return None
+    urls = [
+        item.get("url")
+        for item in value
+        if isinstance(item, dict)
+        and isinstance(item.get("url"), str)
+        and item["url"].startswith(("http://", "https://"))
+        and len(item["url"]) <= 4096
+    ]
+    return {"urls": urls, "count": len(value), "available": bool(urls)}
+
+
 def _insert_auth_key(connection: sqlite3.Connection, store: SQLiteStateStore, item: dict[str, Any]) -> bool:
     if str(item.get("role") or "user").strip().lower() == "admin":
         return False
@@ -130,13 +159,49 @@ def _import_json_sources(
         imported_auth_keys += int(_insert_auth_key(connection, store, item))
 
     imported_tasks = 0
+    for item in _read_json_list(sources["image_tasks"]):
+        task_id = str(item.get("id") or item.get("task_id") or "").strip()
+        owner_id = str(item.get("owner_id") or "").strip()
+        if not task_id or not owner_id:
+            continue
+        created_at = _timestamp(item.get("created_ts") or item.get("created_at"))
+        updated_at = _timestamp(item.get("updated_ts") or item.get("updated_at"), created_at)
+        metadata = {
+            key: item[key]
+            for key in ("size", "quality", "n", "account_ref", "created_at")
+            if key in item
+        }
+        mode = "edit" if str(item.get("mode") or "").strip() == "edit" else "generate"
+        connection.execute(
+            """INSERT OR IGNORE INTO tasks
+               (task_key, owner_id, task_id, task_type, status, model,
+                remote_task_id, metadata_json, result_json, error, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"{owner_id}:{task_id}",
+                owner_id,
+                task_id,
+                mode,
+                str(item.get("status") or "error"),
+                str(item.get("model") or "gpt-image-2"),
+                str(item.get("conversation_id") or item.get("remote_task_id") or "").strip() or None,
+                _safe_json_text(metadata),
+                _safe_json_text(_image_result_metadata(item.get("data")), default="null")
+                if item.get("data") is not None else None,
+                str(item.get("error") or ""),
+                created_at,
+                updated_at,
+            ),
+        )
+        imported_tasks += 1
+
     for item in _read_json_list(sources["editable_tasks"]):
         task_id = str(item.get("id") or "").strip()
         owner_id = str(item.get("owner_id") or "").strip()
         if not task_id or not owner_id:
             continue
-        created_at = float(item.get("created_ts") or item.get("updated_ts") or time.time())
-        updated_at = float(item.get("updated_ts") or created_at)
+        created_at = _timestamp(item.get("created_ts") or item.get("created_at"))
+        updated_at = _timestamp(item.get("updated_ts") or item.get("updated_at"), created_at)
         task_key = f"file:{owner_id}:{task_id}"
         result = item.get("result")
         connection.execute(
@@ -148,7 +213,7 @@ def _import_json_sources(
                 task_key,
                 owner_id,
                 task_id,
-                str(item.get("kind") or "ppt"),
+                f"editable_{str(item.get('kind') or 'ppt')}",
                 str(item.get("status") or "error"),
                 str(item.get("model") or ""),
                 _safe_json_text({}),
@@ -270,15 +335,22 @@ def _source_count(sources: dict[str, Path], name: str) -> int:
             for item in _read_json_list(sources["auth_keys"], wrapped=True)
         )
     if name == "tasks":
-        scheduler = sum(
-            bool(str(row["task_key"] or "").strip())
+        scheduler = {
+            str(row["task_key"] or "").strip()
             for row in _source_rows(sources["scheduler"], "scheduler_tasks")
-        )
+            if str(row["task_key"] or "").strip()
+        }
+        image = {
+            f"{str(item.get('owner_id') or '').strip()}:{str(item.get('id') or item.get('task_id') or '').strip()}"
+            for item in _read_json_list(sources["image_tasks"])
+            if str(item.get("id") or item.get("task_id") or "").strip()
+            and str(item.get("owner_id") or "").strip()
+        }
         editable = sum(
             bool(str(item.get("id") or "").strip()) and bool(str(item.get("owner_id") or "").strip())
             for item in _read_json_list(sources["editable_tasks"])
         )
-        return scheduler + editable
+        return len(scheduler | image) + editable
     if name == "scheduler_health":
         return len(_source_rows(sources["scheduler"], "scheduler_account_health"))
     if name == "key_quotas":
@@ -403,4 +475,3 @@ def verify_sqlite_state(db_path: Path) -> dict[str, object]:
         }
     finally:
         store.close()
-

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from threading import BoundedSemaphore
 from typing import Any
 from urllib.parse import quote
 
@@ -13,6 +15,7 @@ from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
+from services.scheduler.errors import QueueFullError
 from utils.helper import new_uuid
 
 TASK_STATUS_QUEUED = "queued"
@@ -84,13 +87,34 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 class EditableFileTaskService:
-    def __init__(self, path: Path = EDITABLE_FILE_TASKS_PATH) -> None:
+    def __init__(
+        self,
+        path: Path = EDITABLE_FILE_TASKS_PATH,
+        *,
+        state_store: Any | None = None,
+        max_workers: int = 4,
+        queue_max_items: int = 64,
+    ) -> None:
         self.path = path
+        self.state_store = state_store
+        if self.state_store is None and Path(path).resolve() == EDITABLE_FILE_TASKS_PATH.resolve():
+            try:
+                from services.scheduler.service import scheduler_service
+
+                self.state_store = scheduler_service.state_store
+            except Exception:
+                self.state_store = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="editable-file-task",
+        )
+        self._admission = BoundedSemaphore(max(1, int(max_workers)) + max(0, int(queue_max_items)))
+        self._admitted: set[str] = set()
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            self._tasks = self._load_locked()
+            self._tasks = self._load_state_store_locked() if self.state_store is not None else self._load_locked()
             if self._recover_unfinished_locked():
                 self._save_locked()
 
@@ -111,6 +135,9 @@ class EditableFileTaskService:
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return {"items": [_public_task(item) for item in items], "missing_ids": []}
 
+    def shutdown(self, *, wait: bool = False) -> None:
+        self._executor.shutdown(wait=wait, cancel_futures=not wait)
+
     def _submit(self, identity: dict[str, object], *, client_task_id: str, kind: str, prompt: str, base64_images: list[str], base_url: str) -> dict[str, Any]:
         task_id = _clean(client_task_id) or new_uuid()
         owner = _owner_id(identity)
@@ -119,11 +146,29 @@ class EditableFileTaskService:
         with self._lock:
             if key in self._tasks:
                 return _public_task(self._tasks[key])
+            if not self._admission.acquire(blocking=False):
+                raise QueueFullError("editable file task queue is full")
             ts = time.time()
             self._tasks[key] = {"id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED, "kind": kind, "model": EDITABLE_FILE_MODEL, "created_at": now, "updated_at": now, "created_ts": ts, "updated_ts": ts}
             task = dict(self._tasks[key])
-            self._save_locked()
-        threading.Thread(target=self._run_task, args=(key, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
+            self._admitted.add(key)
+            try:
+                self._save_task_locked(task)
+                self._executor.submit(
+                    self._run_task,
+                    key,
+                    kind,
+                    prompt,
+                    base64_images,
+                    dict(identity),
+                    base_url,
+                )
+            except Exception:
+                self._admitted.discard(key)
+                self._admission.release()
+                self._tasks.pop(key, None)
+                self._delete_task_locked(key)
+                raise
         return _public_task(task)
 
     def _run_task(self, key: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
@@ -152,6 +197,10 @@ class EditableFileTaskService:
         finally:
             if backend is not None:
                 backend.close()
+            with self._lock:
+                if key in self._admitted:
+                    self._admitted.remove(key)
+                    self._admission.release()
 
     def public_file_path(self, relative_path: str) -> Path:
         raw = str(relative_path or "").replace("\\", "/").lstrip("/")
@@ -169,7 +218,74 @@ class EditableFileTaskService:
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
+            self._save_task_locked(task)
+
+    def _load_state_store_locked(self) -> dict[str, dict[str, Any]]:
+        self.state_store.initialize()
+        has_migration_marker = getattr(self.state_store, "has_migration_marker", None)
+        if self.path.exists() and (not callable(has_migration_marker) or not has_migration_marker()):
+            self._import_legacy_file_tasks_locked()
+        tasks: dict[str, dict[str, Any]] = {}
+        for record in self.state_store.list_tasks(
+            task_types=("editable_ppt", "editable_psd"),
+        ):
+            task_id = _clean(record.get("task_id"))
+            owner = _clean(record.get("owner_id"))
+            if not task_id or not owner:
+                continue
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            task = {
+                "id": task_id,
+                "owner_id": owner,
+                "status": _clean(record.get("status"), TASK_STATUS_ERROR),
+                "kind": "psd" if record.get("mode") == "editable_psd" else "ppt",
+                "model": _clean(record.get("model"), EDITABLE_FILE_MODEL),
+                "created_at": _clean(metadata.get("created_at"), _now_iso()),
+                "updated_at": _clean(metadata.get("updated_at"), _now_iso()),
+                "created_ts": float(record.get("created_at") or 0),
+                "updated_ts": float(record.get("updated_at") or 0),
+            }
+            result = record.get("result")
+            if isinstance(result, dict):
+                task["result"] = result
+            if record.get("error"):
+                task["error"] = _clean(record.get("error"))
+            tasks[_task_key(owner, task_id)] = task
+        return tasks
+
+    def _import_legacy_file_tasks_locked(self) -> None:
+        for item in self._load_locked().values():
+            self._save_task_locked(item)
+
+    def _save_task_locked(self, task: dict[str, Any]) -> None:
+        if self.state_store is None:
             self._save_locked()
+            return
+        owner = _clean(task.get("owner_id"))
+        task_id = _clean(task.get("id"))
+        self.state_store.save_task({
+            "task_key": f"file:{owner}:{task_id}",
+            "owner_id": owner,
+            "task_id": task_id,
+            "mode": f"editable_{'psd' if task.get('kind') == 'psd' else 'ppt'}",
+            "status": task.get("status"),
+            "model": task.get("model") or EDITABLE_FILE_MODEL,
+            "metadata": {
+                "created_at": task.get("created_at"),
+                "updated_at": task.get("updated_at"),
+            },
+            "result": task.get("result"),
+            "error": task.get("error"),
+            "created_at": task.get("created_ts"),
+            "updated_at": task.get("updated_ts"),
+        })
+
+    def _delete_task_locked(self, key: str) -> None:
+        if self.state_store is None:
+            self._save_locked()
+            return
+        owner, _, task_id = str(key).partition(":")
+        self.state_store.delete_task(f"file:{owner}:{task_id}")
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -203,6 +319,27 @@ class EditableFileTaskService:
         return tasks
 
     def _save_locked(self) -> None:
+        if self.state_store is not None:
+            self.state_store.save_task_batch(
+                {
+                    "task_key": f"file:{_clean(task.get('owner_id'))}:{_clean(task.get('id'))}",
+                    "owner_id": task.get("owner_id"),
+                    "task_id": task.get("id"),
+                    "mode": f"editable_{'psd' if task.get('kind') == 'psd' else 'ppt'}",
+                    "status": task.get("status"),
+                    "model": task.get("model") or EDITABLE_FILE_MODEL,
+                    "metadata": {
+                        "created_at": task.get("created_at"),
+                        "updated_at": task.get("updated_at"),
+                    },
+                    "result": task.get("result"),
+                    "error": task.get("error"),
+                    "created_at": task.get("created_ts"),
+                    "updated_at": task.get("updated_ts"),
+                }
+                for task in self._tasks.values()
+            )
+            return
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

@@ -70,7 +70,22 @@ class AuthService:
             return []
         return [normalized for item in items if (normalized := self._normalize_item(item)) is not None]
 
-    def _save(self) -> None:
+    def _save(
+        self,
+        item: dict[str, object] | None = None,
+        *,
+        deleted_id: str = "",
+    ) -> None:
+        if item is not None:
+            saver = getattr(self.storage, "save_auth_key", None)
+            if callable(saver):
+                saver(dict(item))
+                return
+        if deleted_id:
+            deleter = getattr(self.storage, "delete_auth_key", None)
+            if callable(deleter):
+                deleter(deleted_id)
+                return
         self.storage.save_auth_keys(self._items)
 
     def _reload_locked(self) -> None:
@@ -173,7 +188,7 @@ class AuthService:
                 "last_used_at": None,
             }
             self._items.append(item)
-            self._save()
+            self._save(item=item)
             return self._public_item(item), raw_key
 
     def update_key(
@@ -208,7 +223,7 @@ class AuthService:
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
                 self._items[index] = next_item
-                self._save()
+                self._save(item=next_item)
                 return self._public_item(next_item)
         return None
 
@@ -226,7 +241,7 @@ class AuthService:
             ]
             if len(self._items) == before:
                 return False
-            self._save()
+            self._save(deleted_id=normalized_id)
             return True
 
     def _authenticate(self, raw_key: str, *, require_web_login: bool = False) -> dict[str, object] | None:
@@ -251,7 +266,7 @@ class AuthService:
                 last_flush_at = self._last_used_flush_at.get(item_id)
                 if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
                     try:
-                        self._save()
+                        self._save(item=next_item)
                         self._last_used_flush_at[item_id] = now
                     except Exception:
                         pass
