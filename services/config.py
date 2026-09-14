@@ -86,6 +86,9 @@ DEFAULT_SCHEDULER = {
     "snapshot_flush_interval_ms": 1000,
 }
 
+DEFAULT_USER_KEY_TEXT_CONCURRENCY = 4
+DEFAULT_USER_KEY_IMAGE_CONCURRENCY = 1
+
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -140,6 +143,16 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
     except (OverflowError, TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
+
+
+def _normalize_user_key_concurrency(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        return default
+    return normalized if normalized >= 1 else default
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -569,6 +582,20 @@ class ConfigStore:
             return 3
 
     @property
+    def user_key_text_concurrency(self) -> int:
+        return _normalize_user_key_concurrency(
+            self.data.get("user_key_text_concurrency"),
+            DEFAULT_USER_KEY_TEXT_CONCURRENCY,
+        )
+
+    @property
+    def user_key_image_concurrency(self) -> int:
+        return _normalize_user_key_concurrency(
+            self.data.get("user_key_image_concurrency"),
+            DEFAULT_USER_KEY_IMAGE_CONCURRENCY,
+        )
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -751,6 +778,8 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["user_key_text_concurrency"] = self.user_key_text_concurrency
+        data["user_key_image_concurrency"] = self.user_key_image_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["image_remove_conversation_always"] = self.image_remove_conversation_always
@@ -805,6 +834,14 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        next_data["user_key_text_concurrency"] = _normalize_user_key_concurrency(
+            next_data.get("user_key_text_concurrency"),
+            DEFAULT_USER_KEY_TEXT_CONCURRENCY,
+        )
+        next_data["user_key_image_concurrency"] = _normalize_user_key_concurrency(
+            next_data.get("user_key_image_concurrency"),
+            DEFAULT_USER_KEY_IMAGE_CONCURRENCY,
+        )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

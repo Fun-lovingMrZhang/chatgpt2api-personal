@@ -59,5 +59,55 @@ class ConfigLoadingTests(unittest.TestCase):
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
 
+class UserKeyConcurrencyConfigTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from services import config as config_module
+
+        cls.config_module = config_module
+
+    def make_store(self, tmp_dir, **values):
+        path = Path(tmp_dir) / "config.json"
+        path.write_text(json.dumps({"auth-key": "admin", **values}), encoding="utf-8")
+        return self.config_module.ConfigStore(path)
+
+    def test_defaults_are_four_and_one(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = self.make_store(tmp_dir)
+            self.assertEqual(store.user_key_text_concurrency, 4)
+            self.assertEqual(store.user_key_image_concurrency, 1)
+            self.assertEqual(store.get()["user_key_text_concurrency"], 4)
+            self.assertEqual(store.get()["user_key_image_concurrency"], 1)
+
+    def test_update_normalizes_and_persists_positive_values(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = self.make_store(tmp_dir)
+            result = store.update({
+                "user_key_text_concurrency": "7",
+                "user_key_image_concurrency": 3,
+            })
+            self.assertEqual(result["user_key_text_concurrency"], 7)
+            self.assertEqual(result["user_key_image_concurrency"], 3)
+            reloaded = self.config_module.ConfigStore(Path(tmp_dir) / "config.json")
+            self.assertEqual(reloaded.user_key_text_concurrency, 7)
+            self.assertEqual(reloaded.user_key_image_concurrency, 3)
+
+    def test_invalid_values_fall_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = self.make_store(
+                tmp_dir,
+                user_key_text_concurrency=0,
+                user_key_image_concurrency=True,
+            )
+            self.assertEqual(store.user_key_text_concurrency, 4)
+            self.assertEqual(store.user_key_image_concurrency, 1)
+            result = store.update({
+                "user_key_text_concurrency": "not-an-int",
+                "user_key_image_concurrency": -2,
+            })
+            self.assertEqual(result["user_key_text_concurrency"], 4)
+            self.assertEqual(result["user_key_image_concurrency"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
