@@ -26,6 +26,8 @@ export function ConfigCard() {
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setUserKeyTextConcurrency = useSettingsStore((state) => state.setUserKeyTextConcurrency);
+  const setUserKeyImageConcurrency = useSettingsStore((state) => state.setUserKeyImageConcurrency);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
   const setImageRemoveConversationAlways = useSettingsStore((state) => state.setImageRemoveConversationAlways);
@@ -206,6 +208,32 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">用户密钥文本并发</label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={String(config?.user_key_text_concurrency || "")}
+              onChange={(event) => setUserKeyTextConcurrency(event.target.value)}
+              placeholder="4"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">每个普通用户密钥同时进行的文本请求数量，默认 4；管理员密钥不受限制。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">用户密钥图片并发</label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={String(config?.user_key_image_concurrency || "")}
+              onChange={(event) => setUserKeyImageConcurrency(event.target.value)}
+              placeholder="1"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">每个普通用户密钥同时进行的图片请求和图片任务数量，默认 1；管理员密钥不受限制。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
