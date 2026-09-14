@@ -22,6 +22,12 @@ from services.scheduler.context import current_execution_context
 from services.scheduler.errors import SchedulerError
 from services.scheduler.models import Lane
 from services.scheduler.service import scheduler_service
+from services.user_key_concurrency import (
+    UserKeyConcurrencyLease,
+    UserKeyConcurrencyLimitError,
+    UserKeyConcurrencyLimiter,
+    user_key_concurrency,
+)
 from utils.log import logger
 from utils.helper import anonymize_token, is_codex_image_model, split_image_model
 
@@ -153,6 +159,7 @@ class ImageTaskService:
         state_store: Any | None = None,
         task_writer: Any | None = None,
         quota_service_instance: Any | None = None,
+        concurrency_limiter: UserKeyConcurrencyLimiter | None = None,
         spool_dir: Path | None = None,
     ):
         self.path = path
@@ -163,6 +170,7 @@ class ImageTaskService:
         self.state_store = state_store
         self.task_writer = task_writer or getattr(scheduler_service_instance, "task_writer", None)
         self.quota_service = quota_service_instance or quota_service
+        self.concurrency_limiter = concurrency_limiter or user_key_concurrency
         self.spool_dir = spool_dir or path.parent / ".image_task_spool"
         self._fallback_executor = ThreadPoolExecutor(
             max_workers=max(1, int(config.get_scheduler_settings().lanes[Lane.IMAGE_GENERATION].worker_count)),
@@ -171,6 +179,7 @@ class ImageTaskService:
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._admission_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._concurrency_leases: dict[str, UserKeyConcurrencyLease] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._cleanup_spool_dir()
         with self._lock:
@@ -324,11 +333,20 @@ class ImageTaskService:
                     task["updated_ts"] = time.time()
                     self._save_task_locked(task, synchronous=False)
                     continue
-                task["status"] = TASK_STATUS_RUNNING
-                task["error"] = ""
-                task["updated_at"] = _now_iso()
-                task["updated_ts"] = time.time()
-                self._save_task_locked(task, synchronous=False)
+                try:
+                    self._acquire_task_concurrency(
+                        key,
+                        {"id": _clean(task.get("owner_id")), "role": "user"},
+                        existing=True,
+                    )
+                    task["status"] = TASK_STATUS_RUNNING
+                    task["error"] = ""
+                    task["updated_at"] = _now_iso()
+                    task["updated_ts"] = time.time()
+                    self._save_task_locked(task, synchronous=False)
+                except BaseException:
+                    self._release_task_concurrency(key)
+                    raise
                 pending.append(
                     (
                         key,
@@ -342,15 +360,22 @@ class ImageTaskService:
             with self._lock:
                 task = self._tasks.get(key) or {}
                 model = _clean(task.get("model"), "gpt-image-2")
-            self._dispatch_resume_poll(
-                key,
-                conversation_id,
-                config.image_poll_timeout_secs,
-                {"id": owner, "name": "scheduler-recovery", "role": "system"},
-                mode,
-                model,
-                account_ref,
-            )
+            recovery_identity = {"id": owner, "name": "scheduler-recovery", "role": "user"}
+            try:
+                self._dispatch_resume_poll(
+                    key,
+                    conversation_id,
+                    config.image_poll_timeout_secs,
+                    recovery_identity,
+                    mode,
+                    model,
+                    account_ref,
+                )
+            except BaseException as exc:
+                self._release_task_concurrency(key)
+                self._release_task_quota(key)
+                self._update_task(key, status=TASK_STATUS_ERROR, error=str(exc) or "scheduler recovery failed")
+                raise
 
     def shutdown(self, *, wait: bool = False) -> None:
         self._fallback_executor.shutdown(wait=wait, cancel_futures=not wait)
@@ -736,6 +761,29 @@ class ImageTaskService:
             logger.error({"event": "image_task_quota_renew_failed", "error": str(exc)})
             return False
 
+    def _acquire_task_concurrency(
+        self,
+        key: str,
+        identity: dict[str, object],
+        *,
+        existing: bool = False,
+    ) -> None:
+        lease = (
+            self.concurrency_limiter.acquire_existing(identity, "image")
+            if existing
+            else self.concurrency_limiter.try_acquire(identity, "image")
+        )
+        if lease is None:
+            raise UserKeyConcurrencyLimitError("image")
+        with self._lock:
+            self._concurrency_leases[key] = lease
+
+    def _release_task_concurrency(self, key: str) -> None:
+        with self._lock:
+            lease = self._concurrency_leases.pop(key, None)
+        if lease is not None:
+            lease.release()
+
     async def _submit_async(
         self,
         identity: dict[str, object],
@@ -758,6 +806,7 @@ class ImageTaskService:
             await admission
         except BaseException:
             with self._lock:
+                self._release_task_concurrency(key)
                 self._release_task_quota(key)
                 self._tasks.pop(key, None)
                 if self.state_store is not None:
@@ -814,14 +863,17 @@ class ImageTaskService:
                 "created_ts": time.time(),
             }
             try:
+                self._acquire_task_concurrency(key, identity)
                 self._reserve_task_quota(task, identity, key, mode, payload)
             except BaseException:
+                self._release_task_concurrency(key)
                 self._cleanup_payload_spool(payload)
                 raise
             self._tasks[key] = task
             try:
                 self._save_task_locked(task, synchronous=False)
             except BaseException:
+                self._release_task_concurrency(key)
                 self._cleanup_payload_spool(payload)
                 self._tasks.pop(key, None)
                 reservation_id = _clean(task.get("quota_reservation_id"))
@@ -844,6 +896,7 @@ class ImageTaskService:
                 )
             except BaseException:
                 self._cleanup_payload_spool(payload)
+                self._release_task_concurrency(key)
                 self._release_task_quota(key)
                 with self._lock:
                     self._tasks.pop(key, None)
@@ -941,6 +994,7 @@ class ImageTaskService:
                 task = self._tasks.get(key)
                 if task is None or task.get("status") in TERMINAL_STATUSES:
                     return
+            self._release_task_concurrency(key)
             self._release_task_quota(key)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error, data=[])
 
@@ -970,6 +1024,7 @@ class ImageTaskService:
                 task = self._tasks.get(key)
                 if task is None or task.get("status") in TERMINAL_STATUSES:
                     return
+            self._release_task_concurrency(key)
             self._release_task_quota(key)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error, data=[])
 
@@ -1039,6 +1094,7 @@ class ImageTaskService:
                 raise QuotaSettlementError("image task quota reservation is no longer active")
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
+            self._release_task_concurrency(key)
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
@@ -1068,6 +1124,7 @@ class ImageTaskService:
             if not _is_resumable_timeout(exc, conversation_id):
                 self._release_task_quota(key)
             duration_ms = int((time.time() - started) * 1000)
+            self._release_task_concurrency(key)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
                               **({"conversation_id": conversation_id} if conversation_id else {}))
@@ -1085,6 +1142,7 @@ class ImageTaskService:
             if raise_on_error:
                 raise
         finally:
+            self._release_task_concurrency(key)
             self._cleanup_payload_spool(payload)
             if payload_with_progress is not None:
                 payload_with_progress["images"] = []
@@ -1366,18 +1424,27 @@ class ImageTaskService:
             account_ref = _clean(task.get("account_ref"))
             if not self._renew_task_quota(task):
                 raise QuotaSettlementError("image task quota reservation is no longer active")
+            self._acquire_task_concurrency(key, identity)
             # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            try:
+                self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            except BaseException:
+                self._release_task_concurrency(key)
+                raise
 
-        self._dispatch_resume_poll(
-            key,
-            conversation_id,
-            extra_timeout_secs,
-            dict(identity),
-            mode,
-            model,
-            account_ref,
-        )
+        try:
+            self._dispatch_resume_poll(
+                key,
+                conversation_id,
+                extra_timeout_secs,
+                dict(identity),
+                mode,
+                model,
+                account_ref,
+            )
+        except BaseException:
+            self._release_task_concurrency(key)
+            raise
         return _public_task(task)
 
     async def resume_poll_async(
@@ -1395,8 +1462,12 @@ class ImageTaskService:
         try:
             await admission
         except SchedulerError:
+            self._release_task_concurrency(key)
             with self._lock:
                 self._update_task(key, status=TASK_STATUS_ERROR, error="scheduler queue is full")
+            raise
+        except BaseException:
+            self._release_task_concurrency(key)
             raise
         return result
 
@@ -1553,6 +1624,7 @@ class ImageTaskService:
             data = [{"url": url} for url in image_urls]
             if not self._commit_task_quota(key, data):
                 raise QuotaSettlementError("image task quota reservation is no longer active")
+            self._release_task_concurrency(key)
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,
@@ -1568,6 +1640,7 @@ class ImageTaskService:
             if not _is_resumable_timeout(exc, conversation_id):
                 self._release_task_quota(key)
             duration_ms = int((time.time() - started) * 1000)
+            self._release_task_concurrency(key)
             self._update_task(
                 key,
                 status=TASK_STATUS_ERROR,
@@ -1588,6 +1661,7 @@ class ImageTaskService:
             if raise_on_error:
                 raise
         finally:
+            self._release_task_concurrency(key)
             if backend is not None:
                 backend.close()
             if fallback_slot:

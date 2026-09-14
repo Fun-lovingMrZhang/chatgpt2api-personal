@@ -12,6 +12,7 @@ from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
 from services.quota_service import QuotaExceededError, QuotaSettlementError
 from services.scheduler.errors import SchedulerError
+from services.user_key_concurrency import UserKeyConcurrencyLimitError
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -71,6 +72,18 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except QuotaExceededError as exc:
             raise HTTPException(status_code=429, detail=_quota_exhausted_response(exc)) from exc
+        except UserKeyConcurrencyLimitError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "message": str(exc),
+                        "type": "rate_limit_error",
+                        "code": "user_key_concurrency_limit",
+                    }
+                },
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
@@ -109,6 +122,18 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except QuotaExceededError as exc:
             raise HTTPException(status_code=429, detail=_quota_exhausted_response(exc)) from exc
+        except UserKeyConcurrencyLimitError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "message": str(exc),
+                        "type": "rate_limit_error",
+                        "code": "user_key_concurrency_limit",
+                    }
+                },
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc
@@ -135,6 +160,18 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except QuotaSettlementError as exc:
             raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+        except UserKeyConcurrencyLimitError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "message": str(exc),
+                        "type": "rate_limit_error",
+                        "code": "user_key_concurrency_limit",
+                    }
+                },
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         except SchedulerError as exc:
             headers = {"Retry-After": str(max(1, int(exc.retry_after_seconds)))} if exc.retry_after_seconds else None
             raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}, headers=headers) from exc

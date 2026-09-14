@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
 from services.quota_service import QuotaExceededError
+from services.user_key_concurrency import UserKeyConcurrencyLimitError
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -21,8 +22,11 @@ class FakeImageTaskService:
         self.generation_calls = []
         self.edit_calls = []
         self.reject_quota = False
+        self.reject_concurrency = False
 
     async def submit_generation_async(self, identity, **kwargs):
+        if self.reject_concurrency:
+            raise UserKeyConcurrencyLimitError("image")
         if self.reject_quota:
             raise QuotaExceededError("image", 1, 0)
         return self.submit_generation(identity, **kwargs)
@@ -111,6 +115,18 @@ class ImageTasksApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 429, response.text)
         self.assertEqual(response.json()["detail"]["error"]["code"], "insufficient_quota")
+
+    def test_concurrency_exhaustion_returns_retryable_429(self):
+        self.fake_service.reject_concurrency = True
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "concurrency-task", "prompt": "cat", "model": "gpt-image-2"},
+        )
+
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.headers["retry-after"], "1")
+        self.assertEqual(response.json()["detail"]["error"]["code"], "user_key_concurrency_limit")
 
     def test_create_edit_task_accepts_multiple_images(self):
         """测试图片编辑任务接口支持多个上传图片。"""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import tempfile
+from threading import Event
 import time
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from services.image_task_service import ImageTaskService, _collect_image_urls
 from services.quota_service import AuthQuotaStore, QuotaExceededError, QuotaReservation, QuotaService
 from services.scheduler.state_store import SchedulerStateStore
 from services.storage.sqlite_migration import migrate_legacy_state
+from services.user_key_concurrency import UserKeyConcurrencyLimitError, UserKeyConcurrencyLimiter
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -55,7 +57,14 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
-    def make_service(self, path: Path, handler=None, quota_service=None, state_store=None) -> ImageTaskService:
+    def make_service(
+        self,
+        path: Path,
+        handler=None,
+        quota_service=None,
+        state_store=None,
+        concurrency_limiter=None,
+    ) -> ImageTaskService:
         return ImageTaskService(
             path,
             generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
@@ -63,8 +72,113 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
             quota_service_instance=quota_service,
             state_store=state_store,
+            concurrency_limiter=concurrency_limiter,
             spool_dir=path.parent / "image-task-spool",
         )
+
+    def test_user_image_tasks_hold_one_image_lease_until_terminal_state(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            started = Event()
+            release = Event()
+
+            def handler(_payload):
+                started.set()
+                release.wait(timeout=2)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            limiter = UserKeyConcurrencyLimiter(
+                text_limit_getter=lambda: 4,
+                image_limit_getter=lambda: 1,
+            )
+            quota = FakeQuotaService()
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler,
+                quota_service=quota,
+                concurrency_limiter=limiter,
+            )
+            try:
+                service.submit_generation(
+                    USER_OWNER,
+                    client_task_id="first",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                )
+                self.assertTrue(started.wait(timeout=2))
+                self.assertEqual(limiter.active_count(USER_OWNER, "image"), 1)
+
+                with self.assertRaises(UserKeyConcurrencyLimitError):
+                    service.submit_generation(
+                        USER_OWNER,
+                        client_task_id="second",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+
+                release.set()
+                wait_for_task(service, USER_OWNER, "first", "success")
+                self.assertEqual(limiter.active_count(USER_OWNER, "image"), 0)
+
+                service.submit_generation(
+                    USER_OWNER,
+                    client_task_id="second",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                )
+                wait_for_task(service, USER_OWNER, "second", "success")
+                self.assertEqual(limiter.active_count(USER_OWNER, "image"), 0)
+            finally:
+                release.set()
+                service.shutdown(wait=True)
+
+    def test_duplicate_user_submit_does_not_acquire_second_image_lease(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            started = Event()
+            release = Event()
+
+            def handler(_payload):
+                started.set()
+                release.wait(timeout=2)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            limiter = UserKeyConcurrencyLimiter(
+                text_limit_getter=lambda: 4,
+                image_limit_getter=lambda: 1,
+            )
+            quota = FakeQuotaService()
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler,
+                quota_service=quota,
+                concurrency_limiter=limiter,
+            )
+            try:
+                first = service.submit_generation(
+                    USER_OWNER,
+                    client_task_id="duplicate-user-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                )
+                self.assertTrue(started.wait(timeout=2))
+                second = service.submit_generation(
+                    USER_OWNER,
+                    client_task_id="duplicate-user-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                )
+                self.assertEqual(first["id"], second["id"])
+                self.assertEqual(limiter.active_count(USER_OWNER, "image"), 1)
+                release.set()
+                wait_for_task(service, USER_OWNER, "duplicate-user-task", "success")
+                self.assertEqual(limiter.active_count(USER_OWNER, "image"), 0)
+            finally:
+                release.set()
+                service.shutdown(wait=True)
 
     def test_user_image_task_reserves_and_commits_successful_output(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -150,13 +264,22 @@ class ImageTaskServiceTests(unittest.TestCase):
     def test_timeout_resume_reuses_persisted_reservation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             quota = FakeQuotaService()
+            limiter = UserKeyConcurrencyLimiter(
+                text_limit_getter=lambda: 4,
+                image_limit_getter=lambda: 1,
+            )
 
             def handler(_payload):
                 error = RuntimeError("生图超时")
                 error.conversation_id = "conversation-quota"
                 raise error
 
-            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler, quota)
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler,
+                quota,
+                concurrency_limiter=limiter,
+            )
             service.submit_generation(
                 USER_OWNER,
                 client_task_id="quota-resume",
@@ -170,10 +293,12 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(len(quota.reservations), 1)
             self.assertEqual(quota.commits, [])
             self.assertEqual(quota.releases, [])
+            self.assertEqual(limiter.active_count(USER_OWNER, "image"), 0)
 
             with mock.patch.object(service, "_dispatch_resume_poll") as dispatch:
                 service.resume_poll(USER_OWNER, "quota-resume", 1.0)
             dispatch.assert_called_once()
+            self.assertEqual(limiter.active_count(USER_OWNER, "image"), 1)
 
             backend = mock.Mock()
             backend._poll_image_results.return_value = (["file-1"], [])
@@ -192,6 +317,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(len(quota.reservations), 1)
             self.assertEqual(quota.commits, [("image-reservation-1", 1)])
             self.assertEqual(quota.releases, [])
+            self.assertEqual(limiter.active_count(USER_OWNER, "image"), 0)
 
     def test_quota_reservation_metadata_is_persisted_in_scheduler_store(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
