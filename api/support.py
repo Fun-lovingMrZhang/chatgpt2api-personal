@@ -11,6 +11,7 @@ from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
 from services.quota_service import QuotaAccounting, QuotaExceededError, QuotaType, quota_service
+from services.user_key_concurrency import user_key_concurrency
 from utils.log import logger
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -72,6 +73,16 @@ def _quota_exhausted_response(exc: QuotaExceededError) -> dict[str, object]:
     }
 
 
+def _user_key_concurrency_response(quota_type: QuotaType) -> dict[str, object]:
+    return {
+        "error": {
+            "message": f"user key {quota_type} concurrency limit exceeded",
+            "type": "rate_limit_error",
+            "code": "user_key_concurrency_limit",
+        }
+    }
+
+
 async def run_with_quota(
     call: Any,
     handler,
@@ -84,6 +95,14 @@ async def run_with_quota(
     scheduler_runner=None,
     streaming: bool = False,
 ):
+    lease = user_key_concurrency.try_acquire(identity, quota_type)
+    if lease is None:
+        raise HTTPException(
+            status_code=429,
+            detail=_user_key_concurrency_response(quota_type),
+            headers={"Retry-After": "1"},
+        )
+
     try:
         reservation = quota_service.reserve(
             identity,
@@ -93,9 +112,23 @@ async def run_with_quota(
             endpoint=endpoint,
         )
     except QuotaExceededError as exc:
+        lease.release()
         raise HTTPException(status_code=429, detail=_quota_exhausted_response(exc)) from exc
 
     accounting = QuotaAccounting(reservation, quota_type, service=quota_service)
+
+    def settle_success(result: object | None = None) -> None:
+        try:
+            accounting.commit_success(result)
+        finally:
+            lease.release()
+
+    def settle_failure() -> None:
+        try:
+            accounting.release()
+        finally:
+            lease.release()
+
     try:
         return await call.run(
             handler,
@@ -103,12 +136,12 @@ async def run_with_quota(
             sse=sse,
             scheduler_runner=scheduler_runner,
             streaming=streaming,
-            on_success=accounting.commit_success,
-            on_failure=accounting.release,
+            on_success=settle_success,
+            on_failure=settle_failure,
             on_stream_item=accounting.observe,
         )
     except BaseException:
-        accounting.release()
+        settle_failure()
         raise
 
 

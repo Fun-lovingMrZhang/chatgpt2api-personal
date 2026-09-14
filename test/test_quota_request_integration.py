@@ -7,8 +7,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+from api.errors import install_exception_handlers
 import api.support as support_module
 from services.quota_service import QuotaExceededError, QuotaReservation
+from services.user_key_concurrency import UserKeyConcurrencyLimiter
 
 
 USER_IDENTITY = {"id": "user-1", "name": "普通用户", "role": "user"}
@@ -53,6 +55,7 @@ class QuotaRequestIntegrationTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         app = FastAPI()
         app.include_router(ai_module.create_router())
+        install_exception_handlers(app)
         self.client = TestClient(app)
 
     def test_text_success_commits_one(self):
@@ -143,6 +146,71 @@ class QuotaRequestIntegrationTests(unittest.TestCase):
         self.assertIn("one", response.text)
         self.assertEqual(self.quota.committed, [1])
         self.assertEqual(self.quota.released, 0)
+
+    def test_text_limit_returns_429_before_handler_and_releases_after_manual_lease(self):
+        limiter = UserKeyConcurrencyLimiter(
+            text_limit_getter=lambda: 1,
+            image_limit_getter=lambda: 1,
+        )
+        with mock.patch.object(support_module, "user_key_concurrency", limiter):
+            held = limiter.try_acquire(USER_IDENTITY, "text")
+            self.assertIsNotNone(held)
+            try:
+                with mock.patch.object(ai_module.openai_search, "handle", return_value={"ok": True}) as handler:
+                    response = self.client.post("/v1/search", headers=AUTH_HEADERS, json={"prompt": "hi"})
+                self.assertEqual(response.status_code, 429, response.text)
+                self.assertEqual(response.headers["retry-after"], "1")
+                self.assertEqual(response.json()["error"]["code"], "user_key_concurrency_limit")
+                self.assertEqual(self.quota.reserved, [])
+                handler.assert_not_called()
+            finally:
+                held.release()
+
+            with mock.patch.object(ai_module.openai_search, "handle", return_value={"ok": True}):
+                response = self.client.post("/v1/search", headers=AUTH_HEADERS, json={"prompt": "hi"})
+            self.assertEqual(response.status_code, 200, response.text)
+
+    def test_streaming_text_releases_user_key_lease_after_response_consumes(self):
+        limiter = UserKeyConcurrencyLimiter(
+            text_limit_getter=lambda: 1,
+            image_limit_getter=lambda: 1,
+        )
+
+        async def stream_handler(_payload):
+            self.assertEqual(limiter.active_count(USER_IDENTITY, "text"), 1)
+            yield {"choices": [{"delta": {"content": "one"}}]}
+
+        with mock.patch.object(support_module, "user_key_concurrency", limiter):
+            with mock.patch.object(ai_module.openai_v1_chat_complete, "handle", stream_handler):
+                response = self.client.post(
+                    "/v1/chat/completions",
+                    headers=AUTH_HEADERS,
+                    json={"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(limiter.active_count(USER_IDENTITY, "text"), 0)
+
+    def test_image_generation_uses_image_lease_and_returns_429_when_held(self):
+        limiter = UserKeyConcurrencyLimiter(
+            text_limit_getter=lambda: 4,
+            image_limit_getter=lambda: 1,
+        )
+        with mock.patch.object(support_module, "user_key_concurrency", limiter):
+            held = limiter.try_acquire(USER_IDENTITY, "image")
+            self.assertIsNotNone(held)
+            try:
+                with mock.patch.object(ai_module.openai_v1_image_generations, "handle", return_value={"ok": True}) as handler:
+                    response = self.client.post(
+                        "/v1/images/generations",
+                        headers=AUTH_HEADERS,
+                        json={"prompt": "hi"},
+                    )
+                self.assertEqual(response.status_code, 429, response.text)
+                self.assertEqual(response.headers["retry-after"], "1")
+                self.assertEqual(response.json()["error"]["code"], "user_key_concurrency_limit")
+                handler.assert_not_called()
+            finally:
+                held.release()
 
 
 if __name__ == "__main__":
