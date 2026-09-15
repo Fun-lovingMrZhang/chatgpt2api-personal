@@ -333,10 +333,12 @@ export type UserKey = {
   text_used: number;
   text_reserved: number;
   text_remaining: number;
+  text_concurrency: number;
   image_limit: number;
   image_used: number;
   image_reserved: number;
   image_remaining: number;
+  image_concurrency: number;
 };
 
 export async function login(authKey: string) {
@@ -705,10 +707,22 @@ export async function fetchUserKeys() {
   return httpRequest<{ items: UserKey[] }>("/api/auth/users");
 }
 
-export async function createUserKey(name: string, textLimit = 0, imageLimit = 0) {
+export async function createUserKey(
+  name: string,
+  textLimit = 0,
+  imageLimit = 0,
+  textConcurrency = 4,
+  imageConcurrency = 1,
+) {
   return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
     method: "POST",
-    body: { name, text_limit: textLimit, image_limit: imageLimit },
+    body: {
+      name,
+      text_limit: textLimit,
+      image_limit: imageLimit,
+      text_concurrency: textConcurrency,
+      image_concurrency: imageConcurrency,
+    },
   });
 }
 
@@ -721,6 +735,8 @@ export async function updateUserKey(
     key?: string;
     text_limit?: number;
     image_limit?: number;
+    text_concurrency?: number;
+    image_concurrency?: number;
   },
 ) {
   return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {

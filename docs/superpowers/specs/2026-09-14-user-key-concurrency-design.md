@@ -19,7 +19,7 @@
 
 ## 架构
 
-新增 `services/user_key_concurrency.py`，提供进程内 `UserKeyConcurrencyLimiter` 和幂等 lease。限流器使用线程锁保护 `(key_id, request_type)` 到活动数的映射，配置通过 getter 读取 `config` 当前值，因此不需要重启或重建 scheduler。每次获取都重新读取限制：调大限制立即允许新请求，调小限制不会中断已在途请求，只会拒绝直到活动数降到新限制以下。
+新增 `services/user_key_concurrency.py`，提供进程内 `UserKeyConcurrencyLimiter` 和幂等 lease。限流器使用线程锁保护 `(key_id, request_type)` 到活动数的映射，每次获取都通过 `QuotaService` 读取该用户密钥在 SQLite 中的当前并发字段，因此不需要重启或重建 scheduler。调大限制立即允许新请求，调小限制不会中断已在途请求，只会拒绝直到活动数降到新限制以下。
 
 限流器的核心接口为：
 
@@ -38,18 +38,18 @@ lease.release()  # safe to call more than once
 
 ## 配置与 Web
 
-在 `services/config.py` 增加两个顶层配置字段：
+在现有 SQLite `key_quotas` 表中增加两个按密钥保存的字段：
 
-```json
-{
-  "user_key_text_concurrency": 4,
-  "user_key_image_concurrency": 1
-}
+```sql
+ALTER TABLE key_quotas
+  ADD COLUMN text_concurrency INTEGER NOT NULL DEFAULT 4 CHECK (text_concurrency > 0);
+ALTER TABLE key_quotas
+  ADD COLUMN image_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (image_concurrency > 0);
 ```
 
-后端对缺失、非整数、布尔值和小于 `1` 的输入执行统一归一化，分别回退到 `4` 和 `1`。`config.get()` 始终返回归一化后的值；现有 `/api/settings` GET/POST 继续负责读取和保存。
+已有数据库启动时自动补列，旧密钥使用兼容默认值 `4/1` 初始化；新建密钥也写入自己的初始值。并发修改通过用户密钥 API 与额度更新在同一条保存链路中完成。
 
-Web 基础配置页增加两个数字输入和简短说明，`SettingsConfig`、Zustand store 的归一化/保存逻辑及 setter 同步增加对应字段。保存成功后使用服务端返回的配置更新本地状态。
+`GET /api/auth/users` 返回每条密钥的 `text_concurrency` 和 `image_concurrency`；创建与更新接口接受同名字段，要求正整数。Web 的“用户密钥”页在密钥列表中显示两个上限，并在创建/编辑弹窗中允许逐条查看和修改。保存成功后列表使用服务端返回值更新；限流器下一次准入直接读取新值，立即生效。管理员密钥仍然不创建/读取限流计数。旧的顶层 `config` 并发字段只作为迁移和兼容默认值，不作为用户密钥页的全局控制入口。
 
 ## 错误协议
 
@@ -60,10 +60,11 @@ Web 基础配置页增加两个数字输入和简短说明，`SettingsConfig`、
 后端单元测试验证：
 
 - 文本/图片计数隔离、用户密钥隔离和管理员放行。
+- SQLite 旧表迁移、每条密钥默认值和并发字段独立更新。
 - 达到上限时拒绝，释放后再次允许，lease 重复释放不会造成负计数。
-- 运行时修改配置立即影响下一次获取，缩小限制不影响现有 lease。
+- 运行时修改单条密钥的限制立即影响下一次获取，缩小限制不影响现有 lease。
 - 普通同步请求和流式请求在成功、异常、取消时都释放。
 - 图片异步任务的去重、终态释放、失败回滚和限流错误转换。
-- 配置默认值、非法值归一化及 `/api/settings` 返回值。
+- 用户密钥 API 的创建、列表和更新字段，以及并发值校验。
 
 完成后运行 Python 全量测试，并在 `web` 目录执行现有可用的 TypeScript/build 校验。

@@ -74,10 +74,12 @@ class FakeQuotaService:
             "text_used": 0,
             "text_reserved": 0,
             "text_remaining": 0,
+            "text_concurrency": 4,
             "image_limit": 0,
             "image_used": 0,
             "image_reserved": 0,
             "image_remaining": 0,
+            "image_concurrency": 1,
             "created_at": 1,
             "updated_at": 1,
             "deleted_at": None,
@@ -88,7 +90,15 @@ class FakeQuotaService:
         quota["image_remaining"] = max(0, quota["image_limit"] - quota["image_used"] - quota["image_reserved"])
         return quota
 
-    def set_limits(self, key_id, *, text_limit=None, image_limit=None):
+    def set_limits(
+        self,
+        key_id,
+        *,
+        text_limit=None,
+        image_limit=None,
+        text_concurrency=None,
+        image_concurrency=None,
+    ):
         if self.fail_on_set_limits:
             raise RuntimeError("quota store unavailable")
         self.ensure_key(key_id)
@@ -101,6 +111,10 @@ class FakeQuotaService:
             raise QuotaLimitError()
         quota["text_limit"] = next_text
         quota["image_limit"] = next_image
+        if text_concurrency is not None:
+            quota["text_concurrency"] = text_concurrency
+        if image_concurrency is not None:
+            quota["image_concurrency"] = image_concurrency
         return self._refresh(quota)
 
     def list_user_quotas(self, items):
@@ -141,11 +155,37 @@ class QuotaApiTests(unittest.TestCase):
         response = self.client.post(
             "/api/auth/users",
             headers=AUTH_HEADERS,
-            json={"name": "设计组", "text_limit": 10, "image_limit": 4},
+            json={
+                "name": "设计组",
+                "text_limit": 10,
+                "image_limit": 4,
+                "text_concurrency": 7,
+                "image_concurrency": 3,
+            },
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["item"]["text_limit"], 10)
         self.assertEqual(response.json()["item"]["image_limit"], 4)
+        self.assertEqual(response.json()["item"]["text_concurrency"], 7)
+        self.assertEqual(response.json()["item"]["image_concurrency"], 3)
+
+    def test_update_user_key_changes_per_key_concurrency(self):
+        created = self.client.post(
+            "/api/auth/users",
+            headers=AUTH_HEADERS,
+            json={"name": "并发测试"},
+        ).json()["item"]
+
+        response = self.client.post(
+            f"/api/auth/users/{created['id']}",
+            headers=AUTH_HEADERS,
+            json={"text_concurrency": 9, "image_concurrency": 4},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["item"]["text_concurrency"], 9)
+        self.assertEqual(response.json()["item"]["image_concurrency"], 4)
+        self.assertEqual(response.json()["items"][0]["text_concurrency"], 9)
 
     def test_update_user_key_changes_web_login_permission(self):
         created = self.client.post(

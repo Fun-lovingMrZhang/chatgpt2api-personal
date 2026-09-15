@@ -47,6 +47,25 @@ class UserKeyConcurrencyLimiterTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertIsNone(third)
 
+    def test_each_user_key_uses_its_own_limit_and_updates_immediately(self):
+        limits = {
+            "user-1": {"text": 1, "image": 2},
+            "user-2": {"text": 2, "image": 1},
+        }
+        limiter = UserKeyConcurrencyLimiter(
+            limit_getter=lambda identity, request_type: limits[identity["id"]][request_type],
+        )
+
+        first = limiter.try_acquire(USER, "text")
+        self.assertIsNotNone(first)
+        self.assertIsNone(limiter.try_acquire(USER, "text"))
+        self.assertIsNotNone(limiter.try_acquire(OTHER_USER, "text"))
+        self.assertIsNotNone(limiter.try_acquire(OTHER_USER, "text"))
+        self.assertIsNone(limiter.try_acquire(OTHER_USER, "text"))
+
+        limits["user-1"]["text"] = 2
+        self.assertIsNotNone(limiter.try_acquire(USER, "text"))
+
     def test_recovered_lease_is_counted_even_when_limit_is_full(self):
         first = self.limiter.try_acquire(USER, "image")
         recovered = self.limiter.acquire_existing(USER, "image")

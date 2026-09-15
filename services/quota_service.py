@@ -157,10 +157,26 @@ def _validate_units(value: object, *, allow_zero: bool = False) -> int:
     return units
 
 
+def _validate_concurrency(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("concurrency limit must be a positive integer")
+    try:
+        concurrency = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("concurrency limit must be a positive integer") from exc
+    if concurrency < 1:
+        raise ValueError("concurrency limit must be a positive integer")
+    return concurrency
+
+
 class AuthQuotaStore:
     _QUOTA_FIELDS = {
         "text": ("text_limit", "text_used", "text_reserved"),
         "image": ("image_limit", "image_used", "image_reserved"),
+    }
+    _CONCURRENCY_FIELDS = {
+        "text": "text_concurrency",
+        "image": "image_concurrency",
     }
 
     def __init__(self, db_path: Path):
@@ -223,6 +239,8 @@ class AuthQuotaStore:
                     image_limit INTEGER NOT NULL DEFAULT 0 CHECK (image_limit >= 0),
                     image_used INTEGER NOT NULL DEFAULT 0 CHECK (image_used >= 0),
                     image_reserved INTEGER NOT NULL DEFAULT 0 CHECK (image_reserved >= 0),
+                    text_concurrency INTEGER NOT NULL DEFAULT 4 CHECK (text_concurrency > 0),
+                    image_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (image_concurrency > 0),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     deleted_at REAL
@@ -248,11 +266,48 @@ class AuthQuotaStore:
                     ON quota_reservations(expires_at, status);
                 """
             )
+            existing_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(key_quotas)").fetchall()
+            }
+            migration_defaults = {
+                "text_concurrency": self._default_concurrency("text"),
+                "image_concurrency": self._default_concurrency("image"),
+            }
+            for column, default in migration_defaults.items():
+                if column not in existing_columns:
+                    connection.execute(
+                        f"ALTER TABLE key_quotas ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default} CHECK ({column} > 0)"
+                    )
             self._initialized = True
 
     def _ensure_initialized(self) -> None:
         if not self._initialized:
             self.initialize()
+
+    @staticmethod
+    def _default_concurrency(quota_type: QuotaType) -> int:
+        value = config.user_key_text_concurrency if quota_type == "text" else config.user_key_image_concurrency
+        try:
+            return _validate_concurrency(value)
+        except ValueError:
+            return 1
+
+    def _insert_empty_quota(self, connection: sqlite3.Connection, key_id: str, timestamp: float) -> None:
+        connection.execute(
+            """
+            INSERT INTO key_quotas (
+                key_id, text_concurrency, image_concurrency, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                key_id,
+                self._default_concurrency("text"),
+                self._default_concurrency("image"),
+                timestamp,
+                timestamp,
+            ),
+        )
 
     @classmethod
     def _field_names(cls, quota_type: QuotaType) -> tuple[str, str, str]:
@@ -270,6 +325,8 @@ class AuthQuotaStore:
         image_limit = int(get("image_limit"))
         image_used = int(get("image_used"))
         image_reserved = int(get("image_reserved"))
+        text_concurrency = int(get("text_concurrency"))
+        image_concurrency = int(get("image_concurrency"))
         return {
             "key_id": get("key_id"),
             "text_limit": text_limit,
@@ -280,6 +337,8 @@ class AuthQuotaStore:
             "image_used": image_used,
             "image_reserved": image_reserved,
             "image_remaining": max(0, image_limit - image_used - image_reserved),
+            "text_concurrency": text_concurrency,
+            "image_concurrency": image_concurrency,
             "created_at": get("created_at"),
             "updated_at": get("updated_at"),
             "deleted_at": get("deleted_at"),
@@ -294,11 +353,18 @@ class AuthQuotaStore:
         with self._transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO key_quotas (key_id, created_at, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO key_quotas (
+                    key_id, text_concurrency, image_concurrency, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(key_id) DO NOTHING
                 """,
-                (normalized_id, timestamp, timestamp),
+                (
+                    normalized_id,
+                    self._default_concurrency("text"),
+                    self._default_concurrency("image"),
+                    timestamp,
+                    timestamp,
+                ),
             )
 
     def ensure_keys(self, key_ids: Iterable[str]) -> None:
@@ -310,11 +376,21 @@ class AuthQuotaStore:
         with self._transaction() as connection:
             connection.executemany(
                 """
-                INSERT INTO key_quotas (key_id, created_at, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO key_quotas (
+                    key_id, text_concurrency, image_concurrency, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(key_id) DO NOTHING
                 """,
-                [(key_id, timestamp, timestamp) for key_id in normalized_ids],
+                [
+                    (
+                        key_id,
+                        self._default_concurrency("text"),
+                        self._default_concurrency("image"),
+                        timestamp,
+                        timestamp,
+                    )
+                    for key_id in normalized_ids
+                ],
             )
 
     def mark_deleted(self, key_id: str) -> None:
@@ -338,6 +414,26 @@ class AuthQuotaStore:
             (normalized_id,),
         ).fetchone()
         return self._quota_payload(row) if row is not None else None
+
+    def get_concurrency_limit(self, key_id: str, quota_type: QuotaType) -> int:
+        normalized_id = str(key_id or "").strip()
+        try:
+            field = self._CONCURRENCY_FIELDS[quota_type]
+        except KeyError as exc:
+            raise ValueError(f"unsupported quota type: {quota_type}") from exc
+        if not normalized_id:
+            return self._default_concurrency(quota_type)
+        self._ensure_initialized()
+        row = self._connection().execute(
+            f"SELECT {field}, deleted_at FROM key_quotas WHERE key_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if row is None or row["deleted_at"] is not None:
+            return self._default_concurrency(quota_type)
+        try:
+            return _validate_concurrency(row[field])
+        except ValueError:
+            return self._default_concurrency(quota_type)
 
     def list_reservations(self, key_id: str) -> list[dict[str, object]]:
         normalized_id = str(key_id or "").strip()
@@ -380,17 +476,30 @@ class AuthQuotaStore:
         *,
         text_limit: int | None = None,
         image_limit: int | None = None,
+        text_concurrency: int | None = None,
+        image_concurrency: int | None = None,
     ) -> dict[str, object]:
         normalized_id = str(key_id or "").strip()
         if not normalized_id:
             raise QuotaKeyNotFoundError("key_id is required")
-        if text_limit is None and image_limit is None:
+        if (
+            text_limit is None
+            and image_limit is None
+            and text_concurrency is None
+            and image_concurrency is None
+        ):
             current = self.get_quota(normalized_id)
             if current is None:
                 raise QuotaKeyNotFoundError("quota row not found")
             return current
         normalized_text = _validate_units(text_limit, allow_zero=True) if text_limit is not None else None
         normalized_image = _validate_units(image_limit, allow_zero=True) if image_limit is not None else None
+        normalized_text_concurrency = (
+            _validate_concurrency(text_concurrency) if text_concurrency is not None else None
+        )
+        normalized_image_concurrency = (
+            _validate_concurrency(image_concurrency) if image_concurrency is not None else None
+        )
         self._ensure_initialized()
         with self._transaction() as connection:
             row = connection.execute(
@@ -399,13 +508,7 @@ class AuthQuotaStore:
             ).fetchone()
             if row is None:
                 timestamp = _now()
-                connection.execute(
-                    """
-                    INSERT INTO key_quotas (key_id, created_at, updated_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (normalized_id, timestamp, timestamp),
-                )
+                self._insert_empty_quota(connection, normalized_id, timestamp)
                 row = connection.execute(
                     "SELECT * FROM key_quotas WHERE key_id = ?",
                     (normalized_id,),
@@ -414,6 +517,16 @@ class AuthQuotaStore:
                 raise QuotaKeyNotFoundError("quota row not found")
             next_text = normalized_text if normalized_text is not None else int(row["text_limit"])
             next_image = normalized_image if normalized_image is not None else int(row["image_limit"])
+            next_text_concurrency = (
+                normalized_text_concurrency
+                if normalized_text_concurrency is not None
+                else int(row["text_concurrency"])
+            )
+            next_image_concurrency = (
+                normalized_image_concurrency
+                if normalized_image_concurrency is not None
+                else int(row["image_concurrency"])
+            )
             if next_text < int(row["text_used"]) + int(row["text_reserved"]):
                 raise QuotaLimitError()
             if next_image < int(row["image_used"]) + int(row["image_reserved"]):
@@ -422,10 +535,18 @@ class AuthQuotaStore:
             connection.execute(
                 """
                 UPDATE key_quotas
-                SET text_limit = ?, image_limit = ?, updated_at = ?
+                SET text_limit = ?, image_limit = ?,
+                    text_concurrency = ?, image_concurrency = ?, updated_at = ?
                 WHERE key_id = ?
                 """,
-                (next_text, next_image, timestamp, normalized_id),
+                (
+                    next_text,
+                    next_image,
+                    next_text_concurrency,
+                    next_image_concurrency,
+                    timestamp,
+                    normalized_id,
+                ),
             )
             updated = connection.execute(
                 "SELECT * FROM key_quotas WHERE key_id = ?",
@@ -458,13 +579,7 @@ class AuthQuotaStore:
                 (normalized_id,),
             ).fetchone()
             if row is None:
-                connection.execute(
-                    """
-                    INSERT INTO key_quotas (key_id, created_at, updated_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (normalized_id, timestamp, timestamp),
-                )
+                self._insert_empty_quota(connection, normalized_id, timestamp)
                 row = connection.execute(
                     "SELECT * FROM key_quotas WHERE key_id = ?",
                     (normalized_id,),
@@ -754,6 +869,9 @@ class QuotaService:
     def get_quota(self, key_id: str) -> dict[str, object] | None:
         return self.store.get_quota(key_id)
 
+    def get_concurrency_limit(self, key_id: str, quota_type: QuotaType) -> int:
+        return self.store.get_concurrency_limit(key_id, quota_type)
+
     def list_user_quotas(self, items: list[dict[str, object]]) -> list[dict[str, object]]:
         return self.store.list_user_quotas(items)
 
@@ -763,8 +881,16 @@ class QuotaService:
         *,
         text_limit: int | None = None,
         image_limit: int | None = None,
+        text_concurrency: int | None = None,
+        image_concurrency: int | None = None,
     ) -> dict[str, object]:
-        return self.store.set_limits(key_id, text_limit=text_limit, image_limit=image_limit)
+        return self.store.set_limits(
+            key_id,
+            text_limit=text_limit,
+            image_limit=image_limit,
+            text_concurrency=text_concurrency,
+            image_concurrency=image_concurrency,
+        )
 
     def get_reservation(self, reservation_id: str) -> dict[str, object] | None:
         return self.store.get_reservation(reservation_id)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -49,6 +50,8 @@ class QuotaServiceTests(unittest.TestCase):
 
             quota = service.get_quota("user-1")
             self.assertEqual(quota["text_remaining"], 0)
+            self.assertEqual(quota["text_concurrency"], 4)
+            self.assertEqual(quota["image_concurrency"], 1)
             with self.assertRaises(QuotaExceededError):
                 service.reserve(
                     user_identity(),
@@ -67,6 +70,65 @@ class QuotaServiceTests(unittest.TestCase):
             )
             self.assertTrue(reservation.admin_bypass)
             self.assertIsNone(service.get_quota("admin"))
+
+    def test_concurrency_limits_are_per_key_and_update_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = make_service(Path(tmp_dir))
+            service.ensure_key("user-1")
+            service.ensure_key("user-2")
+
+            updated = service.set_limits(
+                "user-1",
+                text_concurrency=2,
+                image_concurrency=3,
+            )
+
+            self.assertEqual(updated["text_concurrency"], 2)
+            self.assertEqual(updated["image_concurrency"], 3)
+            self.assertEqual(service.get_concurrency_limit("user-1", "text"), 2)
+            self.assertEqual(service.get_concurrency_limit("user-1", "image"), 3)
+            self.assertEqual(service.get_concurrency_limit("user-2", "text"), 4)
+            self.assertEqual(service.get_concurrency_limit("user-2", "image"), 1)
+
+    def test_concurrency_limits_must_be_positive_integers(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = make_service(Path(tmp_dir))
+            with self.assertRaisesRegex(ValueError, "concurrency limit"):
+                service.set_limits("user-1", text_concurrency=0)
+            with self.assertRaisesRegex(ValueError, "concurrency limit"):
+                service.set_limits("user-1", image_concurrency=True)
+
+    def test_old_quota_table_is_migrated_with_concurrency_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "auth_quota.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                CREATE TABLE key_quotas (
+                    key_id TEXT PRIMARY KEY,
+                    text_limit INTEGER NOT NULL DEFAULT 0,
+                    text_used INTEGER NOT NULL DEFAULT 0,
+                    text_reserved INTEGER NOT NULL DEFAULT 0,
+                    image_limit INTEGER NOT NULL DEFAULT 0,
+                    image_used INTEGER NOT NULL DEFAULT 0,
+                    image_reserved INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    deleted_at REAL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO key_quotas (key_id, created_at, updated_at) VALUES (?, ?, ?)",
+                ("user-1", 1, 1),
+            )
+            connection.commit()
+            connection.close()
+
+            service = make_service(Path(tmp_dir))
+            quota = service.get_quota("user-1")
+            self.assertEqual(quota["text_concurrency"], 4)
+            self.assertEqual(quota["image_concurrency"], 1)
 
     def test_reserve_commit_and_release_keep_remaining_consistent(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

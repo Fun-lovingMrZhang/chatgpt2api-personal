@@ -48,7 +48,9 @@ class UserKeyConcurrencyLimiter:
         *,
         text_limit_getter: Callable[[], object] | None = None,
         image_limit_getter: Callable[[], object] | None = None,
+        limit_getter: Callable[[Mapping[str, object], RequestType], object] | None = None,
     ):
+        self._identity_limit_getter = limit_getter
         self._limit_getters: dict[RequestType, Callable[[], object]] = {
             "text": text_limit_getter or (lambda: config.user_key_text_concurrency),
             "image": image_limit_getter or (lambda: config.user_key_image_concurrency),
@@ -71,9 +73,14 @@ class UserKeyConcurrencyLimiter:
             return None
         return user_id, request_type
 
-    def _limit(self, request_type: RequestType) -> int:
+    def _limit(self, identity: Mapping[str, object], request_type: RequestType) -> int:
         try:
-            return max(1, int(self._limit_getters[request_type]()))
+            value = (
+                self._identity_limit_getter(identity, request_type)
+                if self._identity_limit_getter is not None
+                else self._limit_getters[request_type]()
+            )
+            return max(1, int(value))
         except (OverflowError, TypeError, ValueError):
             return 1
 
@@ -86,7 +93,7 @@ class UserKeyConcurrencyLimiter:
         key = self._key(identity, request_type)
         if key is None:
             return UserKeyConcurrencyLease(None, None)
-        limit = self._limit(request_type)
+        limit = self._limit(identity, request_type)
         with self._lock:
             active = self._active.get(key, 0)
             if active >= limit:
@@ -123,5 +130,17 @@ class UserKeyConcurrencyLimiter:
         with self._lock:
             return self._active.get(key, 0)
 
+def _database_limit_getter(identity: Mapping[str, object], request_type: RequestType) -> object:
+    try:
+        from services.quota_service import quota_service
 
-user_key_concurrency = UserKeyConcurrencyLimiter()
+        return quota_service.get_concurrency_limit(str(identity.get("id") or ""), request_type)
+    except Exception:
+        return (
+            config.user_key_text_concurrency
+            if request_type == "text"
+            else config.user_key_image_concurrency
+        )
+
+
+user_key_concurrency = UserKeyConcurrencyLimiter(limit_getter=_database_limit_getter)

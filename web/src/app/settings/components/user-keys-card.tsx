@@ -45,6 +45,15 @@ function parseQuotaLimit(value: string) {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+function parseConcurrencyLimit(value: string) {
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+}
+
 function QuotaSummary({
   label,
   used,
@@ -71,6 +80,15 @@ function QuotaSummary({
   );
 }
 
+function ConcurrencySummary({ label, limit }: { label: string; limit: number }) {
+  return (
+    <div className="min-w-0 text-xs text-stone-500">
+      <div className="font-medium text-stone-700">{label}</div>
+      <div className="mt-1">上限 {limit} 个同时请求</div>
+    </div>
+  );
+}
+
 export function UserKeysCard() {
   const didLoadRef = useRef(false);
   const [items, setItems] = useState<UserKey[]>([]);
@@ -86,8 +104,12 @@ export function UserKeysCard() {
   const [editKey, setEditKey] = useState("");
   const [createTextLimit, setCreateTextLimit] = useState("0");
   const [createImageLimit, setCreateImageLimit] = useState("0");
+  const [createTextConcurrency, setCreateTextConcurrency] = useState("4");
+  const [createImageConcurrency, setCreateImageConcurrency] = useState("1");
   const [editTextLimit, setEditTextLimit] = useState("0");
   const [editImageLimit, setEditImageLimit] = useState("0");
+  const [editTextConcurrency, setEditTextConcurrency] = useState("4");
+  const [editImageConcurrency, setEditImageConcurrency] = useState("1");
   const [editWebLoginEnabled, setEditWebLoginEnabled] = useState(true);
 
   const load = async (silent = false) => {
@@ -154,18 +176,26 @@ export function UserKeysCard() {
   const handleCreate = async () => {
     const textLimit = parseQuotaLimit(createTextLimit);
     const imageLimit = parseQuotaLimit(createImageLimit);
+    const textConcurrency = parseConcurrencyLimit(createTextConcurrency);
+    const imageConcurrency = parseConcurrencyLimit(createImageConcurrency);
     if (textLimit === null || imageLimit === null) {
       toast.error("额度必须是大于等于 0 的整数");
       return;
     }
+    if (textConcurrency === null || imageConcurrency === null) {
+      toast.error("并发必须是大于等于 1 的整数");
+      return;
+    }
     setIsCreating(true);
     try {
-      const data = await createUserKey(name.trim(), textLimit, imageLimit);
+      const data = await createUserKey(name.trim(), textLimit, imageLimit, textConcurrency, imageConcurrency);
       setItems(data.items);
       setRevealedKey(data.key);
       setName("");
       setCreateTextLimit("0");
       setCreateImageLimit("0");
+      setCreateTextConcurrency("4");
+      setCreateImageConcurrency("1");
       setIsDialogOpen(false);
       toast.success("用户密钥已创建");
     } catch (error) {
@@ -224,6 +254,8 @@ export function UserKeysCard() {
     setEditKey("");
     setEditTextLimit(String(item.text_limit ?? 0));
     setEditImageLimit(String(item.image_limit ?? 0));
+    setEditTextConcurrency(String(item.text_concurrency ?? 4));
+    setEditImageConcurrency(String(item.image_concurrency ?? 1));
     setEditWebLoginEnabled(item.web_login_enabled);
   };
 
@@ -236,13 +268,21 @@ export function UserKeysCard() {
     const trimmedKey = editKey.trim();
     const textLimit = parseQuotaLimit(editTextLimit);
     const imageLimit = parseQuotaLimit(editImageLimit);
+    const textConcurrency = parseConcurrencyLimit(editTextConcurrency);
+    const imageConcurrency = parseConcurrencyLimit(editImageConcurrency);
     if (textLimit === null || imageLimit === null) {
       toast.error("额度必须是大于等于 0 的整数");
       return;
     }
+    if (textConcurrency === null || imageConcurrency === null) {
+      toast.error("并发必须是大于等于 1 的整数");
+      return;
+    }
     const limitsChanged = textLimit !== item.text_limit || imageLimit !== item.image_limit;
+    const concurrencyChanged =
+      textConcurrency !== item.text_concurrency || imageConcurrency !== item.image_concurrency;
     const webLoginChanged = editWebLoginEnabled !== item.web_login_enabled;
-    if (trimmedName === item.name && !trimmedKey && !limitsChanged && !webLoginChanged) {
+    if (trimmedName === item.name && !trimmedKey && !limitsChanged && !concurrencyChanged && !webLoginChanged) {
       setEditingItem(null);
       return;
     }
@@ -252,6 +292,9 @@ export function UserKeysCard() {
         ...(trimmedName !== item.name ? { name: trimmedName } : {}),
         ...(trimmedKey ? { key: trimmedKey } : {}),
         ...(limitsChanged ? { text_limit: textLimit, image_limit: imageLimit } : {}),
+        ...(concurrencyChanged
+          ? { text_concurrency: textConcurrency, image_concurrency: imageConcurrency }
+          : {}),
         ...(webLoginChanged ? { web_login_enabled: editWebLoginEnabled } : {}),
       });
       setItems(data.items);
@@ -260,8 +303,8 @@ export function UserKeysCard() {
       toast.success(
         webLoginChanged
           ? "用户密钥与 Web 登录权限已更新"
-          : limitsChanged
-            ? "用户密钥与额度已更新"
+          : limitsChanged || concurrencyChanged
+            ? "用户密钥额度与并发已更新"
             : trimmedKey
               ? "用户密钥已更新"
               : "用户名称已更新",
@@ -363,6 +406,8 @@ export function UserKeysCard() {
                           remaining={item.image_remaining}
                           limit={item.image_limit}
                         />
+                        <ConcurrencySummary label="文本并发" limit={item.text_concurrency} />
+                        <ConcurrencySummary label="图片并发" limit={item.image_concurrency} />
                       </div>
                     </div>
 
@@ -459,6 +504,40 @@ export function UserKeysCard() {
                 onChange={(event) => setCreateImageLimit(event.target.value)}
                 className="h-11 rounded-xl border-stone-200 bg-white"
               />
+            </div>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700" htmlFor="create-text-concurrency">
+                文本并发
+              </label>
+              <Input
+                id="create-text-concurrency"
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={createTextConcurrency}
+                onChange={(event) => setCreateTextConcurrency(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">该密钥同时处理的文本请求数量。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700" htmlFor="create-image-concurrency">
+                图片并发
+              </label>
+              <Input
+                id="create-image-concurrency"
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={createImageConcurrency}
+                onChange={(event) => setCreateImageConcurrency(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">该密钥同时处理的图片请求数量。</p>
             </div>
           </div>
           <DialogFooter>
@@ -583,6 +662,40 @@ export function UserKeysCard() {
                   onChange={(event) => setEditImageLimit(event.target.value)}
                   className="h-11 rounded-xl border-stone-200 bg-white"
                 />
+              </div>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700" htmlFor="edit-text-concurrency">
+                  文本并发
+                </label>
+                <Input
+                  id="edit-text-concurrency"
+                  type="number"
+                  min={1}
+                  step={1}
+                  inputMode="numeric"
+                  value={editTextConcurrency}
+                  onChange={(event) => setEditTextConcurrency(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs text-stone-500">保存后对该密钥的新文本请求立即生效。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700" htmlFor="edit-image-concurrency">
+                  图片并发
+                </label>
+                <Input
+                  id="edit-image-concurrency"
+                  type="number"
+                  min={1}
+                  step={1}
+                  inputMode="numeric"
+                  value={editImageConcurrency}
+                  onChange={(event) => setEditImageConcurrency(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs text-stone-500">保存后对该密钥的新图片请求立即生效。</p>
               </div>
             </div>
             <div className="flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3">

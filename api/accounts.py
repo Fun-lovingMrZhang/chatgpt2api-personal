@@ -24,6 +24,7 @@ from api.support import (
     sanitize_sub2api_servers,
 )
 from services.account_service import account_service
+from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.quota_service import QuotaKeyNotFoundError, QuotaLimitError, quota_service
@@ -42,6 +43,8 @@ class UserKeyCreateRequest(BaseModel):
     name: str = ""
     text_limit: int = Field(default=0, ge=0)
     image_limit: int = Field(default=0, ge=0)
+    text_concurrency: int | None = Field(default=None, ge=1)
+    image_concurrency: int | None = Field(default=None, ge=1)
 
 
 class UserKeyUpdateRequest(BaseModel):
@@ -51,6 +54,8 @@ class UserKeyUpdateRequest(BaseModel):
     key: str | None = None
     text_limit: int | None = Field(default=None, ge=0)
     image_limit: int | None = Field(default=None, ge=0)
+    text_concurrency: int | None = Field(default=None, ge=1)
+    image_concurrency: int | None = Field(default=None, ge=1)
 
 
 class AccountCreateRequest(BaseModel):
@@ -196,6 +201,8 @@ def create_router() -> APIRouter:
                 str(item.get("id") or ""),
                 text_limit=body.text_limit,
                 image_limit=body.image_limit,
+                text_concurrency=body.text_concurrency or config.user_key_text_concurrency,
+                image_concurrency=body.image_concurrency or config.user_key_image_concurrency,
             )
         except Exception as exc:
             try:
@@ -223,7 +230,15 @@ def create_router() -> APIRouter:
             }.items()
             if value is not None
         }
-        has_quota_updates = body.text_limit is not None or body.image_limit is not None
+        has_quota_updates = any(
+            value is not None
+            for value in (
+                body.text_limit,
+                body.image_limit,
+                body.text_concurrency,
+                body.image_concurrency,
+            )
+        )
         if not auth_updates and not has_quota_updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
 
@@ -241,6 +256,8 @@ def create_router() -> APIRouter:
                     key_id,
                     text_limit=body.text_limit,
                     image_limit=body.image_limit,
+                    text_concurrency=body.text_concurrency,
+                    image_concurrency=body.image_concurrency,
                 )
             except QuotaLimitError as exc:
                 raise HTTPException(
