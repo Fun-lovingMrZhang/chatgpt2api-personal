@@ -67,3 +67,33 @@ def test_rotated_token_alias_survives_sqlite_reload(tmp_path):
         assert reloaded.resolve_access_token("old-token") == "new-token"
     finally:
         reloaded_store.close()
+
+
+def test_refresh_accounts_releases_sqlite_worker_connections(tmp_path):
+    store = SQLiteStateStore(tmp_path / "app.db", auto_migrate=False)
+    service = AccountService(store)
+    service.add_account_items([
+        {"access_token": "refresh-token", "status": "正常", "quota": 3},
+    ])
+    baseline = store.connection_count()
+
+    def fake_fetch(
+        access_token: str,
+        event: str,
+        defer_invalid_removal: bool,
+        *,
+        quiet: bool = False,
+    ):
+        return service.update_account(
+            access_token,
+            {"status": "正常", "quota": 3},
+            quiet=quiet,
+        )
+
+    service.fetch_remote_info = fake_fetch
+    try:
+        for _ in range(30):
+            service.refresh_accounts(["refresh-token"], quiet=True)
+            assert store.connection_count() == baseline
+    finally:
+        store.close()

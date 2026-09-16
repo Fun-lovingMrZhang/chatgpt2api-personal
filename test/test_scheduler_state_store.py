@@ -67,16 +67,21 @@ class SchedulerStateStoreTests(unittest.TestCase):
             store = SchedulerStateStore(Path(tmp_dir) / "scheduler.db")
             store.initialize()
 
-            threads = [threading.Thread(target=store.list_health) for _ in range(4)]
+            connections = []
+
+            def read() -> None:
+                connections.append(store._connection())
+                store.list_health()
+
+            threads = [threading.Thread(target=read) for _ in range(4)]
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join()
-            connections = list(store._connections)
 
             store.close()
 
-            self.assertEqual(store._connections, set())
+            self.assertEqual(store.connection_count(), 0)
             for connection in connections:
                 with self.assertRaises(sqlite3.ProgrammingError):
                     connection.execute("SELECT 1")

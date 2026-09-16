@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,24 @@ def reserve_text(service: QuotaService, index: int):
 
 
 class QuotaServiceTests(unittest.TestCase):
+    def test_worker_connections_are_reclaimed_after_thread_exit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = AuthQuotaStore(Path(tmp_dir) / "auth_quota.db")
+            store.initialize()
+            baseline = store.connection_count()
+
+            def read() -> None:
+                store._connection().execute("SELECT 1").fetchone()
+
+            thread = threading.Thread(target=read)
+            thread.start()
+            thread.join()
+
+            self.assertEqual(store.connection_count(), baseline + 1)
+            store.reap_dead_threads()
+            self.assertEqual(store.connection_count(), baseline)
+            store.close()
+
     def test_new_user_has_zero_quota_and_admin_bypasses(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = make_service(Path(tmp_dir))
