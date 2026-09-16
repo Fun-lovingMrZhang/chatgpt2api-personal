@@ -107,6 +107,8 @@ def test_repeated_short_lived_executors_do_not_accumulate_connections(tmp_path):
         for _ in range(300):
             with ThreadPoolExecutor(max_workers=1) as executor:
                 executor.submit(registry.connection).result()
+            assert registry.connection_count() == 1
+            registry.reap_dead_threads()
             assert registry.connection_count() == 0
     finally:
         registry.close()
@@ -166,7 +168,7 @@ After store.close(), assert store.connection_count() == 0; keep the existing Pro
 
 - [ ] Step 4: Add a quota worker reclamation test.
 
-Add a test to test/test_quota_service.py that creates an AuthQuotaStore, calls _connection() from a short-lived Thread, joins it, calls store.connection_count() to trigger the dead-thread reaper, and asserts the count is zero before closing the store. The store implementation must use check_same_thread=False so the reaper can close the worker connection.
+Add a test to test/test_quota_service.py that creates an AuthQuotaStore, calls _connection() from a short-lived Thread, joins it, asserts the diagnostic count includes the worker connection, calls store.reap_dead_threads(), and then asserts the count is back to the main-thread baseline before closing the store. The store implementation must use check_same_thread=False so the reaper can close the worker connection.
 
 - [ ] Step 5: Run only the new and changed tests to prove the red state.
 
@@ -255,7 +257,6 @@ class SQLiteConnectionRegistry:
             return self._reap_dead_threads_locked()
 
     def connection_count(self) -> int:
-        self.reap_dead_threads()
         with self._lock:
             return len(self._connections)
 
@@ -343,17 +344,20 @@ def close_current_thread(self) -> None:
 
 def connection_count(self) -> int:
     return self._connection_registry.connection_count()
+
+def reap_dead_threads(self) -> int:
+    return self._connection_registry.reap_dead_threads()
 ~~~
 
 Replace close() body with self._connection_registry.close() while preserving the public method.
 
 - [ ] Step 2: Migrate SchedulerStateStore.
 
-Apply the same shape using name="scheduler-state". Preserve all scheduler PRAGMAs and the existing close_current_thread() public method. Add connection_count(). Do not alter SQL methods or transaction behavior.
+Apply the same shape using name="scheduler-state". Preserve all scheduler PRAGMAs and the existing close_current_thread() public method. Add connection_count() and reap_dead_threads(). Do not alter SQL methods or transaction behavior.
 
 - [ ] Step 3: Migrate AuthQuotaStore.
 
-Apply the same shape using name="quota". Preserve isolation_level=None, explicit transaction commands, quota cache size, wal_autocheckpoint, and foreign key setup. Add close_current_thread() and connection_count(), and delegate close() to the registry.
+Apply the same shape using name="quota". Preserve isolation_level=None, explicit transaction commands, quota cache size, wal_autocheckpoint, and foreign key setup. Add close_current_thread(), connection_count(), and reap_dead_threads(), and delegate close() to the registry.
 
 - [ ] Step 4: Run store tests.
 
