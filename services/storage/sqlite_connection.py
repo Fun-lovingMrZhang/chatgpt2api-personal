@@ -72,7 +72,7 @@ class SQLiteConnectionRegistry:
         removed = 0
         for connection, owner_ref in tuple(self._connections.items()):
             owner = owner_ref()
-            if owner is not None and owner is not current and owner.is_alive():
+            if owner is current or (owner is not None and owner.is_alive()):
                 continue
             self._connections.pop(connection, None)
             self._close(connection)
