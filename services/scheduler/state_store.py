@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from services.storage.sqlite_connection import SQLiteConnectionRegistry
+
 
 class SchedulerStateStore:
     """SQLite persistence for scheduler health snapshots and task metadata."""
@@ -49,25 +51,25 @@ class SchedulerStateStore:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._local = threading.local()
-        self._connections: set[sqlite3.Connection] = set()
+        self._connection_registry = SQLiteConnectionRegistry(
+            self._create_connection,
+            name="scheduler-state",
+        )
         self._initialize_lock = threading.RLock()
         self._initialized = False
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = getattr(self._local, "connection", None)
-        if connection is None:
-            connection = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute(f"PRAGMA cache_size={self.CACHE_SIZE_KIB}")
-            connection.execute("PRAGMA foreign_keys=ON")
-            with self._initialize_lock:
-                self._connections.add(connection)
-            self._local.connection = connection
+    def _create_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute(f"PRAGMA cache_size={self.CACHE_SIZE_KIB}")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    def _connection(self) -> sqlite3.Connection:
+        return self._connection_registry.connection()
 
     def initialize(self) -> None:
         if self._initialized:
@@ -459,27 +461,16 @@ class SchedulerStateStore:
 
     def close(self) -> None:
         with self._initialize_lock:
-            connections = list(self._connections)
-            self._connections.clear()
-            self._local.connection = None
-            for connection in connections:
-                try:
-                    connection.close()
-                except sqlite3.Error:
-                    pass
+            self._connection_registry.close()
 
     def close_current_thread(self) -> None:
-        """Release only the connection owned by the calling writer thread."""
-        connection = getattr(self._local, "connection", None)
-        if connection is None:
-            return
-        with self._initialize_lock:
-            self._connections.discard(connection)
-            self._local.connection = None
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
+        self._connection_registry.close_current_thread()
+
+    def reap_dead_threads(self) -> int:
+        return self._connection_registry.reap_dead_threads()
+
+    def connection_count(self) -> int:
+        return self._connection_registry.connection_count()
 
     def has_migration_marker(self, version: int = 1) -> bool:
         self._ensure_initialized()
