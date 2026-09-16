@@ -909,11 +909,14 @@ class QuotaService:
 
     def start_watchdog(self, stop_event: threading.Event, interval_seconds: float = 5.0) -> threading.Thread:
         def run() -> None:
-            while not stop_event.wait(interval_seconds):
-                try:
-                    self.recover_expired()
-                except Exception as exc:
-                    logger.error({"event": "quota_reservation_recovery_failed", "error": str(exc)})
+            try:
+                while not stop_event.wait(interval_seconds):
+                    try:
+                        self.recover_expired()
+                    except Exception as exc:
+                        logger.error({"event": "quota_reservation_recovery_failed", "error": str(exc)})
+            finally:
+                self.store.close_current_thread()
 
         thread = threading.Thread(target=run, name="quota-reservation-watchdog", daemon=True)
         thread.start()

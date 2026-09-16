@@ -1444,6 +1444,24 @@ class AccountService:
             return dict(account)
         return None
 
+    def _refresh_account_worker(
+        self,
+        access_token: str,
+        defer_invalid_removal: bool,
+        quiet: bool,
+    ) -> dict[str, Any] | None:
+        try:
+            return self.fetch_remote_info(
+                access_token,
+                "refresh_accounts",
+                defer_invalid_removal,
+                quiet=quiet,
+            )
+        finally:
+            close_current_thread = getattr(self.storage, "close_current_thread", None)
+            if callable(close_current_thread):
+                close_current_thread()
+
     def fetch_remote_info(
         self,
         access_token: str,
@@ -1699,11 +1717,10 @@ class AccountService:
         try:
             futures = {
                 executor.submit(
-                    self.fetch_remote_info,
+                    self._refresh_account_worker,
                     token,
-                    "refresh_accounts",
                     defer_invalid_removal,
-                    quiet=quiet,
+                    quiet,
                 ): token
                 for token in access_tokens
             }
