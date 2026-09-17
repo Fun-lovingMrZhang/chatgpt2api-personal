@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 from services.config import ConfigStore, config
 from services.protocol.chat_completion_cache import ChatCompletionCache
@@ -65,3 +66,11 @@ def test_response_cache_resident_bytes_are_bounded(monkeypatch):
         )
 
     assert cache.current_bytes <= 1024
+
+
+def test_dockerfile_limits_glibc_allocator_arenas():
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+
+    assert "MALLOC_ARENA_MAX=2" in text
+    assert "MALLOC_TRIM_THRESHOLD_=131072" in text

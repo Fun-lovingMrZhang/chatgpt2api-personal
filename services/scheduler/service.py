@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import time
 from pathlib import Path
 from threading import Event, Thread
@@ -16,6 +17,41 @@ from services.scheduler.models import AccountRequirement, Lane, Lease, Outcome, 
 from services.scheduler.reconciler import AccountReconciler
 from services.scheduler.state_store import SchedulerStateStore, SnapshotWriter, TaskStateWriter
 from utils.helper import is_codex_image_model, split_image_model
+
+
+_MALLOC_TRIM: Callable[[int], object] | None = None
+_MALLOC_TRIM_LOADED = False
+
+
+def _close_current_thread_resource(resource: object) -> None:
+    close_current_thread = getattr(resource, "close_current_thread", None)
+    if callable(close_current_thread):
+        close_current_thread()
+
+
+def _get_malloc_trim() -> Callable[[int], object] | None:
+    global _MALLOC_TRIM, _MALLOC_TRIM_LOADED
+    if _MALLOC_TRIM_LOADED:
+        return _MALLOC_TRIM
+    _MALLOC_TRIM_LOADED = True
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if callable(malloc_trim):
+            _MALLOC_TRIM = malloc_trim
+    except Exception:
+        _MALLOC_TRIM = None
+    return _MALLOC_TRIM
+
+
+def _malloc_trim() -> None:
+    malloc_trim = _get_malloc_trim()
+    if malloc_trim is None:
+        return
+    try:
+        malloc_trim(0)
+    except Exception:
+        return
 
 
 class SchedulerService:
@@ -64,6 +100,7 @@ class SchedulerService:
                 clock=clock,
                 lease_replacer=self._replace_execution_lease,
                 global_limiter=self._global_limiter,
+                worker_cleanup=self._cleanup_worker_thread,
             )
             for lane in Lane
         }
@@ -78,6 +115,27 @@ class SchedulerService:
 
     def lane(self, lane: Lane) -> LaneScheduler:
         return self._lanes[lane]
+
+    def _cleanup_worker_thread(self, _job: object) -> None:
+        resources = [
+            self.state_store,
+            getattr(self.account_service, "storage", None),
+        ]
+        try:
+            from services.quota_service import quota_service
+        except Exception:
+            quota_service = None
+        resources.append(quota_service)
+
+        seen: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            _close_current_thread_resource(resource)
+        job_lane = getattr(getattr(_job, "requirement", None), "lane", None)
+        if job_lane in (Lane.IMAGE_GENERATION, Lane.IMAGE_EDIT):
+            _malloc_trim()
 
     async def start(self) -> None:
         async with self._lifecycle_lock:

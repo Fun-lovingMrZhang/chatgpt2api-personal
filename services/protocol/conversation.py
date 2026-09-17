@@ -271,10 +271,17 @@ def format_image_result(
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
+        revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
+        url = str(item.get("url") or "").strip()
+        if response_format != "b64_json" and url:
+            data.append({
+                "url": url,
+                "revised_prompt": revised_prompt,
+            })
+            continue
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
-        revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             data.append({
                 "b64_json": b64_json,
@@ -289,6 +296,19 @@ def format_image_result(
     if message and not data:
         result["message"] = message
     return result
+
+
+def image_result_items_from_urls(
+    backend: OpenAIBackendAPI,
+    image_urls: list[str],
+    response_format: str,
+) -> list[dict[str, str]]:
+    if response_format != "b64_json":
+        return [{"url": url} for url in image_urls if str(url or "").strip()]
+    return [
+        {"b64_json": base64.b64encode(image_data).decode("ascii")}
+        for image_data in backend.download_image_bytes(image_urls)
+    ]
 
 
 @dataclass
@@ -1043,10 +1063,7 @@ def stream_image_outputs(
     if image_urls:
         if request.progress_callback:
             request.progress_callback("receiving_image")
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
+        image_items = image_result_items_from_urls(backend, image_urls, request.response_format)
         data = format_image_result(
             image_items,
             request.prompt,
@@ -1140,10 +1157,7 @@ def stream_image_outputs(
                 if image_urls:
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
-                    image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                        for image_data in backend.download_image_bytes(image_urls)
-                    ]
+                    image_items = image_result_items_from_urls(backend, image_urls, request.response_format)
                     data = format_image_result(
                         image_items,
                         request.prompt,
@@ -1252,10 +1266,7 @@ def stream_image_outputs(
             if image_urls:
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
-                image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
+                image_items = image_result_items_from_urls(backend, image_urls, request.response_format)
                 data = format_image_result(
                     image_items,
                     request.prompt,

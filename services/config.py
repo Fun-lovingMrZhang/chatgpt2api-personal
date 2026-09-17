@@ -54,7 +54,7 @@ DEFAULT_SCHEDULER = {
     "enabled": True,
     "system_concurrency": 192,
     "text": {
-        "worker_count": 128,
+        "worker_count": 48,
         "global_concurrency": 128,
         "per_account_concurrency": 4,
         "queue_max_items": 256,
@@ -63,7 +63,7 @@ DEFAULT_SCHEDULER = {
         "request_timeout_ms": 120000,
     },
     "image_generation": {
-        "worker_count": 32,
+        "worker_count": 24,
         "global_concurrency": 32,
         "per_account_concurrency": 2,
         "queue_max_items": 64,
@@ -72,7 +72,7 @@ DEFAULT_SCHEDULER = {
         "request_timeout_ms": 600000,
     },
     "image_edit": {
-        "worker_count": 32,
+        "worker_count": 24,
         "global_concurrency": 32,
         "per_account_concurrency": 2,
         "queue_max_items": 32,
@@ -674,7 +674,7 @@ class ConfigStore:
 
     @property
     def image_input_max_bytes(self) -> int:
-        return _normalize_positive_int(self.data.get("image_input_max_bytes"), 128 * 1024 * 1024, 1024 * 1024)
+        return _normalize_positive_int(self.data.get("image_input_max_bytes"), 32 * 1024 * 1024, 1024 * 1024)
 
     @property
     def file_task_max_workers(self) -> int:

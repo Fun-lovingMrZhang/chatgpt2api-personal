@@ -211,6 +211,26 @@ class LaneSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(caught.exception.retry_after_seconds or 0, 1)
         await lane.stop()
 
+    async def test_worker_cleanup_runs_after_success_and_failure(self) -> None:
+        settings = make_settings(queue_max_items=2)
+        pool = make_pool(settings)
+        cleaned: list[Lane] = []
+        lane = LaneScheduler(
+            Lane.TEXT,
+            settings,
+            pool,
+            worker_cleanup=lambda job: cleaned.append(job.requirement.lane),
+        )
+        requirement = AccountRequirement(Lane.TEXT, "auto")
+
+        self.assertEqual(await lane.submit(lambda: "ok", requirement), "ok")
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            await lane.submit(lambda: (_ for _ in ()).throw(RuntimeError("boom")), requirement)
+
+        await lane.wait_until_idle()
+        self.assertEqual(cleaned, [Lane.TEXT, Lane.TEXT])
+        await lane.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

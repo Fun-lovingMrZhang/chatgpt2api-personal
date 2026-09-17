@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import inspect
+import logging
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,9 @@ from services.scheduler.context import (
     reset_execution_context,
 )
 from services.scheduler.models import AccountRequirement, Lane, Lease, Outcome
+
+
+logger = logging.getLogger(__name__)
 
 
 class _StreamDone:
@@ -116,6 +120,7 @@ class LaneScheduler:
         aging_seconds: float = 1.0,
         lease_replacer: Callable[[ExecutionContext, set[str], Outcome], Lease | None] | None = None,
         global_limiter: GlobalConcurrencyLimiter | None = None,
+        worker_cleanup: Callable[[_QueuedJob], None] | None = None,
     ):
         self.lane = lane
         self.settings = settings.lanes[lane] if hasattr(settings, "lanes") else settings
@@ -125,6 +130,7 @@ class LaneScheduler:
         self._aging_seconds = max(0.01, float(aging_seconds))
         self._lease_replacer = lease_replacer
         self._global_limiter = global_limiter
+        self._worker_cleanup = worker_cleanup
         self._loop: asyncio.AbstractEventLoop | None = None
         self._condition: asyncio.Condition | None = None
         self._executor: ThreadPoolExecutor | None = None
@@ -621,6 +627,15 @@ class LaneScheduler:
             return None
         finally:
             reset_execution_context(context_token)
+            self._run_worker_cleanup(job)
+
+    def _run_worker_cleanup(self, job: _QueuedJob) -> None:
+        if self._worker_cleanup is None:
+            return
+        try:
+            self._worker_cleanup(job)
+        except Exception:
+            logger.warning("scheduler_worker_cleanup_failed", exc_info=True)
 
     @staticmethod
     def _invoke_work(

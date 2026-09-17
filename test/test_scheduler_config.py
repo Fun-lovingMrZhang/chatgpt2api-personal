@@ -25,15 +25,21 @@ class SchedulerConfigTests(unittest.TestCase):
 
         self.assertTrue(settings.enabled)
         self.assertEqual(settings.system_concurrency, 192)
-        self.assertEqual(settings.lanes[Lane.TEXT].worker_count, 128)
+        self.assertEqual(settings.lanes[Lane.TEXT].worker_count, 48)
         self.assertEqual(settings.lanes[Lane.TEXT].global_concurrency, 128)
-        self.assertEqual(settings.lanes[Lane.IMAGE_GENERATION].worker_count, 32)
+        self.assertEqual(settings.lanes[Lane.IMAGE_GENERATION].worker_count, 24)
         self.assertEqual(settings.lanes[Lane.IMAGE_GENERATION].global_concurrency, 32)
-        self.assertEqual(settings.lanes[Lane.IMAGE_EDIT].worker_count, 32)
+        self.assertEqual(settings.lanes[Lane.IMAGE_EDIT].worker_count, 24)
         self.assertEqual(settings.lanes[Lane.IMAGE_EDIT].global_concurrency, 32)
         self.assertGreater(settings.lanes[Lane.TEXT].request_timeout_ms, 0)
         self.assertGreater(settings.lanes[Lane.IMAGE_GENERATION].queue_max_cost, 0)
         self.assertGreater(settings.image_total_per_account_concurrency, 0)
+
+    def test_image_input_default_budget_is_bounded_for_small_hosts(self) -> None:
+        store = self.make_store({})
+
+        self.assertEqual(store.image_input_max_bytes, 32 * 1024 * 1024)
+        self.assertEqual(store.get()["image_input_max_bytes"], 32 * 1024 * 1024)
 
     def test_invalid_scheduler_values_use_safe_bounds(self) -> None:
         settings = self.make_store({
