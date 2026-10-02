@@ -5,6 +5,7 @@ from typing import Any, Iterable, Iterator
 
 from PIL import Image
 
+from services.image_comments import normalize_image_comments
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -72,6 +73,15 @@ def build_request(body: dict[str, Any]) -> ConversationRequest:
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")
     progress_callback = body.get("progress_callback")
+    try:
+        comments = normalize_image_comments(body.get("comments"))
+    except ValueError as exc:
+        raise ImageGenerationError(
+            str(exc),
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_image_comments",
+        ) from exc
     encoded_images = encode_images(images)
     input_image_tokens = count_image_inputs_tokens(images, model)
     body["_input_image_tokens"] = input_image_tokens
@@ -89,6 +99,7 @@ def build_request(body: dict[str, Any]) -> ConversationRequest:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        comments=comments,
     )
 
 

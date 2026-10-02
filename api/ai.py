@@ -304,8 +304,10 @@ def create_router() -> APIRouter:
             budget = ImageInputBudget(config.image_input_max_bytes)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
-        call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
-        await filter_or_log(call, prompt)
+        comments = payload.get("comments") or []
+        filter_text = prompt + "\n" + "\n".join(str(c.get("text") or "") for c in comments if isinstance(c, dict))
+        call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=filter_text)
+        await filter_or_log(call, filter_text)
         payload["images"] = await read_image_sources(image_sources, budget=budget)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources, budget=budget)

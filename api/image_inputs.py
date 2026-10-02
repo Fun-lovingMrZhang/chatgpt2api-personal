@@ -15,6 +15,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from services.image_comments import image_comments_to_dicts, normalize_image_comments
 from services.proxy_service import proxy_settings
 from services.config import config
 
@@ -115,10 +116,22 @@ def _parse_count(value: object) -> int:
     return count
 
 
+def _parse_comments_field(value: object) -> list[dict[str, Any]]:
+    """解析评论字段：支持 JSON 字符串（表单）或数组（JSON 请求体）。"""
+    if value is None or value == "" or value == []:
+        return []
+    try:
+        comments = normalize_image_comments(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": f"invalid comments: {exc}"}) from exc
+    return image_comments_to_dicts(comments)
+
+
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """构造图片编辑载荷：从表单或 JSON 字段提取通用参数。"""
     prompt = _clean(fields.get("prompt"))
-    if not prompt:
+    comments = _parse_comments_field(fields.get("comments"))
+    if not prompt and not comments:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
     payload = {
         "prompt": prompt,
@@ -129,6 +142,8 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream")),
     }
+    if comments:
+        payload["comments"] = comments
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
     return payload
@@ -252,7 +267,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "comments"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value

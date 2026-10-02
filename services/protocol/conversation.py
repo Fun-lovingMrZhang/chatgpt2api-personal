@@ -13,6 +13,7 @@ import tiktoken
 
 from services.account_service import account_service
 from services.config import config
+from services.image_comments import ImageComment
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from services.scheduler.context import current_execution_context
 from services.scheduler.models import Outcome
@@ -324,6 +325,7 @@ class ConversationRequest:
     response_format: str = "b64_json"
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str, str], None] | None
+    comments: list[ImageComment] | None = None  # 图片锚点评论（编辑场景）
 
 
 def _report_image_progress(
@@ -731,12 +733,17 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    comments: list[ImageComment] | None = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    # 纯评论编辑（无全局 prompt）时保持与网页端一致：文本部分只含评论块，不追加尺寸提示
+    if image_model and comments and not prompt.strip():
+        final_prompt = ""
+    else:
+        final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -744,6 +751,7 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
+        comments=comments if image_model else None,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -907,6 +915,7 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            comments=request.comments,
     ):
         last = event
         event_conversation_id = str(event.get("conversation_id") or "")

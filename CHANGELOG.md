@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [新增] `/v1/images/edits` 与 `/api/image-tasks/edits` 支持锚点评论（`comments`）编辑，复刻 chatgpt.com 网页版「图片评论」能力：评论坐标编码进上游请求文本块，模型只改动指定位置；`comments` 存在时 `prompt` 可省略。
+
 ## 1.8.0 - 2026-07-28
 
 + [新增] 新增默认请求上游模型名称和默认思考强度配置，支持在设置页面修改，并可通过模型名的 `-standard`、`-extended`、`-max` 后缀覆盖思考强度。

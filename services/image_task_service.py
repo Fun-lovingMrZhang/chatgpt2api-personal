@@ -414,6 +414,7 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        comments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         payload = self._build_edit_payload(
             prompt=prompt,
@@ -423,6 +424,7 @@ class ImageTaskService:
             base_url=base_url,
             images=images,
             masks=masks,
+            comments=comments,
         )
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -438,6 +440,7 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        comments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         payload = self._build_edit_payload(
             prompt=prompt,
@@ -447,6 +450,7 @@ class ImageTaskService:
             base_url=base_url,
             images=images,
             masks=masks,
+            comments=comments,
         )
         del images, masks
         return await self._submit_async(identity, client_task_id=client_task_id, mode="edit", payload=payload)
@@ -461,6 +465,7 @@ class ImageTaskService:
         base_url: str,
         images: list[tuple[bytes, str, str]] | None,
         masks: list[tuple[bytes, str, str]] | None,
+        comments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         spooled_images: list[dict[str, str]] = []
         spooled_masks: list[dict[str, str]] = []
@@ -470,7 +475,7 @@ class ImageTaskService:
         except BaseException:
             self._cleanup_spool_descriptors(spooled_images + spooled_masks)
             raise
-        return {
+        payload: dict[str, Any] = {
             "prompt": prompt,
             "images": spooled_images,
             "mask": spooled_masks,
@@ -481,6 +486,9 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
+        if comments:
+            payload["comments"] = comments
+        return payload
 
     def _spool_inputs(self, inputs: list[tuple[bytes, str, str]]) -> list[dict[str, str]]:
         if not inputs:

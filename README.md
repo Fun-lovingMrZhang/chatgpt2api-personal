@@ -266,6 +266,27 @@ curl http://localhost:8000/v1/images/edits \
   }'
 ```
 
+支持网页版「图片评论」式锚点编辑：传入 `comments` 数组（`x`/`y` 为图内归一化坐标，支持 `0.275`、`"27.5%"` 或 `0-100` 数值三种写法），坐标会被编码进上游请求，模型只改动指定位置：
+
+```bash
+curl http://localhost:8000/v1/images/edits \
+  -H "Authorization: Bearer <auth-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "保持其余部分不变",
+    "images": [
+      {"image_url": "https://example.com/input.png"}
+    ],
+    "comments": [
+      {"x": "27.5%", "y": "70%", "text": "把青瓷茶壶换成金边白瓷茶壶"},
+      {"x": 0.36, "y": 0.315, "text": "发髻上再插一支金色步摇"}
+    ]
+  }'
+```
+
+`comments` 存在时 `prompt` 可省略；评论会随图片一起进入上游，编辑结果仍通过 `data` 返回。
+
 <details>
 <summary>字段说明</summary>
 <br>
@@ -273,11 +294,12 @@ curl http://localhost:8000/v1/images/edits \
 | 字段          | 说明                                            |
 |:------------|:----------------------------------------------|
 | `model`     | 图片模型， `gpt-image-2`                           |
-| `prompt`    | 图片编辑提示词                                       |
+| `prompt`    | 图片编辑提示词，传入 `comments` 时可省略                    |
 | `n`         | 生成数量，当前后端限制为 `1-4`                            |
 | `image`     | 需要编辑的图片文件，使用 multipart/form-data 上传           |
 | `images`    | JSON 图片引用数组，支持 `{"image_url": "https://..."}` |
 | `image_url` | 表单模式下也可直接传图片链接，支持重复字段传多张图                     |
+| `comments`  | 锚点评论数组，元素为 `{x, y, text, image_index}`，复刻网页版「图片评论」编辑；`x`/`y` 支持 `[0,1]` 数值、百分比字符串或 `0-100` 数值，`image_index` 默认 `0` |
 
 <br>
 </details>

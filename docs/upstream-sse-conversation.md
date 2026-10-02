@@ -129,6 +129,33 @@ Conversation SSE 是上游对话链路的流式返回协议。每条 SSE `data:`
 
 这类 `sediment://...` 表示输入附件，不是生成结果。即使它可以被下载，也不能当作输出图片返回。
 
+### 锚点评论（图片评论）编辑的输入编码
+
+chatgpt.com 网页版 2026-10 上线的「轻触图片以添加评论」编辑（对生成图或上传图打点标注改动），请求编码抓包确认如下：
+
+- 消息仍是 `content_type: "multimodal_text"`，图片指针之后跟随评论文本块；
+- 评论文本块格式：`图像 N：\n序号.（x：X%，y：Y%）评论内容`，`N` 为图片序号（从 1 开始），
+  `X`/`Y` 为图内归一化百分比（保留 1 位小数、去掉尾零，如 `27.5%`、`70%`），
+  冒号/括号/逗号使用全角字符（U+FF1A / U+FF08 / U+FF09 / U+FF0C），多条评论以 `\n` 连接；
+- 消息 `metadata.dalle.from_client.operation` 为 `{"type": "transformation", "original_file_id": "file_...",
+  "original_gen_id": "..."}`（网页端编辑同会话内已生成的图片时才携带，新图 `metadata.dalle.parent_gen_id`
+  会指回 `original_gen_id`）。实测：代理链路是全新会话 + 刚上传的图片，没有 `original_gen_id`，
+  此时携带该 metadata 会让上游图片工具直接报错（"We experienced an error when generating images"），
+  因此代理请求必须省略它；省略后评论编辑正常出图。
+- `system_hints` 仍为 `["picture_v2"]`，顶层与消息 metadata 均有。
+
+单图单评论示例（网页端原文）：
+
+```text
+parts: [
+  {"asset_pointer": "sediment://file_00000000b55482068e6b0c2ebaafdc62",
+   "content_type": "image_asset_pointer", "height": 1672, "size_bytes": 2117233, "width": 941},
+  "图像 1：\n1.（x：27.5%，y：70%）把这只青瓷茶壶换成带金色描边的白瓷茶壶"
+]
+```
+
+本项目通过 `services/image_comments.py` 复刻该编码，并把多图评论合并为一个文本块放在所有图片指针之后。
+
 ## 图片工具成功场景
 
 图片生成或图片编辑成功时，上游一般会出现工具消息：

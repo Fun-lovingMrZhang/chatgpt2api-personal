@@ -22,6 +22,7 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
+from services.image_comments import build_image_message_parts
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -134,6 +135,86 @@ def _is_content_policy_error(error_msg: str) -> bool:
         return False
     msg_lower = error_msg.lower()
     return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
+
+
+def build_image_generation_payload(
+    prompt: str,
+    references: list[Dict[str, Any]],
+    upstream_model: str,
+    thinking_effort: str = "",
+    comments: Optional[list[Any]] = None,
+) -> Dict[str, Any]:
+    """构造 /backend-api/f/conversation 图片生成/编辑请求体。
+
+    带评论时复刻网页端「添加评论」编辑编码：文本部分包含评论坐标块。
+    注意不要携带 metadata.dalle.from_client.operation：上游在缺少
+    original_gen_id（代理上传图没有该 id）时会直接报图片生成错误（实测确认）。
+    """
+    parts: list[Any] = []
+    if comments and references:
+        parts = build_image_message_parts(prompt, references, comments)
+    else:
+        parts = [{
+            "content_type": "image_asset_pointer",
+            "asset_pointer": f"file-service://{item['file_id']}",
+            "width": item["width"],
+            "height": item["height"],
+            "size_bytes": item["file_size"],
+        } for item in references]
+        parts.append(prompt)
+    content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
+                                                                                      "parts": [prompt]}
+    metadata: Dict[str, Any] = {
+        "developer_mode_connector_ids": [],
+        "selected_github_repos": [],
+        "selected_all_github_repos": False,
+        "system_hints": ["picture_v2"],
+        "serialization_metadata": {"custom_symbol_offsets": []},
+    }
+    if references:
+        metadata["attachments"] = [{
+            "id": item["file_id"],
+            "mimeType": item["mime_type"],
+            "name": item["file_name"],
+            "size": item["file_size"],
+            "width": item["width"],
+            "height": item["height"],
+        } for item in references]
+    payload: Dict[str, Any] = {
+        "action": "next",
+        "messages": [{
+            "id": new_uuid(),
+            "author": {"role": "user"},
+            "create_time": time.time(),
+            "content": content,
+            "metadata": metadata,
+        }],
+        "parent_message_id": new_uuid(),
+        "model": upstream_model,
+        "client_prepare_state": "sent",
+        "timezone_offset_min": -480,
+        "timezone": "Asia/Shanghai",
+        "conversation_mode": {"kind": "primary_assistant"},
+        "enable_message_followups": True,
+        "system_hints": ["picture_v2"],
+        "supports_buffering": True,
+        "supported_encodings": ["v1"],
+        "client_contextual_info": {
+            "is_dark_mode": False,
+            "time_since_loaded": 1200,
+            "page_height": 1072,
+            "page_width": 1724,
+            "pixel_ratio": 1.2,
+            "screen_height": 1440,
+            "screen_width": 2560,
+            "app_name": "chatgpt.com",
+        },
+        "paragen_cot_summary_display_override": "allow",
+        "force_parallel_switch": "auto",
+    }
+    if thinking_effort:
+        payload["thinking_effort"] = thinking_effort
+    return payload
 
 
 @dataclass
@@ -1140,70 +1221,12 @@ class OpenAIBackendAPI:
         }
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+                                references: Optional[list[Dict[str, Any]]] = None,
+                                comments: Optional[list[Any]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
-        parts = [{
-            "content_type": "image_asset_pointer",
-            "asset_pointer": f"file-service://{item['file_id']}",
-            "width": item["width"],
-            "height": item["height"],
-            "size_bytes": item["file_size"],
-        } for item in references]
-        parts.append(prompt)
-        content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
-                                                                                          "parts": [prompt]}
-        metadata = {
-            "developer_mode_connector_ids": [],
-            "selected_github_repos": [],
-            "selected_all_github_repos": False,
-            "system_hints": ["picture_v2"],
-            "serialization_metadata": {"custom_symbol_offsets": []},
-        }
-        if references:
-            metadata["attachments"] = [{
-                "id": item["file_id"],
-                "mimeType": item["mime_type"],
-                "name": item["file_name"],
-                "size": item["file_size"],
-                "width": item["width"],
-                "height": item["height"],
-            } for item in references]
-        payload = {
-            "action": "next",
-            "messages": [{
-                "id": new_uuid(),
-                "author": {"role": "user"},
-                "create_time": time.time(),
-                "content": content,
-                "metadata": metadata,
-            }],
-            "parent_message_id": new_uuid(),
-            "model": upstream_model,
-            "client_prepare_state": "sent",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
-            "conversation_mode": {"kind": "primary_assistant"},
-            "enable_message_followups": True,
-            "system_hints": ["picture_v2"],
-            "supports_buffering": True,
-            "supported_encodings": ["v1"],
-            "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 1200,
-                "page_height": 1072,
-                "page_width": 1724,
-                "pixel_ratio": 1.2,
-                "screen_height": 1440,
-                "screen_width": 2560,
-                "app_name": "chatgpt.com",
-            },
-            "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "auto",
-        }
-        if thinking_effort:
-            payload["thinking_effort"] = thinking_effort
+        payload = build_image_generation_payload(prompt, references, upstream_model, thinking_effort, comments)
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -2756,10 +2779,11 @@ class OpenAIBackendAPI:
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
+            comments: Optional[list[Any]] = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(prompt, model, images or [], comments)
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2793,6 +2817,7 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            comments: Optional[list[Any]] = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
@@ -2805,7 +2830,7 @@ class OpenAIBackendAPI:
         self._report_progress("preparing_conversation")
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, comments)
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
 
