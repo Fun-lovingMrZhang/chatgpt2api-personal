@@ -94,7 +94,7 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        payload, image_sources, mask_sources, markup_sources = await parse_image_edit_request(request)
         budget = payload.pop("_image_input_budget", None)
         if not isinstance(budget, ImageInputBudget):
             budget = ImageInputBudget(config.image_input_max_bytes)
@@ -108,6 +108,7 @@ def create_router() -> APIRouter:
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=filter_text), filter_text)
         images = await read_image_sources(image_sources, budget=budget)
         masks = await read_image_sources(mask_sources, budget=budget) if mask_sources else None
+        markup_overlays = await read_image_sources(markup_sources, budget=budget) if markup_sources else None
         try:
             return await image_task_service.submit_edit_async(
                 identity,
@@ -120,6 +121,8 @@ def create_router() -> APIRouter:
                 images=images,
                 masks=masks,
                 comments=comments,
+                markup_overlays=markup_overlays,
+                markup_strokes=payload.get("markup_strokes") or [],
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -144,6 +147,8 @@ def create_router() -> APIRouter:
             del images
             if masks is not None:
                 del masks
+            if markup_overlays is not None:
+                del markup_overlays
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(

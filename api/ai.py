@@ -298,7 +298,7 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        payload, image_sources, mask_sources, markup_sources = await parse_image_edit_request(request)
         budget = payload.pop("_image_input_budget", None)
         if not isinstance(budget, ImageInputBudget):
             budget = ImageInputBudget(config.image_input_max_bytes)
@@ -311,6 +311,8 @@ def create_router() -> APIRouter:
         payload["images"] = await read_image_sources(image_sources, budget=budget)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources, budget=budget)
+        if markup_sources:
+            payload["markup"] = await read_image_sources(markup_sources, budget=budget)
         payload["base_url"] = resolve_image_base_url(request)
         return await run_with_quota(
             call,

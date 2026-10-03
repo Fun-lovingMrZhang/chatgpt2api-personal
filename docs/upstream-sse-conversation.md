@@ -156,6 +156,36 @@ parts: [
 
 本项目通过 `services/image_comments.py` 复刻该编码，并把多图评论合并为一个文本块放在所有图片指针之后。
 
+### 标注（画笔 markup）编辑的输入编码
+
+chatgpt.com 网页版「标注」画笔编辑（2026-10 抓包确认）与评论编辑走的是完全不同的编码：笔迹信息全部在像素里，没有坐标文本块。网页端流程分两步：
+
+1. `POST /backend-api/image-gen/markup-preview`（multipart/form-data）：
+   - `original_file_id`：被标注图片的 file id；
+   - `markup`：与原图同尺寸的透明 RGBA PNG，仅含笔迹像素（文件名 `image-markup-overlay.png`）；
+   - `is_temporary_chat` / `is_project_thread`：`false`。
+   响应返回服务端合成后的图片指针：
+   `{"image_asset_pointer": {"asset_pointer": "sediment://file_...", "size_bytes": ..., "width": ..., "height": ...}}`。
+2. `POST /backend-api/f/conversation` 请求体：
+   - `parts = [image_asset_pointer(合成图), 提示词文本]`；
+   - `metadata.image_gen_flow_tags = ["markup"]`（评论编辑没有该标签）；
+   - `metadata.attachments` 为合成图信息，`name` 形如 `image-markup-preview-<file_id>.png`；
+   - `metadata.dalle.from_client.operation` 为
+     `{"type": "transformation", "original_file_id": "file_...", "original_gen_id": "...",
+     "input_image_asset_pointer": "sediment://file_...", "is_markup": true}`
+     （同样仅在编辑会话内已生成图片时携带；代理的全新会话 + 上传图链路必须省略，
+     理由与评论编辑一致——没有 `original_gen_id` 时携带会导致上游图片工具报错）；
+   - `system_hints` 为空数组（无 `picture_v2`），但代理实测携带 `picture_v2` 不影响出图，
+     因此沿用普通编辑链路的 hints。
+
+响应侧与评论编辑完全同构：`image_gen` 工具消息返回新图指针，
+`metadata.dalle.parent_gen_id` 指回请求中的 `original_gen_id`，`edit_op` 为 `"transformation"`，
+`server_ste_metadata.turn_use_case` 为 `"image gen"`。
+
+本项目通过 `services/image_markup.py` 接入：接受矢量笔迹（`markup_strokes`，本地 PIL 渲染）或
+透明笔迹 PNG（`markup`，语义同网页端 overlay），本地把笔迹合成进原图后按普通编辑图上传，
+并在消息 metadata 携带 `image_gen_flow_tags=["markup"]` 对齐网页端标记。
+
 ## 图片工具成功场景
 
 图片生成或图片编辑成功时，上游一般会出现工具消息：

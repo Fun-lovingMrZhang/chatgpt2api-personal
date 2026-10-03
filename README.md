@@ -287,6 +287,35 @@ curl http://localhost:8000/v1/images/edits \
 
 `comments` 存在时 `prompt` 可省略；评论会随图片一起进入上游，编辑结果仍通过 `data` 返回。
 
+同样支持网页版「标注」画笔编辑：传入 `markup_strokes` 数组（归一化坐标的折线笔迹）或直接上传透明笔迹图 `markup`，代理会把笔迹合成进输入图像素后走编辑链路：
+
+```bash
+# JSON 方式：笔迹矢量（points 为 [0,1] 归一化坐标，支持 "30%" 与 0-100 数值写法）
+curl http://localhost:8000/v1/images/edits \
+  -H "Authorization: Bearer <auth-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "把圆圈内的霓虹招牌换成绿色",
+    "images": [
+      {"image_url": "https://example.com/input.png"}
+    ],
+    "markup_strokes": [
+      {"points": [[0.62, 0.18], [0.78, 0.22], [0.75, 0.42], [0.6, 0.38], [0.62, 0.18]], "color": "#FF3B30", "width": 0.01}
+    ]
+  }'
+
+# 表单方式：直接上传一张与原图同比例的透明笔迹 PNG（同网页端 overlay）
+curl http://localhost:8000/v1/images/edits \
+  -H "Authorization: Bearer <auth-key>" \
+  -F "model=gpt-image-2" \
+  -F "prompt=把圆圈内的招牌换成绿色" \
+  -F "image=@input.png" \
+  -F "markup=@overlay.png"
+```
+
+`markup_strokes` 存在时 `prompt` 可省略；`color` 默认红色 `#FF3B30`（同网页端默认画笔），`width` 为相对图片短边的线宽比例（默认 `0.008`）。
+
 <details>
 <summary>字段说明</summary>
 <br>
@@ -294,12 +323,14 @@ curl http://localhost:8000/v1/images/edits \
 | 字段          | 说明                                            |
 |:------------|:----------------------------------------------|
 | `model`     | 图片模型， `gpt-image-2`                           |
-| `prompt`    | 图片编辑提示词，传入 `comments` 时可省略                    |
+| `prompt`    | 图片编辑提示词，传入 `comments` 或 `markup_strokes` 时可省略                    |
 | `n`         | 生成数量，当前后端限制为 `1-4`                            |
 | `image`     | 需要编辑的图片文件，使用 multipart/form-data 上传           |
 | `images`    | JSON 图片引用数组，支持 `{"image_url": "https://..."}` |
 | `image_url` | 表单模式下也可直接传图片链接，支持重复字段传多张图                     |
 | `comments`  | 锚点评论数组，元素为 `{x, y, text, image_index}`，复刻网页版「图片评论」编辑；`x`/`y` 支持 `[0,1]` 数值、百分比字符串或 `0-100` 数值，`image_index` 默认 `0` |
+| `markup_strokes` | 标注笔迹数组，元素为 `{points, color?, width?}`，复刻网页版「标注」画笔编辑；`points` 为 `[x, y]` 归一化坐标列表（写法同评论坐标），`color` 默认 `#FF3B30`，`width` 为相对短边的线宽比例（默认 `0.008`） |
+| `markup`    | multipart 模式下直接上传透明笔迹 PNG（RGBA，与原图同比例），代理自动缩放对齐原图并合成 |
 
 <br>
 </details>

@@ -143,10 +143,13 @@ def build_image_generation_payload(
     upstream_model: str,
     thinking_effort: str = "",
     comments: Optional[list[Any]] = None,
+    markup: bool = False,
 ) -> Dict[str, Any]:
     """构造 /backend-api/f/conversation 图片生成/编辑请求体。
 
     带评论时复刻网页端「添加评论」编辑编码：文本部分包含评论坐标块。
+    带标注（markup）时复刻网页端「标注」画笔编辑：输入图已是本地合成
+    笔迹后的位图，metadata 携带 image_gen_flow_tags=["markup"]。
     注意不要携带 metadata.dalle.from_client.operation：上游在缺少
     original_gen_id（代理上传图没有该 id）时会直接报图片生成错误（实测确认）。
     """
@@ -180,6 +183,9 @@ def build_image_generation_payload(
             "width": item["width"],
             "height": item["height"],
         } for item in references]
+    if markup:
+        # 网页端「标注」编辑的流程标记（2026-10 抓包确认）
+        metadata["image_gen_flow_tags"] = ["markup"]
     payload: Dict[str, Any] = {
         "action": "next",
         "messages": [{
@@ -1222,11 +1228,12 @@ class OpenAIBackendAPI:
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None,
-                                comments: Optional[list[Any]] = None) -> requests.Response:
+                                comments: Optional[list[Any]] = None,
+                                markup: bool = False) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
-        payload = build_image_generation_payload(prompt, references, upstream_model, thinking_effort, comments)
+        payload = build_image_generation_payload(prompt, references, upstream_model, thinking_effort, comments, markup)
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -2780,10 +2787,11 @@ class OpenAIBackendAPI:
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
             comments: Optional[list[Any]] = None,
+            markup: bool = False,
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [], comments)
+            yield from self._stream_picture_conversation(prompt, model, images or [], comments, markup)
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2818,11 +2826,16 @@ class OpenAIBackendAPI:
             model: str,
             images: list[str],
             comments: Optional[list[Any]] = None,
+            markup: bool = False,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self._report_progress("uploading")
-        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        default_file_name = "image-markup-preview.png" if markup else "image_{idx}.png"
+        references = [
+            self._upload_image(image, default_file_name.format(idx=position))
+            for position, image in enumerate(images, start=1)
+        ]
         self._report_progress("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
@@ -2830,7 +2843,7 @@ class OpenAIBackendAPI:
         self._report_progress("preparing_conversation")
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, comments)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, comments, markup)
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
 

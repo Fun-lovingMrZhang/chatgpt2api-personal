@@ -3,6 +3,7 @@
 ## Unreleased
 
 + [新增] `/v1/images/edits` 与 `/api/image-tasks/edits` 支持锚点评论（`comments`）编辑，复刻 chatgpt.com 网页版「图片评论」能力：评论坐标编码进上游请求文本块，模型只改动指定位置；`comments` 存在时 `prompt` 可省略。
++ [新增] `/v1/images/edits` 与 `/api/image-tasks/edits` 支持标注画笔（`markup_strokes` / `markup`）编辑，复刻 chatgpt.com 网页版「标注」能力：笔迹本地合成进输入图像素（上游模型看到的输入与网页端服务端合成本一致），metadata 携带 `image_gen_flow_tags=["markup"]`；支持矢量笔迹（归一化坐标 + 颜色 + 相对线宽）或直接上传透明笔迹 PNG，`markup_strokes` 存在时 `prompt` 可省略。
 
 ## 1.8.0 - 2026-07-28
 

@@ -415,6 +415,8 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
         comments: list[dict[str, Any]] | None = None,
+        markup_overlays: list[tuple[bytes, str, str]] | None = None,
+        markup_strokes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         payload = self._build_edit_payload(
             prompt=prompt,
@@ -425,6 +427,8 @@ class ImageTaskService:
             images=images,
             masks=masks,
             comments=comments,
+            markup_overlays=markup_overlays,
+            markup_strokes=markup_strokes,
         )
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -441,6 +445,8 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
         comments: list[dict[str, Any]] | None = None,
+        markup_overlays: list[tuple[bytes, str, str]] | None = None,
+        markup_strokes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         payload = self._build_edit_payload(
             prompt=prompt,
@@ -451,8 +457,10 @@ class ImageTaskService:
             images=images,
             masks=masks,
             comments=comments,
+            markup_overlays=markup_overlays,
+            markup_strokes=markup_strokes,
         )
-        del images, masks
+        del images, masks, markup_overlays
         return await self._submit_async(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
     def _build_edit_payload(
@@ -466,19 +474,24 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None,
         masks: list[tuple[bytes, str, str]] | None,
         comments: list[dict[str, Any]] | None = None,
+        markup_overlays: list[tuple[bytes, str, str]] | None = None,
+        markup_strokes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         spooled_images: list[dict[str, str]] = []
         spooled_masks: list[dict[str, str]] = []
+        spooled_markups: list[dict[str, str]] = []
         try:
             spooled_images = self._spool_inputs(images or [])
             spooled_masks = self._spool_inputs(masks or [])
+            spooled_markups = self._spool_inputs(markup_overlays or [])
         except BaseException:
-            self._cleanup_spool_descriptors(spooled_images + spooled_masks)
+            self._cleanup_spool_descriptors(spooled_images + spooled_masks + spooled_markups)
             raise
         payload: dict[str, Any] = {
             "prompt": prompt,
             "images": spooled_images,
             "mask": spooled_masks,
+            "markup": spooled_markups,
             "model": model,
             "n": 1,
             "size": size,
@@ -488,6 +501,8 @@ class ImageTaskService:
         }
         if comments:
             payload["comments"] = comments
+        if markup_strokes:
+            payload["markup_strokes"] = markup_strokes
         return payload
 
     def _spool_inputs(self, inputs: list[tuple[bytes, str, str]]) -> list[dict[str, str]]:
@@ -555,6 +570,7 @@ class ImageTaskService:
     def _cleanup_payload_spool(self, payload: dict[str, Any]) -> None:
         self._cleanup_spool_descriptors(payload.get("images"))
         self._cleanup_spool_descriptors(payload.get("mask"))
+        self._cleanup_spool_descriptors(payload.get("markup"))
 
     def _cleanup_spool_dir(self) -> None:
         try:
@@ -588,11 +604,16 @@ class ImageTaskService:
         return materialized
 
     def _materialize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if not self._spool_paths(payload.get("images")) and not self._spool_paths(payload.get("mask")):
+        if (
+            not self._spool_paths(payload.get("images"))
+            and not self._spool_paths(payload.get("mask"))
+            and not self._spool_paths(payload.get("markup"))
+        ):
             return payload
         materialized = dict(payload)
         materialized["images"] = self._materialize_spooled_inputs(payload.get("images"))
         materialized["mask"] = self._materialize_spooled_inputs(payload.get("mask"))
+        materialized["markup"] = self._materialize_spooled_inputs(payload.get("markup"))
         return materialized
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
@@ -1155,9 +1176,11 @@ class ImageTaskService:
             if payload_with_progress is not None:
                 payload_with_progress["images"] = []
                 payload_with_progress["mask"] = []
+                payload_with_progress["markup"] = []
             if runtime_payload is not payload:
                 runtime_payload["images"] = []
                 runtime_payload["mask"] = []
+                runtime_payload["markup"] = []
 
     def _log_call(
         self,

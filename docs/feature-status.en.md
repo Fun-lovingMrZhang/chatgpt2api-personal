@@ -39,6 +39,7 @@
 | 文本补全缓存与重复请求合并 | ✅  | `/v1/chat/completions` 文本链路默认启用 60 秒短缓存、流式结果回放、in-flight 请求合并和相邻重复消息清理；可通过 `chat_completion_cache` 配置关闭或调整。 |
 | 图片尺寸参数 | ❌  | 待实现。 |
 | 图片锚点评论编辑（网页版「图片评论」） | ✅  | `/v1/images/edits` 与 `/api/image-tasks/edits` 支持 `comments` 数组，坐标编码复刻网页端 2026-10 抓包格式，模型只改动标注位置。 |
+| 图片标注画笔编辑（网页版「标注」） | ✅  | `/v1/images/edits` 与 `/api/image-tasks/edits` 支持 `markup_strokes` 矢量笔迹或 `markup` 透明笔迹图，本地合成进输入图像素并携带 `image_gen_flow_tags=["markup"]`，复刻网页端 2026-10 抓包格式。 |
 | 服务端图片 URL 缓存 | ✅  | 已实现。 |
 | `rt_token` 刷新 | ❌  | 待实现。 |
 | 代理配置功能 | ✅  | 已支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理，并应用到出站请求。 |

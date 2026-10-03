@@ -6,6 +6,7 @@ from typing import Any, Iterable, Iterator
 from PIL import Image
 
 from services.image_comments import normalize_image_comments
+from services.image_markup import composite_markup_images, normalize_markup_strokes
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -82,11 +83,26 @@ def build_request(body: dict[str, Any]) -> ConversationRequest:
             error_type="invalid_request_error",
             code="invalid_image_comments",
         ) from exc
+    try:
+        markup_strokes = normalize_markup_strokes(body.get("markup_strokes"))
+    except ValueError as exc:
+        raise ImageGenerationError(
+            str(exc),
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_image_markup",
+        ) from exc
+    markup_overlays = body.get("markup") or []
+    markup = bool(markup_overlays or markup_strokes)
+    if markup:
+        # 网页端「标注」编辑：把笔迹合成进输入图像素后再走普通编辑链路
+        images = composite_markup_images(images, markup_overlays, markup_strokes)
     encoded_images = encode_images(images)
     input_image_tokens = count_image_inputs_tokens(images, model)
     body["_input_image_tokens"] = input_image_tokens
     body["images"] = []
     body["mask"] = []
+    body["markup"] = []
     if not encoded_images:
         raise ImageGenerationError("image is required")
     return ConversationRequest(
@@ -100,6 +116,7 @@ def build_request(body: dict[str, Any]) -> ConversationRequest:
         message_as_error=True,
         progress_callback=progress_callback,
         comments=comments,
+        markup=markup,
     )
 
 

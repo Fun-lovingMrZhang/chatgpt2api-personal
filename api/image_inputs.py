@@ -16,6 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from services.image_comments import image_comments_to_dicts, normalize_image_comments
+from services.image_markup import markup_strokes_to_dicts, normalize_markup_strokes
 from services.proxy_service import proxy_settings
 from services.config import config
 
@@ -25,6 +26,7 @@ ImageSource = str | UploadFile | ImageInput
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
+MARKUP_REFERENCE_FIELDS = {"markup", "markup[]"}
 
 
 @dataclass
@@ -127,11 +129,23 @@ def _parse_comments_field(value: object) -> list[dict[str, Any]]:
     return image_comments_to_dicts(comments)
 
 
-def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
+def _parse_markup_strokes_field(value: object) -> list[dict[str, Any]]:
+    """解析标注笔迹字段：支持 JSON 字符串（表单）或数组（JSON 请求体）。"""
+    if value is None or value == "" or value == []:
+        return []
+    try:
+        strokes = normalize_markup_strokes(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": f"invalid markup_strokes: {exc}"}) from exc
+    return markup_strokes_to_dicts(strokes)
+
+
+def _payload_from_fields(fields: dict[str, Any], *, has_markup_overlay: bool = False) -> dict[str, Any]:
     """构造图片编辑载荷：从表单或 JSON 字段提取通用参数。"""
     prompt = _clean(fields.get("prompt"))
     comments = _parse_comments_field(fields.get("comments"))
-    if not prompt and not comments:
+    markup_strokes = _parse_markup_strokes_field(fields.get("markup_strokes"))
+    if not prompt and not comments and not markup_strokes and not has_markup_overlay:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
     payload = {
         "prompt": prompt,
@@ -144,6 +158,8 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     }
     if comments:
         payload["comments"] = comments
+    if markup_strokes:
+        payload["markup_strokes"] = markup_strokes
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
     return payload
@@ -247,10 +263,20 @@ def _json_mask_sources(body: dict[str, Any], budget: ImageInputBudget | None = N
     return []
 
 
-async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource]]:
+def _json_markup_sources(body: dict[str, Any], budget: ImageInputBudget | None = None) -> list[ImageSource]:
+    """读取 JSON markup overlay 引用（透明笔迹图，语义同 mask）。"""
+    markup = body.get("markup")
+    if markup is not None:
+        return _sources_from_value(markup, budget)
+    return []
+
+
+async def parse_image_edit_request(
+    request: Request,
+) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource], list[ImageSource]]:
     """解析图片编辑请求：同时支持 multipart 上传和官方 JSON 图片 URL。
-    
-    返回 (payload, image_sources, mask_sources)
+
+    返回 (payload, image_sources, mask_sources, markup_sources)
     """
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type == "application/json":
@@ -261,27 +287,31 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail={"error": "JSON body must be an object"})
         budget = _new_budget()
-        payload = _payload_from_fields(body)
+        markup_sources = _json_markup_sources(body, budget)
+        payload = _payload_from_fields(body, has_markup_overlay=bool(markup_sources))
         payload["_image_input_budget"] = budget
-        return payload, _json_image_sources(body, budget), _json_mask_sources(body, budget)
+        return payload, _json_image_sources(body, budget), _json_mask_sources(body, budget), markup_sources
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "comments"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "comments", "markup_strokes"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value
     sources: list[ImageSource] = []
     mask_sources: list[ImageSource] = []
+    markup_sources: list[ImageSource] = []
     budget = _new_budget()
     for key, value in form.multi_items():
         if key in IMAGE_REFERENCE_FIELDS:
             sources.extend(_sources_from_value(value, budget))
         elif key in MASK_REFERENCE_FIELDS:
             mask_sources.extend(_sources_from_value(value, budget))
-    payload = _payload_from_fields(fields)
+        elif key in MARKUP_REFERENCE_FIELDS:
+            markup_sources.extend(_sources_from_value(value, budget))
+    payload = _payload_from_fields(fields, has_markup_overlay=bool(markup_sources))
     payload["_image_input_budget"] = budget
-    return payload, sources, mask_sources
+    return payload, sources, mask_sources, markup_sources
 
 
 def _extension_from_mime(mime_type: str) -> str:
