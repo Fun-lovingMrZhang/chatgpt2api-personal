@@ -36,3 +36,6 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+
+# 本地下游交接文档（不入库，手动分发给下游）
+docs/image-edit-integration-guide.md
