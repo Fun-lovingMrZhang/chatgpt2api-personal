@@ -14,9 +14,15 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_comments import ImageComment
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    IMAGE_RATE_LIMIT_PAYLOAD_RE,
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    ImageRateLimitedError,
+    OpenAIBackendAPI,
+)
 from services.scheduler.context import current_execution_context
-from services.scheduler.models import Outcome
+from services.scheduler.models import Lane, Outcome
 from utils.helper import (
     IMAGE_MODELS,
     anonymize_token,
@@ -40,6 +46,7 @@ class ImageGenerationError(Exception):
         param: str | None = None,
         account_email: str = "",
         conversation_id: str = "",
+        retry_after_secs: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -48,6 +55,7 @@ class ImageGenerationError(Exception):
         self.param = param
         self.account_email = account_email
         self.conversation_id = conversation_id
+        self.retry_after_secs = retry_after_secs
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -60,6 +68,8 @@ class ImageGenerationError(Exception):
         }
         if self.account_email:
             error_dict["error"]["account_email"] = self.account_email
+        if self.retry_after_secs is not None:
+            error_dict["error"]["retry_after"] = int(self.retry_after_secs)
         return error_dict
 
 
@@ -364,6 +374,7 @@ class ConversationState:
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    rate_limited: bool = False
 
 
 @dataclass
@@ -635,6 +646,10 @@ def _is_user_message_event(event: dict[str, Any]) -> bool:
 
 
 def update_conversation_state(state: ConversationState, payload: str, event: dict[str, Any] | None = None) -> None:
+    # 滑动窗口限流标记：image_gen 工具返回 "You're generating images too quickly..."
+    # 可能以 patch/delta 形式分片到达，直接在原始 payload 上匹配最可靠。
+    if not state.rate_limited and IMAGE_RATE_LIMIT_PAYLOAD_RE.search(payload or ""):
+        state.rate_limited = True
     conversation_id, file_ids, sediment_ids = extract_conversation_ids(payload)
     if conversation_id and not state.conversation_id:
         state.conversation_id = conversation_id
@@ -683,6 +698,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "blocked": state.blocked,
         "tool_invoked": state.tool_invoked,
         "turn_use_case": state.turn_use_case,
+        "rate_limited": state.rate_limited,
         **extra,
     }
 
@@ -962,6 +978,21 @@ def stream_image_outputs(
         "turn_use_case": last.get("turn_use_case"),
     })
     _report_image_progress(request, "image_stream_resolve_start", conversation_id)
+    # 滑动窗口限流快速失败：tool 消息已返回 "generating images too quickly"，
+    # 上游不会再产出图片，继续走 tasks/poll 只会白等 image_poll_timeout_secs。
+    # 抛出专用异常交由 _generate_single_image 做账号冷却 + 换号重试。
+    if not file_ids and not sediment_ids and last.get("rate_limited"):
+        logger.warning({
+            "event": "image_stream_rate_limited",
+            "conversation_id": conversation_id,
+            "message": message[:200],
+        })
+        raise ImageRateLimitedError(
+            "You're generating images too quickly. To ensure the best experience "
+            "for everyone, we have rate limits in place.",
+            conversation_id=conversation_id,
+            retry_after_secs=float(config.image_rate_limit_cooldown_secs),
+        )
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -1063,6 +1094,8 @@ def stream_image_outputs(
     except Exception as exc:
         # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
         # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
+        if isinstance(exc, ImageRateLimitedError):
+            raise
         if is_text_reply and conversation_id:
             logger.warning({
                 "event": "image_text_reply_first_poll_error_ignored",
@@ -1133,6 +1166,8 @@ def stream_image_outputs(
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                     break  # 轮询成功，退出重试循环
                 except Exception as exc:
+                    if isinstance(exc, ImageRateLimitedError):
+                        raise
                     error_str = str(exc)
                     is_transient = (
                         isinstance(exc, ImagePollTimeoutError)
@@ -1242,6 +1277,8 @@ def stream_image_outputs(
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                 break  # 轮询成功，退出重试循环
             except Exception as exc:
+                if isinstance(exc, ImageRateLimitedError):
+                    raise
                 error_str = str(exc)
                 is_transient = (
                     isinstance(exc, ImagePollTimeoutError)
@@ -1373,12 +1410,56 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 滑动窗口限流最大换号重试次数：命中限流的账号已进入冷却，
+    # 换号必定选到不同账号；重试上限取配置值，超出后返回 429。
+    MAX_RATE_LIMIT_RETRIES = max(0, int(config.image_rate_limit_failover_retries))
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    rate_limit_retry_count = 0
     account_email = ""
+    last_rate_limit_retry_after = float(config.image_rate_limit_cooldown_secs)
+
+    def _cooldown_account_for_rate_limit(failed_token: str) -> None:
+        """命中滑动窗口限流后，把该账号的图片通道冷却 image_rate_limit_cooldown_secs。"""
+        nonlocal last_rate_limit_retry_after
+        cooldown_secs = float(config.image_rate_limit_cooldown_secs)
+        last_rate_limit_retry_after = cooldown_secs
+        context = current_execution_context()
+        if context is not None and context.lease is not None:
+            try:
+                from services.scheduler.service import scheduler_service as _scheduler_service
+
+                lanes = {Lane.IMAGE_GENERATION, Lane.IMAGE_EDIT, context.lease.lane}
+                for lane in lanes:
+                    _scheduler_service.account_pool.open_breaker(
+                        context.lease.account_key, lane, cooldown_secs,
+                    )
+                logger.warning({
+                    "event": "image_rate_limit_cooldown",
+                    "account_ref": anonymize_token(failed_token),
+                    "account_email": account_email,
+                    "account_key": context.lease.account_key,
+                    "cooldown_secs": cooldown_secs,
+                    "lanes": sorted(str(lane.value) for lane in lanes),
+                })
+                return
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_rate_limit_cooldown_breaker_failed",
+                    "account_ref": anonymize_token(failed_token),
+                    "error": repr(exc)[:200],
+                })
+        account_service.mark_image_rate_limited(failed_token, cooldown_secs)
+        logger.warning({
+            "event": "image_rate_limit_cooldown",
+            "account_ref": anonymize_token(failed_token),
+            "account_email": account_email,
+            "cooldown_secs": cooldown_secs,
+            "lane": "legacy_account_pool",
+        })
 
     def select_token(excluded_tokens: set[str] | None = None) -> str:
         context = current_execution_context()
@@ -1427,7 +1508,18 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             token = select_token()
         except RuntimeError as exc:
-            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+            # 选不到可用账号：号池为空或全部处于冷却（如滑动窗口限流），返回 429
+            message_text = str(exc) or "image generation failed"
+            if "no available" in message_text.lower():
+                raise ImageGenerationError(
+                    message_text,
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    code="no_available_image_account",
+                    account_email=account_email,
+                    retry_after_secs=max(1, int(config.image_rate_limit_cooldown_secs)),
+                ) from exc
+            raise ImageGenerationError(message_text, account_email=account_email) from exc
 
         emitted_for_token = False
         returned_message = False
@@ -1475,7 +1567,7 @@ def _generate_single_image(
                 if last_conversation_id:
                     _report_image_progress(request, "image_conversation_id", last_conversation_id)
                     if not getattr(exc, "conversation_id", ""):
-                        if isinstance(exc, ImageGenerationError):
+                        if isinstance(exc, (ImageGenerationError, ImageRateLimitedError)):
                             exc.conversation_id = last_conversation_id
                         else:
                             raise ImageGenerationError(
@@ -1560,6 +1652,68 @@ def _generate_single_image(
                 code="content_policy_violation",
                 account_email=account_email,
                 conversation_id=getattr(exc, "conversation_id", ""),
+            ) from exc
+        except ImageRateLimitedError as exc:
+            # 滑动窗口限流：该账号短窗口内额度耗尽，冷却后换号重试。
+            # 上游限流按账号计（不同账号独立额度），换号通常能立即成功；
+            # 检测在 SSE 流内完成（秒级），换号成本远低于等满轮询超时。
+            mark_result(token, False)
+            _cooldown_account_for_rate_limit(token)
+            if account_email:
+                setattr(exc, "account_email", account_email)
+            remote_conversation_id = str(getattr(exc, "conversation_id", "") or "")
+            if rate_limit_retry_count < MAX_RATE_LIMIT_RETRIES:
+                rate_limit_retry_count += 1
+                logger.warning({
+                    "event": "image_rate_limited_failover",
+                    "account_ref": anonymize_token(token),
+                    "account_email": account_email,
+                    "retry_count": rate_limit_retry_count,
+                    "max_retries": MAX_RATE_LIMIT_RETRIES,
+                    "index": index,
+                    "conversation_id": remote_conversation_id,
+                })
+                cooldown_secs = max(1, int(last_rate_limit_retry_after))
+                try:
+                    replace_or_abort(token, Outcome.RATE_LIMIT)
+                except ImageGenerationError as replace_exc:
+                    # 调度器已无可替换账号（其余账号同样在冷却/不可用），
+                    # 与重试次数用尽等价：对下游返回 429 + Retry-After。
+                    if getattr(replace_exc, "code", "") != "no_replacement_account":
+                        raise
+                    raise ImageGenerationError(
+                        "Image generation is temporarily rate limited: all image accounts "
+                        "are cooling down (upstream: generating images too quickly). "
+                        f"Please retry in about {cooldown_secs // 60} minutes.",
+                        status_code=429,
+                        error_type="rate_limit_error",
+                        code="image_rate_limited",
+                        param=None,
+                        account_email=account_email,
+                        conversation_id=remote_conversation_id,
+                        retry_after_secs=cooldown_secs,
+                    ) from replace_exc
+                continue
+            logger.warning({
+                "event": "image_rate_limited_exhausted_retries",
+                "account_ref": anonymize_token(token),
+                "account_email": account_email,
+                "retry_count": rate_limit_retry_count,
+                "index": index,
+            })
+            cooldown_secs = max(1, int(last_rate_limit_retry_after))
+            raise ImageGenerationError(
+                "Image generation is temporarily rate limited "
+                "(upstream: generating images too quickly). "
+                f"Cooling down affected accounts for about {cooldown_secs // 60} minutes; "
+                "please retry later.",
+                status_code=429,
+                error_type="rate_limit_error",
+                code="image_rate_limited",
+                param=None,
+                account_email=account_email,
+                conversation_id=remote_conversation_id,
+                retry_after_secs=cooldown_secs,
             ) from exc
         except ImageGenerationError as exc:
             mark_result(token, False)
@@ -1707,6 +1861,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     emitted = False
     last_error = ""
+    first_error_exc: Exception | None = None
     for index in range(1, max(1, request.n) + 1):
         if index in results:
             for output in results[index]:
@@ -1714,8 +1869,14 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 yield output
         elif index in errors:
             last_error = str(errors[index])
+            if first_error_exc is None:
+                first_error_exc = errors[index]
 
     if not emitted:
+        # 保留已构造好的 ImageGenerationError（如限流 429、轮询超时 504）的
+        # 状态码与错误码语义，仅对未知异常做统一包装。
+        if isinstance(first_error_exc, ImageGenerationError):
+            raise first_error_exc
         raise ImageGenerationError(
             image_stream_error_message(last_error or "no account in the pool could generate images"),
             conversation_id="",

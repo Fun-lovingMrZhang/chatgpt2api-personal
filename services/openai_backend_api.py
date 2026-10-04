@@ -51,6 +51,23 @@ class ImageContentPolicyError(ImageTaskError):
     pass
 
 
+class ImageRateLimitedError(ImageTaskError):
+    """账号触发上游图片生成滑动窗口限流（"You're generating images too quickly"）。
+
+    与内容政策错误不同，这是临时性限制：调用方应给账号做短冷却并换号重试，
+    而不是继续在该账号上轮询等图。
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        conversation_id: str = "",
+        retry_after_secs: float | None = None,
+    ) -> None:
+        super().__init__(message, conversation_id)
+        self.retry_after_secs = retry_after_secs
+
+
 class ImageStreamHardTimeoutError(RuntimeError):
     """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
@@ -128,6 +145,17 @@ _CONTENT_POLICY_KEYWORDS = (
     "抱歉，我不能",
 )
 
+# 图片生成滑动窗口限流标记（image_gen 工具返回的原文："You're generating images
+# too quickly. ... Please wait for an hour before generating more images."）。
+# 命中后应快速失败并对账号做短冷却，而不是傻等 image_poll_timeout_secs。
+_IMAGE_RATE_LIMIT_MARKERS = (
+    "generating images too quickly",
+    "wait for an hour before generating more images",
+    "rate limits in place",
+)
+# SSE 原始 payload 是 JSON 字符串，英文标记不会被转义，可直接匹配
+IMAGE_RATE_LIMIT_PAYLOAD_RE = re.compile(r"generating images too quickly", re.IGNORECASE)
+
 
 def _is_content_policy_error(error_msg: str) -> bool:
     """检查错误消息是否为内容政策违规。"""
@@ -135,6 +163,14 @@ def _is_content_policy_error(error_msg: str) -> bool:
         return False
     msg_lower = error_msg.lower()
     return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
+
+
+def _is_image_rate_limit_error(error_msg: str) -> bool:
+    """检查错误消息是否为图片生成频率限流（滑动窗口）。"""
+    if not error_msg:
+        return False
+    msg_lower = error_msg.lower()
+    return any(marker in msg_lower for marker in _IMAGE_RATE_LIMIT_MARKERS)
 
 
 def build_image_generation_payload(
@@ -2345,6 +2381,39 @@ class OpenAIBackendAPI:
                 return msg_text[:500]
         return ""
 
+    @staticmethod
+    def _find_image_rate_limit_error_in_conversation(data: Dict[str, Any]) -> str:
+        """从对话文档中查找图片生成滑动窗口限流消息。
+
+        命中限时后 image_gen 工具会以 tool 消息返回
+        "You're generating images too quickly..."，随后 assistant 仅输出
+        「由于我这边发生了错误，我未能生成图片。」这类通用文案。
+        """
+        mapping = data.get("mapping") or {}
+        for node in mapping.values():
+            message = (node or {}).get("message") or {}
+            author = message.get("author") or {}
+            role = str(author.get("role") or "").strip().lower()
+            if role not in {"assistant", "tool"}:
+                continue
+            content = message.get("content") or {}
+            text_parts: list[str] = []
+            if isinstance(content, dict):
+                msg_parts = content.get("parts") or []
+                if isinstance(msg_parts, list):
+                    for part in msg_parts:
+                        if isinstance(part, str) and part.strip():
+                            text_parts.append(part.strip())
+                text_field = str(content.get("text") or "")
+                if text_field.strip():
+                    text_parts.append(text_field.strip())
+            elif isinstance(content, str) and content.strip():
+                text_parts.append(content.strip())
+            msg_text = "\n".join(text_parts)
+            if msg_text and _is_image_rate_limit_error(msg_text):
+                return msg_text[:500]
+        return ""
+
     def _poll_image_results(
             self,
             conversation_id: str,
@@ -2484,6 +2553,22 @@ class OpenAIBackendAPI:
                         "error_msg": policy_msg[:200],
                     })
                     raise ImageContentPolicyError(policy_msg, conversation_id or "")
+
+                # 滑动窗口限流检测：tool 消息已明确返回 "generating images too quickly"，
+                # 继续轮询只会白等 image_poll_timeout_secs，应立即快速失败交由上层换号。
+                rate_limit_msg = self._find_image_rate_limit_error_in_conversation(conversation)
+                if rate_limit_msg:
+                    logger.warning({
+                        "event": "image_poll_conversation_rate_limited",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error_msg": rate_limit_msg[:200],
+                    })
+                    raise ImageRateLimitedError(
+                        rate_limit_msg,
+                        conversation_id or "",
+                        retry_after_secs=float(config.image_rate_limit_cooldown_secs),
+                    )
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})

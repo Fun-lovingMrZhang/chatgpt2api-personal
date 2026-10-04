@@ -241,9 +241,17 @@ function AccountsPageContent() {
     void loadAccounts();
     void loadModels();
 
+    // 静默轮询账号列表：限流冷却倒计时、在途数等内存态需要周期刷新
+    const pollTimer = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void loadAccounts(true);
+      }
+    }, 30_000);
+
     // 清理进度条定时器
     return () => {
       if (progressRef.current) clearInterval(progressRef.current);
+      clearInterval(pollTimer);
     };
   }, []);
 
@@ -1108,13 +1116,30 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge
-                            variant={status.badge}
-                            className="inline-flex items-center gap-1 rounded-md px-2 py-1"
-                          >
-                            <StatusIcon className="size-3.5" />
-                            {account.status}
-                          </Badge>
+                          {(() => {
+                            const rateLimitSecs = account.image_rate_limit_remaining_secs ?? 0;
+                            if (rateLimitSecs > 0) {
+                              return (
+                                <Badge
+                                  variant="warning"
+                                  className="inline-flex items-center gap-1 rounded-md px-2 py-1"
+                                  title="生图触发上游滑动窗口限流（generating images too quickly），冷却期间不参与生图派单，到点自动恢复"
+                                >
+                                  <CircleAlert className="size-3.5" />
+                                  限流冷却 {Math.max(1, Math.ceil(rateLimitSecs / 60))} 分钟
+                                </Badge>
+                              );
+                            }
+                            return (
+                              <Badge
+                                variant={status.badge}
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1"
+                              >
+                                <StatusIcon className="size-3.5" />
+                                {account.status}
+                              </Badge>
+                            );
+                          })()}
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>

@@ -16,6 +16,7 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, is_safe_to_log_url, log_service
+from services.openai_backend_api import ImageRateLimitedError
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.quota_service import QuotaSettlementError, quota_service
 from services.scheduler.context import current_execution_context
@@ -1666,6 +1667,42 @@ class ImageTaskService:
                 status="success",
                 urls=_collect_image_urls(data),
             )
+        except ImageRateLimitedError as exc:
+            # 续轮询的会话归属原账号，无法换号接管；标记冷却并快速失败，
+            # 避免继续占着并发槽位等满 extra_timeout_secs。
+            try:
+                from services.account_service import account_service as _account_service
+
+                _account_service.mark_image_rate_limited(access_token)
+            except Exception:
+                pass
+            cooldown_secs = int(getattr(exc, "retry_after_secs", 0) or config.image_rate_limit_cooldown_secs)
+            error_message = (
+                "账号触发图片生成滑动窗口限流（generating images too quickly），"
+                f"已冷却约 {max(1, cooldown_secs // 60)} 分钟后自动恢复，请稍后重试。"
+            )
+            self._release_task_quota(key)
+            duration_ms = int((time.time() - started) * 1000)
+            self._release_task_concurrency(key)
+            self._update_task(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                data=[],
+                duration_ms=duration_ms,
+                conversation_id=conversation_id,
+            )
+            self._log_call(
+                identity,
+                mode,
+                model,
+                started,
+                "调用失败（续轮询）",
+                status="failed",
+                error=error_message,
+            )
+            if raise_on_error:
+                raise
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
             if not _is_resumable_timeout(exc, conversation_id):

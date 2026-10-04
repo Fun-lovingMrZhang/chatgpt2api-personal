@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import re
+import time
 import uuid
 import zipfile
 from datetime import datetime
@@ -28,6 +29,7 @@ from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.quota_service import QuotaKeyNotFoundError, QuotaLimitError, quota_service
+from services.scheduler.service import scheduler_service
 from services.sub2api_auto_sync_service import sub2api_auto_sync_service
 from services.sub2api_service import (
     Sub2APISyncBusyError,
@@ -36,6 +38,7 @@ from services.sub2api_service import (
     sub2api_config,
     sub2api_import_service,
 )
+from utils.helper import anonymize_token
 
 
 
@@ -181,6 +184,49 @@ def _account_zip_bytes(items: list[dict[str, str]]) -> bytes:
     return buf.getvalue()
 
 
+_IMAGE_BREAKER_LANES = {"image_generation", "image_edit"}
+
+
+def _attach_image_rate_limit(items: list[dict[str, Any]]) -> None:
+    """为账号列表附加图片滑动窗口限流冷却剩余秒数（内存态，不落盘）。
+
+    两个来源取最大值：legacy 路径的 account_service 内存表，以及调度器
+    breaker（scheduler 路径的 open_breaker 冷却）。breaker 的 key 已被
+    anonymize（sha256 确定性哈希），与列表 token 重新 anonymize 后即可对上。
+    """
+    if not items:
+        return
+    now = time.time()
+    legacy = account_service.image_rate_limit_snapshot()
+    breaker_remaining: dict[str, float] = {}
+    try:
+        for health in scheduler_service.account_pool.snapshot_health():
+            if str(health.get("lane") or "") not in _IMAGE_BREAKER_LANES:
+                continue
+            if str(health.get("breaker_state") or "") != "open":
+                continue
+            remaining = max(0.0, float(health.get("cooldown_until") or 0.0) - now)
+            if remaining <= 0:
+                continue
+            account_ref = str(health.get("account_key") or "")
+            if account_ref:
+                breaker_remaining[account_ref] = max(breaker_remaining.get(account_ref, 0.0), remaining)
+    except Exception:
+        breaker_remaining = {}
+    if not legacy and not breaker_remaining:
+        return
+    for item in items:
+        token = str(item.get("access_token") or "").strip()
+        if not token:
+            continue
+        remaining = max(
+            float(legacy.get(token, 0.0)),
+            float(breaker_remaining.get(anonymize_token(token), 0.0)),
+        )
+        if remaining > 0:
+            item["image_rate_limit_remaining_secs"] = int(remaining + 0.999)
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -291,7 +337,9 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        items = account_service.list_accounts()
+        _attach_image_rate_limit(items)
+        return {"items": items}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):

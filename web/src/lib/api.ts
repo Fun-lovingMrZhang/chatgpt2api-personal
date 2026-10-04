@@ -35,6 +35,8 @@ export type Account = {
   fail: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
+  /** 图片滑动窗口限流(generating images too quickly)冷却剩余秒数，>0 表示生图通道暂停派单。 */
+  image_rate_limit_remaining_secs?: number;
   last_used_at?: string | null;
   proxy?: string | null;
 };

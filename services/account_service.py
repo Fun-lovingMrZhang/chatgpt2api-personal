@@ -55,6 +55,8 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._scheduler_state_generation = 0
         self._image_inflight: dict[str, int] = {}
+        # 滑动窗口限流冷却表：token -> 冷却截止时间戳（epoch 秒，内存态，重启即清）
+        self._image_rate_limited_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._token_alias_expiry: dict[str, float] = {}
         self._token_alias_created_at: dict[str, float] = {}
@@ -522,6 +524,11 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                old_limited_until = self._image_rate_limited_until.pop(old_token, None)
+                if old_limited_until is not None:
+                    self._image_rate_limited_until[new_token] = max(
+                        old_limited_until, self._image_rate_limited_until.get(new_token, 0.0),
+                    )
             self._accounts[new_token] = account
             self._save_accounts()
             if rotated:
@@ -995,6 +1002,11 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
+        now = time.time()
+        # 清理已过期的滑动窗口限流冷却记录，避免 map 无限增长
+        expired = [token for token, until in self._image_rate_limited_until.items() if until <= now]
+        for token in expired:
+            self._image_rate_limited_until.pop(token, None)
         return [
             token
             for item in self._accounts.values()
@@ -1004,6 +1016,7 @@ class AccountService:
                and self._account_matches_source_type(item, source_type)
                and (token := item.get("access_token") or "")
                and token not in excluded
+               and self._image_rate_limited_until.get(token, 0.0) <= now
         ]
 
     def _list_available_candidate_tokens(
@@ -1053,6 +1066,46 @@ class AccountService:
             else:
                 self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
+
+    def mark_image_rate_limited(self, access_token: str, cooldown_secs: float | None = None) -> float:
+        """命中滑动窗口限流后冷却该账号的图片通道。
+
+        与日额度耗尽的 status="限流" 不同（会被 5 分钟刷新周期按 image_gen
+        remaining 重写），小时级滑动窗口冷却只记录在内存表中，到点自动恢复。
+        返回实际生效的冷却秒数。
+        """
+        if not access_token:
+            return 0.0
+        seconds = float(
+            cooldown_secs if cooldown_secs is not None else config.image_rate_limit_cooldown_secs
+        )
+        seconds = max(1.0, seconds)
+        with self._image_slot_condition:
+            resolved = self._resolve_access_token_locked(access_token)
+            self._image_rate_limited_until[resolved] = time.time() + seconds
+            self._image_slot_condition.notify_all()
+        return seconds
+
+    def image_rate_limit_remaining(self, access_token: str) -> float:
+        """返回该账号图片滑动窗口限流冷却剩余秒数（0 表示未冷却）。"""
+        if not access_token:
+            return 0.0
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            return max(0.0, self._image_rate_limited_until.get(resolved, 0.0) - time.time())
+
+    def image_rate_limit_snapshot(self) -> dict[str, float]:
+        """返回所有仍在滑动窗口限流冷却中的账号（当前 token → 剩余秒数），供前端展示。"""
+        now = time.time()
+        with self._lock:
+            snapshot: dict[str, float] = {}
+            for token, until in self._image_rate_limited_until.items():
+                if until <= now:
+                    continue
+                resolved = self._resolve_access_token_locked(token)
+                remaining = max(0.0, until - now)
+                snapshot[resolved] = max(snapshot.get(resolved, 0.0), remaining)
+            return snapshot
 
     def get_available_access_token(
             self,

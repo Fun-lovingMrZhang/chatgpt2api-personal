@@ -227,7 +227,11 @@ def _image_error_response(exc: Exception) -> JSONResponse:
             429,
         )
     if hasattr(exc, "to_openai_error") and hasattr(exc, "status_code"):
-        return JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error())
+        response = JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error())
+        retry_after = getattr(exc, "retry_after_secs", None)
+        if retry_after is not None:
+            response.headers["Retry-After"] = str(max(1, int(retry_after)))
+        return response
     return openai_error_response(message, 502)
 
 

@@ -558,6 +558,26 @@ class ConfigStore:
             return 120
 
     @property
+    def image_rate_limit_cooldown_secs(self) -> int:
+        """命中上游滑动窗口限流（generating images too quickly）后账号图片通道的冷却秒数。
+
+        实测免费号在限流后静默约 15~17 分钟可恢复，默认 1200s（20 分钟）留出余量。
+        设为 0 表示命中限流后不冷却账号（不推荐）。
+        """
+        try:
+            return max(0, int(self.data.get("image_rate_limit_cooldown_secs", 1200)))
+        except (TypeError, ValueError):
+            return 1200
+
+    @property
+    def image_rate_limit_failover_retries(self) -> int:
+        """触发滑动窗口限流后换账号重试的最大次数（每次必选不同账号），超出返回 429。"""
+        try:
+            return max(0, int(self.data.get("image_rate_limit_failover_retries", 2)))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -775,6 +795,8 @@ class ConfigStore:
         data["image_retention_days"] = self.image_retention_days
         data["log_retention_days"] = self.log_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_rate_limit_cooldown_secs"] = self.image_rate_limit_cooldown_secs
+        data["image_rate_limit_failover_retries"] = self.image_rate_limit_failover_retries
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency

@@ -4,6 +4,8 @@
   "image_retention_days": 15,
   "log_retention_days": 30,
   "image_poll_timeout_secs": 120,
+  "image_rate_limit_cooldown_secs": 1200,
+  "image_rate_limit_failover_retries": 2,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
   "log_levels": [
