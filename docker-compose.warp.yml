@@ -86,7 +86,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: wwbio/chatgpt2api:tagname
+    image: wwbio/chatgpt2api:latest
     container_name: chatgpt2api-warp
     restart: unless-stopped
     depends_on:

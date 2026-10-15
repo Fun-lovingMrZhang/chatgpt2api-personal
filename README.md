@@ -50,11 +50,11 @@ docker compose up -d
 
 ```bash
 docker login
-docker build -t wwbio/chatgpt2api:tagname .
-docker push wwbio/chatgpt2api:tagname
+docker build -t wwbio/chatgpt2api:latest .
+docker push wwbio/chatgpt2api:latest
 ```
 
-`tagname` 需与 Compose 配置中的镜像标签一致。
+镜像标签需与 Compose 配置中的标签一致。
 若要让其他用户无需登录即可拉取，请将 Docker Hub 仓库设为 Public。
 
 ### WARP / FlareSolverr 稳定代理部署
