@@ -34,8 +34,9 @@
 ### Docker 运行
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/iamdurant/chatgpt2api-personal.git chatgpt2api
 cd chatgpt2api
+docker compose pull
 docker compose up -d
 ```
 
@@ -45,13 +46,25 @@ docker compose up -d
 - API 地址：`http://localhost:3000/v1`
 - 数据目录：`./data`
 
+构建并推送 Docker Hub 镜像：
+
+```bash
+docker login
+docker build -t wwbio/chatgpt2api:tagname .
+docker push wwbio/chatgpt2api:tagname
+```
+
+`tagname` 需与 Compose 配置中的镜像标签一致。
+若要让其他用户无需登录即可拉取，请将 Docker Hub 仓库设为 Public。
+
 ### WARP / FlareSolverr 稳定代理部署
 
 如果图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
 
 ```bash
 cp .env.example .env
-docker compose -f docker-compose.warp.yml up -d --build
+docker compose -f docker-compose.warp.yml pull
+docker compose -f docker-compose.warp.yml up -d
 ```
 
 该 compose 会启动：
@@ -71,7 +84,7 @@ docker compose -f docker-compose.warp.yml up -d --build
 启动后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/iamdurant/chatgpt2api-personal.git chatgpt2api
 cd chatgpt2api
 uv sync
 uv run main.py
@@ -88,9 +101,8 @@ bun run dev
 后续更新新版本：
 
 ```bash
-docker pull ghcr.io/basketikun/chatgpt2api:latest
-docker-compose down
-docker-compose up -d
+docker compose pull
+docker compose up -d
 
 ```
 

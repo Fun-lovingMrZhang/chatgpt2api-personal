@@ -33,7 +33,7 @@ git --version
 适合不需要 WARP / FlareSolverr 清障的场景。
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/iamdurant/chatgpt2api-personal.git chatgpt2api
 cd chatgpt2api
 ```
 
@@ -99,7 +99,8 @@ CHATGPT2API_AUTH_KEY=your_secret_key_here
 启动：
 
 ```bash
-docker compose -f docker-compose.warp.yml up -d --build
+docker compose -f docker-compose.warp.yml pull
+docker compose -f docker-compose.warp.yml up -d
 ```
 
 访问：
@@ -136,7 +137,7 @@ docker compose -f docker-compose.warp.yml down
 后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/iamdurant/chatgpt2api-personal.git chatgpt2api
 cd chatgpt2api
 uv sync
 uv run main.py
@@ -282,7 +283,8 @@ tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
 
 ```bash
 git pull
-docker compose -f docker-compose.warp.yml up -d --build
+docker compose -f docker-compose.warp.yml pull
+docker compose -f docker-compose.warp.yml up -d
 ```
 
 查看状态：
