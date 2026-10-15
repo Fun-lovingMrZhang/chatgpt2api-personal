@@ -48,6 +48,7 @@ COPY main.py ./
 COPY config.json ./
 COPY VERSION ./
 COPY api ./api
+COPY assets ./assets
 COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts

@@ -88,13 +88,13 @@ DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
-SEARCH_MODEL = "gpt-5-5"
+SEARCH_MODEL = "gpt-5-6"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
-EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
+EDITABLE_FILE_MODEL = "gpt-5-6"
 EDITABLE_FILE_THINKING_EFFORT = "extended"
 EDITABLE_FILE_TIMEOUT_SECS = 1200.0
 EDITABLE_FILE_POLL_INTERVAL_SECS = 5.0
@@ -173,6 +173,9 @@ def _is_image_rate_limit_error(error_msg: str) -> bool:
     return any(marker in msg_lower for marker in _IMAGE_RATE_LIMIT_MARKERS)
 
 
+IMAGE_CREATION_MENTION = "@创建图像"
+
+
 def build_image_generation_payload(
     prompt: str,
     references: list[Dict[str, Any]],
@@ -183,12 +186,17 @@ def build_image_generation_payload(
 ) -> Dict[str, Any]:
     """构造 /backend-api/f/conversation 图片生成/编辑请求体。
 
+    结构对齐网页端真实抓包（2026-10）：`model=auto`、
+    `parent_message_id=client-created-root`、文本以「@创建图像」生态提及开头
+    并携带 picture_v2 的 custom_symbol_offsets。
+
     带评论时复刻网页端「添加评论」编辑编码：文本部分包含评论坐标块。
     带标注（markup）时复刻网页端「标注」画笔编辑：输入图已是本地合成
     笔迹后的位图，metadata 携带 image_gen_flow_tags=["markup"]。
     注意不要携带 metadata.dalle.from_client.operation：上游在缺少
     original_gen_id（代理上传图没有该 id）时会直接报图片生成错误（实测确认）。
     """
+    mention_text = f"{IMAGE_CREATION_MENTION} {prompt}"
     parts: list[Any] = []
     if comments and references:
         parts = build_image_message_parts(prompt, references, comments)
@@ -200,15 +208,23 @@ def build_image_generation_payload(
             "height": item["height"],
             "size_bytes": item["file_size"],
         } for item in references]
-        parts.append(prompt)
-    content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
-                                                                                      "parts": [prompt]}
+        parts.append(mention_text)
+    content = {"content_type": "multimodal_text", "parts": parts} if references else {
+        "content_type": "text", "parts": [mention_text]}
     metadata: Dict[str, Any] = {
         "developer_mode_connector_ids": [],
         "selected_github_repos": [],
         "selected_all_github_repos": False,
         "system_hints": ["picture_v2"],
-        "serialization_metadata": {"custom_symbol_offsets": []},
+        "serialization_metadata": {
+            "render_format": "markdown",
+            "custom_symbol_offsets": [{
+                "id": "picture_v2",
+                "symbol": "ecosystemMention",
+                "startIndex": 0,
+                "endIndex": len(IMAGE_CREATION_MENTION),
+            }],
+        },
     }
     if references:
         metadata["attachments"] = [{
@@ -223,36 +239,37 @@ def build_image_generation_payload(
         # 网页端「标注」编辑的流程标记（2026-10 抓包确认）
         metadata["image_gen_flow_tags"] = ["markup"]
     payload: Dict[str, Any] = {
+        "turn_attribution": {"turn_trigger": "composer"},
         "action": "next",
+        "is_do_not_remember": False,
         "messages": [{
             "id": new_uuid(),
-            "author": {"role": "user"},
+            "author": {"metadata": {}, "name": None, "role": "user"},
+            "channel": None,
             "create_time": time.time(),
+            "end_turn": None,
             "content": content,
             "metadata": metadata,
+            "recipient": "all",
+            "status": "finished_successfully",
+            "update_time": None,
+            "weight": 1,
         }],
-        "parent_message_id": new_uuid(),
+        "parent_message_id": "client-created-root",
         "model": upstream_model,
-        "client_prepare_state": "sent",
+        "system_hints": ["picture_v2"],
         "timezone_offset_min": -480,
         "timezone": "Asia/Shanghai",
-        "conversation_mode": {"kind": "primary_assistant"},
-        "enable_message_followups": True,
-        "system_hints": ["picture_v2"],
-        "supports_buffering": True,
-        "supported_encodings": ["v1"],
         "client_contextual_info": {
-            "is_dark_mode": False,
-            "time_since_loaded": 1200,
-            "page_height": 1072,
-            "page_width": 1724,
-            "pixel_ratio": 1.2,
-            "screen_height": 1440,
-            "screen_width": 2560,
             "app_name": "chatgpt.com",
+            "app_surface": "codex_browser",
+            "has_web_push_capabilities": True,
+            "web_push_notification_permission": "default",
         },
-        "paragen_cot_summary_display_override": "allow",
-        "force_parallel_switch": "auto",
+        "local_function_names": ["local.continue_in_work"],
+        "supported_encodings": ["v1"],
+        "genui_state_snapshots": [],
+        "client_prepare_state": "success",
     }
     if thinking_effort:
         payload["thinking_effort"] = thinking_effort
@@ -323,14 +340,14 @@ class OpenAIBackendAPI:
             "Pragma": "no-cache",
             "Priority": "u=1, i",
             "Sec-Ch-Ua": self.fp["sec-ch-ua"],
-            "Sec-Ch-Ua-Arch": '"x86"',
-            "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
+            "Sec-Ch-Ua-Arch": self.fp["sec-ch-ua-arch"],
+            "Sec-Ch-Ua-Bitness": self.fp["sec-ch-ua-bitness"],
+            "Sec-Ch-Ua-Full-Version": self.fp["sec-ch-ua-full-version"],
+            "Sec-Ch-Ua-Full-Version-List": self.fp["sec-ch-ua-full-version-list"],
             "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
             "Sec-Ch-Ua-Model": '""',
             "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
-            "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
+            "Sec-Ch-Ua-Platform-Version": self.fp["sec-ch-ua-platform-version"],
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -397,23 +414,36 @@ class OpenAIBackendAPI:
                 "oai-device-id",
                 "oai-session-id",
                 "sec-ch-ua",
+                "sec-ch-ua-arch",
+                "sec-ch-ua-bitness",
+                "sec-ch-ua-full-version",
+                "sec-ch-ua-full-version-list",
                 "sec-ch-ua-mobile",
                 "sec-ch-ua-platform",
+                "sec-ch-ua-platform-version",
         ):
             value = str(account.get(key) or "").strip()
             if value:
                 fp[key] = value
         fp.setdefault(
             "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         )
-        fp.setdefault("impersonate", "chrome110")
+        fp.setdefault("impersonate", "chrome146")
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
-        fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
+        fp.setdefault("sec-ch-ua", '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"')
+        fp.setdefault("sec-ch-ua-arch", '"x86"')
+        fp.setdefault("sec-ch-ua-bitness", '"64"')
+        fp.setdefault("sec-ch-ua-full-version", '"148.0.7778.167"')
+        fp.setdefault(
+            "sec-ch-ua-full-version-list",
+            '"Chromium";v="148.0.7778.167", "Google Chrome";v="148.0.7778.167", "Not/A)Brand";v="99.0.0.0"',
+        )
         fp.setdefault("sec-ch-ua-mobile", "?0")
-        fp.setdefault("sec-ch-ua-platform", '"Windows"')
+        fp.setdefault("sec-ch-ua-platform", '"Linux"')
+        fp.setdefault("sec-ch-ua-platform-version", '""')
         return fp
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -490,23 +520,37 @@ class OpenAIBackendAPI:
         return default_account
 
     def get_user_info(self) -> Dict[str, Any]:
-        """获取当前 token 的账号信息。"""
+        """获取当前 token 的账号信息。
+
+        上游对 backend-api 的 403 存在间歇性误判（同一 token 同一请求
+        几分钟内可自行恢复，实测确认），这里对 403 做短退避重试。
+        """
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
-        try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        me_payload: Dict[str, Any] = {}
+        init_payload: Dict[str, Any] = {}
+        default_account: Dict[str, Any] = {}
+        for attempt in range(3):
+            executor = ThreadPoolExecutor(max_workers=3)
+            try:
+                me_future = executor.submit(self._get_me)
+                init_future = executor.submit(self._get_conversation_init)
+                account_future = executor.submit(self._get_default_account)
+                me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            except (KeyboardInterrupt, SystemExit):
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            except UpstreamHTTPError as exc:
+                executor.shutdown(wait=False, cancel_futures=True)
+                if "HTTP 403" not in str(exc) or attempt >= 2:
+                    raise
+                time.sleep(2.0 * (attempt + 1))
+            except BaseException:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True, cancel_futures=True)
+                break
 
         plan_type = str(default_account.get("plan_type") or "free")
 
@@ -580,7 +624,8 @@ class OpenAIBackendAPI:
             raw_finalize=data,
         )
 
-    def _conversation_headers(self, path: str, requirements: ChatRequirements) -> Dict[str, str]:
+    def _conversation_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "",
+                              trace_id: str = "") -> Dict[str, str]:
         """根据当前 requirements 构造对话 SSE 请求头。"""
         headers = {
             "Accept": "text/event-stream",
@@ -593,6 +638,10 @@ class OpenAIBackendAPI:
             headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
         if requirements.so_token:
             headers["OpenAI-Sentinel-SO-Token"] = requirements.so_token
+        if conduit_token:
+            headers["X-Conduit-Token"] = conduit_token
+        if trace_id:
+            headers["X-Oai-Turn-Trace-Id"] = trace_id
         return self._headers(path, headers)
 
     def _api_messages_to_conversation_messages(self, messages: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -687,10 +736,12 @@ class OpenAIBackendAPI:
     ) -> Dict[str, Any]:
         """把标准 messages 构造成 web 对话请求体。"""
         payload = {
+            "turn_attribution": {"turn_trigger": "composer"},
             "action": "next",
+            "is_do_not_remember": False,
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": model,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": "client-created-root",
             "conversation_mode": {"kind": "primary_assistant"},
             "conversation_origin": None,
             "force_paragen": False,
@@ -700,13 +751,20 @@ class OpenAIBackendAPI:
             "history_and_training_disabled": True,
             "reset_rate_limits": False,
             "suggestions": [],
-            "supported_encodings": [],
+            "supported_encodings": ["v1"],
             "system_hints": [],
             "timezone": timezone,
             "timezone_offset_min": -480,
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
+            "local_function_names": ["local.continue_in_work"],
+            "genui_state_snapshots": [],
+            "client_prepare_state": "success",
             "client_contextual_info": {
+                "app_name": "chatgpt.com",
+                "app_surface": "codex_browser",
+                "has_web_push_capabilities": True,
+                "web_push_notification_permission": "default",
                 "is_dark_mode": False,
                 "time_since_loaded": 120,
                 "page_height": 900,
@@ -737,8 +795,8 @@ class OpenAIBackendAPI:
             return model_name, suffix.lower()
         return upstream_model, self._normalize_thinking_effort(config.default_thinking_effort)
 
-    def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
-            Dict[str, str]:
+    def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*",
+                       trace_id: str = "") -> Dict[str, str]:
         """构造图片链路请求头。"""
         headers = {
             "Content-Type": "application/json",
@@ -747,10 +805,12 @@ class OpenAIBackendAPI:
         }
         if requirements.proof_token:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+        if requirements.turnstile_token:
+            headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
-        if accept == "text/event-stream":
-            headers["X-Oai-Turn-Trace-Id"] = new_uuid()
+        if trace_id:
+            headers["X-Oai-Turn-Trace-Id"] = trace_id
         return self._headers(path, headers)
 
     def _codex_responses_headers(self) -> Dict[str, str]:
@@ -1148,39 +1208,51 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
-        """为图片生成准备 conduit token。"""
+    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> tuple[str, str]:
+        """为图片生成准备 conduit token，返回 (conduit_token, trace_id)。
+
+        请求结构对齐网页端真实抓包（2026-10）：`model=auto`、
+        `parent_message_id=client-created-root`、`client_prepare_state=sent`，
+        并携带与后续 f/conversation 相同的 `x-oai-turn-trace-id`。
+        """
         path = "/backend-api/f/conversation/prepare"
         upstream_model, thinking_effort = self._image_model_settings(model)
+        trace_id = new_uuid()
         payload = {
             "action": "next",
-            "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "is_do_not_remember": False,
             "model": upstream_model,
-            "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
-            "conversation_mode": {"kind": "primary_assistant"},
+            "parent_message_id": "client-created-root",
             "system_hints": ["picture_v2"],
+            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": -480,
+            "client_contextual_info": {
+                "app_name": "chatgpt.com",
+                "app_surface": "codex_browser",
+                "has_web_push_capabilities": True,
+                "web_push_notification_permission": "default",
+            },
+            "local_function_names": ["local.continue_in_work"],
+            "supported_encodings": ["v1"],
+            "client_prepare_state": "sent",
             "partial_query": {
                 "id": new_uuid(),
                 "author": {"role": "user"},
                 "content": {"content_type": "text", "parts": [prompt]},
             },
-            "supports_buffering": True,
-            "supported_encodings": ["v1"],
-            "client_contextual_info": {"app_name": "chatgpt.com"},
+            "client_prepare_dispatch": "debounced",
+            "client_prepare_source": "composer_editor_state",
         }
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements),
+            headers=self._image_headers(path, requirements, trace_id=trace_id),
             json=payload,
             timeout=60,
         )
-        payload = self._read_json_response(response, path)
-        return payload.get("conduit_token", "")
+        data = self._read_json_response(response, path)
+        return str(data.get("conduit_token") or ""), trace_id
 
     def _decode_image_base64(self, image: str) -> bytes:
         """把 base64 图片字符串或本地路径解码成二进制。"""
@@ -1265,7 +1337,8 @@ class OpenAIBackendAPI:
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None,
                                 comments: Optional[list[Any]] = None,
-                                markup: bool = False) -> requests.Response:
+                                markup: bool = False,
+                                trace_id: str = "") -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
@@ -1273,7 +1346,7 @@ class OpenAIBackendAPI:
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream", trace_id=trace_id),
             json=payload,
             timeout=300,
             stream=True,
@@ -2863,6 +2936,61 @@ class OpenAIBackendAPI:
                     close()
         return images
 
+    @staticmethod
+    def _last_user_text(messages: list[Dict[str, Any]]) -> str:
+        """取最后一条用户消息的文本，用于 f/conversation/prepare 的 partial_query。"""
+        for item in reversed(messages):
+            if str(item.get("role") or "") != "user":
+                continue
+            content = item.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and str(part.get("type") or "") == "text"
+                )
+            return ""
+        return ""
+
+    def _prepare_text_conversation(self, messages: list[Dict[str, Any]], model: str, timezone: str) -> tuple[str, str]:
+        """调用 f/conversation/prepare 为文本对话准备 conduit token，返回 (conduit_token, trace_id)。"""
+        path = "/backend-api/f/conversation/prepare"
+        trace_id = new_uuid()
+        payload = {
+            "action": "next",
+            "is_do_not_remember": False,
+            "model": model,
+            "parent_message_id": "client-created-root",
+            "timezone": timezone,
+            "timezone_offset_min": -480,
+            "client_contextual_info": {
+                "app_name": "chatgpt.com",
+                "app_surface": "codex_browser",
+                "has_web_push_capabilities": True,
+                "web_push_notification_permission": "default",
+            },
+            "local_function_names": ["local.continue_in_work"],
+            "supported_encodings": ["v1"],
+            "client_prepare_state": "sent",
+            "partial_query": {
+                "id": new_uuid(),
+                "author": {"role": "user"},
+                "content": {"content_type": "text", "parts": [self._last_user_text(messages)]},
+            },
+            "client_prepare_dispatch": "debounced",
+            "client_prepare_source": "context_change",
+        }
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Content-Type": "application/json", "x-oai-turn-trace-id": trace_id}),
+            json=payload,
+            timeout=60,
+        )
+        data = self._read_json_response(response, "conversation_prepare")
+        return str(data.get("conduit_token") or ""), trace_id
+
     def stream_conversation(
             self,
             messages: Optional[list[Dict[str, Any]]] = None,
@@ -2884,9 +3012,13 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
+        conduit_token = ""
+        trace_id = ""
+        if self.access_token:
+            conduit_token, trace_id = self._prepare_text_conversation(normalized, model, timezone)
         response = self.session.post(
             self.base_url + path,
-            headers=self._conversation_headers(path, requirements),
+            headers=self._conversation_headers(path, requirements, conduit_token, trace_id),
             json=payload,
             timeout=300,
             stream=True,
@@ -2926,9 +3058,10 @@ class OpenAIBackendAPI:
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        conduit_token, trace_id = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, comments, markup)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, comments, markup,
+                                                trace_id=trace_id)
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
 
@@ -2963,16 +3096,44 @@ class OpenAIBackendAPI:
             self._close_response(response)
 
     def _bootstrap(self) -> None:
-        """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
-        )
+        """预热首页，并提取 PoW 相关脚本引用。
+
+        首页请求不能带 Authorization：携带登录态访问首页会被 Cloudflare 挑战（403）。
+        """
+        authorization = self.session.headers.pop("Authorization", None)
+        try:
+            response = self.session.get(
+                self.base_url + "/",
+                headers=self._bootstrap_headers(),
+                timeout=30,
+            )
+        finally:
+            if authorization is not None:
+                self.session.headers["Authorization"] = authorization
         text = self._read_text_response(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+
+    def _sentinel_fingerprint(self) -> Dict[str, Any]:
+        """构造与当前 HTTP 请求头一致的 sentinel 环境指纹，供 dx 求解器使用。"""
+        user_agent = self.user_agent
+        if "Windows" in user_agent:
+            platform = "Win32"
+        elif "Macintosh" in user_agent:
+            platform = "MacIntel"
+        else:
+            platform = "Linux x86_64"
+        return {
+            "userAgent": user_agent,
+            "appVersion": user_agent.replace("Mozilla/", ""),
+            "platform": platform,
+            "language": "zh-CN",
+            "languages": ["zh-CN", "zh", "en"],
+            "hardwareConcurrency": 32,
+            "deviceMemory": 8,
+            "oaiDid": self.device_id,
+        }
 
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
@@ -3005,7 +3166,9 @@ class OpenAIBackendAPI:
         turnstile_token = ""
         turnstile_info = prepare_data.get("turnstile") or {}
         if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+            turnstile_token = solve_turnstile_token(
+                turnstile_info["dx"], p_token, self._sentinel_fingerprint()
+            ) or ""
 
         finalize_path = base + "/finalize"
         response = self.session.post(
@@ -3013,12 +3176,23 @@ class OpenAIBackendAPI:
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
                 "prepare_token": prepare_data.get("prepare_token", ""),
-                "proof_token": proof_token,
-                "turnstile_token": turnstile_token,
+                "proofofwork": proof_token,
+                "turnstile": turnstile_token,
             },
             timeout=30,
         )
         data = self._read_json_response(response, "chat_requirements_finalize")
+
+        # finalize 下发的 oai-sc cookie 会把当前会话标记为受限，导致后续
+        # f/conversation 返回 404 {"detail":"Model not found"}（实测确认，
+        # 移除该 cookie 后同一请求即可恢复 200）。这里在拿到 requirements
+        # token 后立即清除它。
+        try:
+            for cookie in list(self.session.cookies.jar):
+                if cookie.name == "oai-sc":
+                    self.session.cookies.jar.clear(cookie.domain, cookie.path, cookie.name)
+        except Exception:  # noqa: BLE001 - cookie 清理失败不应阻断主流程
+            pass
 
         token = data.get("token", "")
         if not token:
@@ -3035,7 +3209,7 @@ class OpenAIBackendAPI:
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:
-            return "/backend-api/conversation", "Asia/Shanghai"
+            return "/backend-api/f/conversation", "Asia/Shanghai"
         return "/backend-anon/conversation", "America/Los_Angeles"
 
     def list_models(self) -> Dict[str, Any]:
