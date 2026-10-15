@@ -115,8 +115,10 @@ environment:
 
 ### API 兼容能力
 
+- 跟进 2026-10-15 ChatGPT 网页端协议更新，适配新版会话准备流程与 Sentinel 校验，恢复文本及图片请求
 - 兼容 `POST /v1/images/generations` 图片生成接口
 - 兼容 `POST /v1/images/edits` 图片编辑接口
+- 图片编辑兼容网页版「标注」画笔与「图片评论」锚点编辑
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
